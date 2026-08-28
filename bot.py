@@ -5,18 +5,25 @@ Layout (all visible at once, k9s/ranger style):
     +-----------+-----------+---------------------------+
     | Devices   | Channels  |  Messages for the         |
     | (BLE)     | & Nodes   |  selected channel/node    |
-    |           |           |  + send box               |
+    +-----------+           |  + send box               |
+    | This      |           |                           |
+    | device's  |           |                           |
+    | status    |           |                           |
     +-----------+-----------+---------------------------+
 
 Flow:
-  1. Left pane - scans for Meshtastic BLE peripherals, pick one to connect.
+  1. Left pane (top) - scans for Meshtastic BLE peripherals, pick one to
+     connect. Left pane (bottom) - once connected, shows the connected
+     device's own status: firmware version, role/preset/region/slot/
+     frequency, uptime, last-heard signal quality, GPS fix.
   2. Middle pane - once connected, lists this node's channels AND all known
      mesh nodes. Pick a channel to broadcast on it, or a node to send it a
      direct message.
   3. Right pane - live message log for whichever target is selected (each
      target keeps its own scrollback), plus an input box to send text.
-     Keyword auto-reply (see rules.txt) fires for every incoming message on
-     every target, in the background, the whole time the app is running.
+     Keyword auto-reply (see rules.txt) only fires on the WATCH_CHANNEL_NAME
+     channel (EDGE_ATS by default) - other channels and node DMs are still
+     browsable/sendable manually, but not auto-monitored or auto-replied to.
 
 Usage:
     python3 bot.py
@@ -34,6 +41,31 @@ The Meshtastic phone/desktop app must be disconnected from the device first -
 BLE only allows one connected client at a time.
 """
 
+import importlib
+import sys
+
+# Check dependencies up front so a missing package fails fast with a plain
+# "pip install X" hint instead of a raw ImportError/traceback from somewhere
+# deep inside textual/meshtastic. meshtastic.ble_interface is checked
+# specifically (not just "meshtastic") since it pulls in bleak, which is a
+# separate, occasionally-missing install.
+_REQUIRED_MODULES = [
+    ("textual", "textual"),
+    ("pubsub", "pypubsub"),
+    ("meshtastic.ble_interface", "meshtastic"),
+]
+_missing_packages = []
+for _module_name, _pip_name in _REQUIRED_MODULES:
+    try:
+        importlib.import_module(_module_name)
+    except ImportError:
+        if _pip_name not in _missing_packages:
+            _missing_packages.append(_pip_name)
+if _missing_packages:
+    print("缺少必要的 Python 套件,請先安裝:", file=sys.stderr)
+    print(f"    pip3 install {' '.join(_missing_packages)}", file=sys.stderr)
+    sys.exit(1)
+
 import datetime
 from pathlib import Path
 
@@ -46,6 +78,7 @@ from textual.widgets import Input, Label, ListItem, ListView, RichLog
 
 import meshtastic
 import meshtastic.ble_interface
+from meshtastic.protobuf import config_pb2
 
 RULES_FILE = Path(__file__).parent / "rules.txt"
 
@@ -56,6 +89,11 @@ help=指令: ping
 """
 
 BROADCAST_ADDR = "^all"
+
+# The bot only auto-monitors/replies on this one channel (by name, resolved to
+# an index once channels are known - other channels and node DMs are ignored
+# entirely by on_receive, though they're still browsable/sendable manually).
+WATCH_CHANNEL_NAME = "EDGE_ATS"
 
 
 def load_rules() -> dict[str, str]:
@@ -131,6 +169,17 @@ def format_incoming_line(info: dict) -> str:
     return line
 
 
+def format_uptime(seconds: int | None) -> str:
+    if not seconds:
+        return "--"
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}"
+    return f"{hours:02d}:{minutes:02d}"
+
+
 def build_reply_text(reply: str, info: dict) -> str:
     """Append the collected message info to a keyword reply, compact (LoRa payload limit)."""
     bits = [info["when"], f"via={info['transport']}"]
@@ -176,6 +225,9 @@ class MeshtasticTUI(App):
         self.my_id: str | None = None
         self.target: tuple[str, str | int] | None = None  # ("channel", idx) or ("node", id)
         self.history: dict[tuple, list[str]] = {}
+        self.watch_channel_index: int | None = None
+        self.firmware_version: str | None = None
+        self.last_signal: dict | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -183,6 +235,8 @@ class MeshtasticTUI(App):
                 with Vertical(id="devices-pane"):
                     yield Label("裝置 (BLE)", classes="pane-title")
                     yield ListView(id="device-list")
+                    yield Label("本機狀態", classes="pane-title")
+                    yield RichLog(id="local-status-log", wrap=True, highlight=True, markup=True)
                 with Vertical(id="targets-pane"):
                     yield Label("頻道 / Node", classes="pane-title")
                     yield ListView(id="target-list")
@@ -200,6 +254,7 @@ class MeshtasticTUI(App):
         pub.subscribe(self.on_receive, "meshtastic.receive")
         pub.subscribe(self.on_config_synced, "meshtastic.connection.established")
         self.action_rescan()
+        self.set_interval(5.0, self._render_local_status)
 
     def on_unmount(self) -> None:
         pub.unsubscribe(self.on_receive, "meshtastic.receive")
@@ -257,8 +312,119 @@ class MeshtasticTUI(App):
     def _config_synced(self, interface) -> None:
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
-        self._log_system(f"[green]設定同步完成[/green] (my id: {self.my_id})")
+        self.watch_channel_index = self._find_channel_index(WATCH_CHANNEL_NAME)
+        if self.watch_channel_index is None:
+            self._log_system(
+                f"[red]找不到頻道 {WATCH_CHANNEL_NAME},bot 不會自動監控/回應任何頻道[/red]"
+            )
+        else:
+            self._log_system(
+                f"[green]設定同步完成[/green] (my id: {self.my_id}),"
+                f"監控頻道: {WATCH_CHANNEL_NAME} (index {self.watch_channel_index})"
+            )
         self._populate_targets()
+        self._render_local_status()
+        self.fetch_metadata()
+
+    def _find_channel_index(self, name: str) -> int | None:
+        for ch in self.interface.localNode.channels or []:
+            if ch.settings and ch.settings.name == name:
+                return ch.index
+        return None
+
+    # ---- pane 1b: local device status -------------------------------------
+
+    @work(thread=True)
+    def fetch_metadata(self) -> None:
+        # getMetadata() blocks on an admin round-trip over BLE and can be slow
+        # (or, on some firmware, never resolve) - run it off the UI thread and
+        # just leave the version as "查詢中..." if it never comes back.
+        try:
+            self.interface.localNode.getMetadata()
+        except Exception:  # noqa: BLE001
+            pass
+        metadata = self.interface.metadata
+        version = metadata.firmware_version if metadata else None
+        self.call_from_thread(self._metadata_fetched, version)
+
+    def _metadata_fetched(self, version: str | None) -> None:
+        self.firmware_version = version or "未知"
+        self._render_local_status()
+
+    def _track_signal(self, packet: dict) -> None:
+        # Tracks reception quality of whatever this radio last heard from
+        # anyone on the mesh - a node can't measure its own transmit signal,
+        # so this is the closest honest proxy for "how well is my radio
+        # currently hearing the mesh", refreshed on every packet regardless
+        # of the EDGE_ATS-only monitoring/reply restriction above.
+        snr = packet.get("rxSnr")
+        rssi = packet.get("rxRssi")
+        if snr is None and rssi is None:
+            return
+        self.last_signal = {"snr": snr, "rssi": rssi, "from_id": packet.get("fromId", "?")}
+
+    def _render_local_status(self) -> None:
+        log = self.query_one("#local-status-log", RichLog)
+        log.clear()
+        if self.interface is None or self.my_id is None:
+            log.write("[dim]尚未連線[/dim]")
+            return
+
+        lora = self.interface.localNode.localConfig.lora
+        device_cfg = self.interface.localNode.localConfig.device
+        position_cfg = self.interface.localNode.localConfig.position
+
+        region = config_pb2.Config.LoRaConfig.RegionCode.Name(lora.region)
+        preset = (
+            config_pb2.Config.LoRaConfig.ModemPreset.Name(lora.modem_preset)
+            if lora.use_preset
+            else "自訂"
+        )
+        role = config_pb2.Config.DeviceConfig.Role.Name(device_cfg.role)
+        gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
+
+        log.write(f"[bold]韌體[/bold] {self.firmware_version or '查詢中...'}")
+        log.write(f"[bold]Role[/bold] {role}  [bold]Preset[/bold] {preset}")
+        log.write(f"[bold]Region[/bold] {region}  [bold]Slot[/bold] {lora.channel_num or '(Auto)'}")
+        if lora.override_frequency:
+            log.write(f"[bold]頻率[/bold] {lora.override_frequency:.3f} MHz")
+        else:
+            log.write("[bold]頻率[/bold] 依 Region/Slot 自動")
+        log.write(
+            f"BW {lora.bandwidth}kHz SF{lora.spread_factor} "
+            f"CR{lora.coding_rate} Tx{lora.tx_power}dBm"
+        )
+
+        node = (self.interface.nodes or {}).get(self.my_id, {})
+        metrics = node.get("deviceMetrics", {})
+        log.write(f"[bold]Uptime[/bold] {format_uptime(metrics.get('uptimeSeconds'))}")
+        battery = metrics.get("batteryLevel")
+        if battery is not None:
+            log.write(
+                f"電量 {battery}%  Ch.Util {metrics.get('channelUtilization', 0):.1f}%  "
+                f"Air Tx {metrics.get('airUtilTx', 0):.1f}%"
+            )
+
+        if self.last_signal:
+            snr = self.last_signal["snr"]
+            rssi = self.last_signal["rssi"]
+            log.write(
+                f"[bold]最近收訊[/bold] SNR {snr if snr is not None else '--'} "
+                f"RSSI {rssi if rssi is not None else '--'} (from {self.last_signal['from_id']})"
+            )
+        else:
+            log.write("[bold]最近收訊[/bold] --")
+
+        position = node.get("position", {})
+        if gps_mode == "NOT_PRESENT":
+            gps_line = "無 GPS 模組"
+        elif gps_mode == "DISABLED":
+            gps_line = "已停用"
+        elif "latitudeI" in position:
+            gps_line = f"已定位 ({position['latitudeI'] / 1e7:.4f}, {position['longitudeI'] / 1e7:.4f})"
+        else:
+            gps_line = "已啟用,尚無定位"
+        log.write(f"[bold]GPS[/bold] {gps_line}")
 
     # ---- pane 2: channels & nodes -----------------------------------------
 
@@ -306,8 +472,12 @@ class MeshtasticTUI(App):
         self.query_one("#status-log", RichLog).write(f"[dim]{now}[/dim] {line}")
 
     def on_receive(self, packet, interface) -> None:
+        self._track_signal(packet)
+
         info = parse_incoming(packet, self.my_id)
         if info is None:
+            return
+        if info["target"] != ("channel", self.watch_channel_index):
             return
         line = format_incoming_line(info)
         self.history.setdefault(info["target"], []).append(line)
