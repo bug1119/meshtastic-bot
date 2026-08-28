@@ -228,6 +228,7 @@ class MeshtasticTUI(App):
         self.watch_channel_index: int | None = None
         self.firmware_version: str | None = None
         self.last_signal: dict | None = None
+        self.scanning = False
 
     def compose(self) -> ComposeResult:
         # min_width=1 on every RichLog below: RichLog defaults to min_width=78,
@@ -273,6 +274,15 @@ class MeshtasticTUI(App):
     # ---- pane 1: devices -------------------------------------------------
 
     def action_rescan(self) -> None:
+        # Guard against overlapping scans: BLEInterface.scan() takes ~10s, and
+        # without this, a manual "R" press (or the empty-result auto-retry
+        # below) while one is still running would start a second one, and
+        # since _populate_devices only appends, both scans' results would land
+        # in the list - the same device showing up twice.
+        if self.scanning:
+            self._log_system("已在掃描中,請稍候...")
+            return
+        self.scanning = True
         self.query_one("#device-list", ListView).clear()
         self.scan_devices()
 
@@ -281,16 +291,23 @@ class MeshtasticTUI(App):
         try:
             devices = meshtastic.ble_interface.BLEInterface.scan()
         except Exception as e:  # noqa: BLE001
+            self.scanning = False
             self.call_from_thread(self._log_system, f"[red]掃描失敗: {e}[/red]")
             return
         self.call_from_thread(self._populate_devices, devices)
 
     def _populate_devices(self, devices: list) -> None:
+        self.scanning = False
         listview = self.query_one("#device-list", ListView)
+        listview.clear()
         for d in devices:
             listview.append(ListItem(Label(d.name), name=d.name))
         if not devices:
-            self._log_system("沒找到裝置,按 R 重新掃描")
+            if self.interface is None:
+                self._log_system("沒找到裝置,自動重新掃描...")
+                self.action_rescan()
+            else:
+                self._log_system("沒找到裝置,按 R 重新掃描")
         elif len(devices) == 1 and self.interface is None:
             self._log_system(f"只找到一個裝置,自動連線: {devices[0].name}")
             listview.index = 0
