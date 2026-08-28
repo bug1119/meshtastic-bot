@@ -283,6 +283,10 @@ class MeshtasticTUI(App):
             listview.append(ListItem(Label(d.name), name=d.name))
         if not devices:
             self._log_system("沒找到裝置,按 R 重新掃描")
+        elif len(devices) == 1 and self.interface is None:
+            self._log_system(f"只找到一個裝置,自動連線: {devices[0].name}")
+            listview.index = 0
+            self._on_device_selected(devices[0].name)
 
     def _on_device_selected(self, device_name: str) -> None:
         self._log_system(f"連線到 {device_name}...")
