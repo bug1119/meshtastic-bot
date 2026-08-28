@@ -21,6 +21,10 @@ Flow:
 Usage:
     python3 bot.py
 
+Keyboard: Left/Right cycle devices -> channels/nodes -> messages. Up/Down keep
+their normal per-widget meaning (move the list cursor in the device/target
+lists, scroll the log) - use Tab/Shift+Tab to reach the status pane.
+
 Auto-reply rules live in rules.txt next to this script, one per line as
     keyword=reply text
 Blank lines and lines starting with # are ignored. The file is re-read on
@@ -151,7 +155,20 @@ class MeshtasticTUI(App):
     #status-pane .pane-title { background: $warning 30%; }
     """
 
-    BINDINGS = [Binding("r", "rescan", "Rescan devices"), Binding("q", "quit", "Quit")]
+    BINDINGS = [
+        Binding("r", "rescan", "Rescan devices"),
+        Binding("q", "quit", "Quit"),
+        # Left/Right cycle devices -> channels/nodes -> messages. priority=True so
+        # they win even when the log pane has focus (RichLog binds arrow keys for
+        # its own scrolling); action_focus_pane special-cases the send box so
+        # typing still moves the text cursor instead of switching panes. Up/down
+        # are deliberately left alone everywhere - ListView uses them to move the
+        # list cursor and RichLog uses them to scroll, both of which matter more
+        # than a pane jump. Tab/Shift+Tab (Textual default) still cycle through
+        # every focusable widget including the status pane.
+        Binding("left", "focus_pane(-1)", "上一欄", show=False, priority=True),
+        Binding("right", "focus_pane(1)", "下一欄", show=False, priority=True),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -337,6 +354,47 @@ class MeshtasticTUI(App):
             self.interface.sendText(text, channelIndex=key)
         else:
             self.interface.sendText(text, destinationId=key)
+
+    # ---- pane navigation (arrow keys) ------------------------------------
+
+    def _focused_pane_index(self) -> int | None:
+        focused = self.focused
+        focused_id = focused.id if focused is not None else None
+        if focused_id == "device-list":
+            return 0
+        if focused_id == "target-list":
+            return 1
+        if focused_id in ("log", "send-box"):
+            return 2
+        return None
+
+    def _focus_pane(self, index: int) -> None:
+        index = max(0, min(index, 2))
+        if index == 0:
+            self.query_one("#device-list", ListView).focus()
+        elif index == 1:
+            self.query_one("#target-list", ListView).focus()
+        else:
+            send_box = self.query_one("#send-box", Input)
+            if not send_box.disabled:
+                send_box.focus()
+            else:
+                self.query_one("#log", RichLog).focus()
+
+    def action_focus_pane(self, delta: int) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            # This binding has priority, so it would otherwise steal left/right
+            # away from the send box's own text-cursor movement while typing.
+            if delta < 0:
+                focused.action_cursor_left()
+            else:
+                focused.action_cursor_right()
+            return
+        current = self._focused_pane_index()
+        if current is None:
+            return
+        self._focus_pane(current + delta)
 
     # ---- shared list dispatch -------------------------------------------
 
