@@ -447,7 +447,7 @@ class MeshtasticTUI(App):
         if battery is not None:
             log.write(f"[bold]電量:[/bold] {battery}%")
             log.write(f"[bold]Ch.Util:[/bold] {metrics.get('channelUtilization', 0):.1f}%")
-            log.write(f"[bold]Air Tx:[/bold] {metrics.get('airUtilTx', 0):.1f}%")
+        log.write(f"[bold]OK to MQTT:[/bold] {'是' if lora.config_ok_to_mqtt else '否'}")
 
         if self.last_signal:
             snr = self.last_signal["snr"]
