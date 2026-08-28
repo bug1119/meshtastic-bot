@@ -445,10 +445,10 @@ class MeshtasticTUI(App):
         role = config_pb2.Config.DeviceConfig.Role.Name(device_cfg.role)
         gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
 
+        log.write(f"[bold]Region:[/bold] {region}")
         log.write(f"[bold]韌體:[/bold] {self.firmware_version or '查詢中...'}")
         log.write(f"[bold]Role:[/bold] {role}")
         log.write(f"[bold]Preset:[/bold] {preset}")
-        log.write(f"[bold]Region:[/bold] {region}")
         log.write(f"[bold]Slot:[/bold] {lora.channel_num or '(Auto)'}")
         if lora.override_frequency:
             log.write(f"[bold]頻率:[/bold] {lora.override_frequency:.3f} MHz")
@@ -471,7 +471,6 @@ class MeshtasticTUI(App):
             rssi = self.last_signal["rssi"]
             log.write(f"[bold]最近 SNR:[/bold] {snr if snr is not None else '--'}")
             log.write(f"[bold]最近 RSSI:[/bold] {rssi if rssi is not None else '--'}")
-            log.write(f"[bold]來源:[/bold] {self.last_signal['from_id']}")
         else:
             log.write("[bold]最近收訊:[/bold] --")
 
