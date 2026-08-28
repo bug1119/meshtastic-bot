@@ -83,8 +83,17 @@ def on_receive(packet, interface):
     if reply is None:
         return
 
-    print(f"[send] ch={channel}: {reply!r}")
-    interface.sendText(reply, channelIndex=channel)
+    # Append the collected info to the reply itself, not just the local log -
+    # kept compact since LoRa payloads are size-limited.
+    info_bits = [when, f"via={transport}"]
+    if snr is not None:
+        info_bits.append(f"snr={snr}")
+    if rssi is not None:
+        info_bits.append(f"rssi={rssi}")
+    full_reply = f"{reply} | {' '.join(info_bits)} from={from_id}"
+
+    print(f"[send] ch={channel}: {full_reply!r}")
+    interface.sendText(full_reply, channelIndex=channel)
 
 
 def on_connection(interface, topic=pub.AUTO_TOPIC):
