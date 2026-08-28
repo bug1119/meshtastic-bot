@@ -1,0 +1,3 @@
+# keyword=reply text (one per line, case-insensitive substring match on keyword)
+ping=pong
+help=指令: ping

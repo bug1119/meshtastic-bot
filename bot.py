@@ -6,17 +6,23 @@ Flow:
   2. Channel screen - lists the connected node's channels, pick one to watch.
   3. Channel view - live scrolling message log (time/sender/transport/SNR/RSSI)
      plus an input box to send text on that channel. Keyword auto-reply (see
-     KEYWORD_RULES) keeps firing in the background the whole time you're in
-     the channel view, alongside anything you send by hand.
+     rules.txt) keeps firing in the background the whole time you're in the
+     channel view, alongside anything you send by hand.
 
 Usage:
     python3 bot.py
+
+Auto-reply rules live in rules.txt next to this script, one per line as
+    keyword=reply text
+Blank lines and lines starting with # are ignored. The file is re-read on
+every incoming message, so edits take effect immediately - no restart needed.
 
 The Meshtastic phone/desktop app must be disconnected from the device first -
 BLE only allows one connected client at a time.
 """
 
 import datetime
+from pathlib import Path
 
 from pubsub import pub
 from textual import work
@@ -29,46 +35,81 @@ from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Ri
 import meshtastic
 import meshtastic.ble_interface
 
-# keyword (lowercase substring match) -> reply text
-KEYWORD_RULES = {
-    "ping": "pong",
-    "help": "指令: ping",
-}
+RULES_FILE = Path(__file__).parent / "rules.txt"
+
+DEFAULT_RULES = """\
+# keyword=reply text (one per line, case-insensitive substring match on keyword)
+ping=pong
+help=指令: ping
+"""
+
+
+def load_rules() -> dict[str, str]:
+    """Re-read rules.txt every call so edits take effect without restarting the bot."""
+    if not RULES_FILE.exists():
+        RULES_FILE.write_text(DEFAULT_RULES, encoding="utf-8")
+
+    rules: dict[str, str] = {}
+    for raw_line in RULES_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        keyword, _, reply = line.partition("=")
+        keyword = keyword.strip()
+        if keyword:
+            rules[keyword] = reply.strip()
+    return rules
 
 
 def find_reply(text: str) -> str | None:
     lowered = text.lower()
-    for keyword, reply in KEYWORD_RULES.items():
-        if keyword in lowered:
+    for keyword, reply in load_rules().items():
+        if keyword.lower() in lowered:
             return reply
     return None
 
 
-def format_incoming(packet: dict) -> tuple[str, str] | None:
-    """Return (channel_key, formatted_line) for a text-message packet, or None."""
+def parse_incoming(packet: dict) -> dict | None:
+    """Return a dict of the fields we care about for a text-message packet, or None."""
     decoded = packet.get("decoded")
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
         return None
-
-    text = decoded.get("text", "")
-    from_id = packet.get("fromId", "?")
-    channel = packet.get("channel", 0)
 
     rx_time = packet.get("rxTime")
     when = (
         datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S") if rx_time else "??:??:??"
     )
-    transport = "MQTT" if packet.get("viaMqtt") else "LoRa"
-    snr = packet.get("rxSnr")
-    rssi = packet.get("rxRssi")
 
-    line = f"[dim]{when}[/dim] [bold]{from_id}[/bold] ({transport}"
-    if snr is not None:
-        line += f" snr={snr}"
-    if rssi is not None:
-        line += f" rssi={rssi}"
-    line += f"): {text}"
-    return channel, line
+    return {
+        "text": decoded.get("text", ""),
+        "from_id": packet.get("fromId", "?"),
+        "channel": packet.get("channel", 0),
+        "when": when,
+        "transport": "MQTT" if packet.get("viaMqtt") else "LoRa",
+        "snr": packet.get("rxSnr"),
+        "rssi": packet.get("rxRssi"),
+    }
+
+
+def format_incoming_line(info: dict) -> str:
+    """Render a parsed incoming message as one RichLog line."""
+    line = f"[dim]{info['when']}[/dim] [bold]{info['from_id']}[/bold] ({info['transport']}"
+    if info["snr"] is not None:
+        line += f" snr={info['snr']}"
+    if info["rssi"] is not None:
+        line += f" rssi={info['rssi']}"
+    line += f"): {info['text']}"
+    return line
+
+
+def build_reply_text(reply: str, info: dict) -> str:
+    """Append the collected message info to a keyword reply, compact (LoRa payload limit)."""
+    bits = [info["when"], f"via={info['transport']}"]
+    if info["snr"] is not None:
+        bits.append(f"snr={info['snr']}")
+    if info["rssi"] is not None:
+        bits.append(f"rssi={info['rssi']}")
+    return f"{reply} | {' '.join(bits)} from={info['from_id']}"
 
 
 class DeviceScreen(Screen):
@@ -183,21 +224,22 @@ class ChannelViewScreen(Screen):
         pub.unsubscribe(self.on_receive, "meshtastic.receive")
 
     def on_receive(self, packet, interface) -> None:
-        result = format_incoming(packet)
-        if result is None:
+        info = parse_incoming(packet)
+        if info is None:
             return
-        channel, line = result
-        if channel != self.app.channel_index:
+        if info["channel"] != self.app.channel_index:
             return
 
-        self.app.call_from_thread(self._append_line, line)
+        self.app.call_from_thread(self._append_line, format_incoming_line(info))
 
-        decoded = packet.get("decoded", {})
-        reply = find_reply(decoded.get("text", ""))
+        reply = find_reply(info["text"])
         if reply is None:
             return
-        interface.sendText(reply, channelIndex=channel)
-        self.app.call_from_thread(self._append_line, f"[yellow]  -> auto-reply: {reply}[/yellow]")
+        full_reply = build_reply_text(reply, info)
+        interface.sendText(full_reply, channelIndex=info["channel"])
+        self.app.call_from_thread(
+            self._append_line, f"[yellow]  -> auto-reply: {full_reply}[/yellow]"
+        )
 
     def _append_line(self, line: str) -> None:
         self.query_one("#log", RichLog).write(line)
