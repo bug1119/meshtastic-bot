@@ -230,25 +230,33 @@ class MeshtasticTUI(App):
         self.last_signal: dict | None = None
 
     def compose(self) -> ComposeResult:
+        # min_width=1 on every RichLog below: RichLog defaults to min_width=78,
+        # meaning it lays text out for at least 78 columns even in a much
+        # narrower pane and then clips whatever doesn't fit, instead of
+        # wrapping. min_width=1 makes it wrap at the pane's actual width.
         with Vertical():
             with Horizontal(id="main-row"):
                 with Vertical(id="devices-pane"):
                     yield Label("裝置 (BLE)", classes="pane-title")
                     yield ListView(id="device-list")
                     yield Label("本機狀態", classes="pane-title")
-                    yield RichLog(id="local-status-log", wrap=True, highlight=True, markup=True)
+                    yield RichLog(
+                        id="local-status-log", wrap=True, highlight=True, markup=True, min_width=1
+                    )
                 with Vertical(id="targets-pane"):
                     yield Label("頻道 / Node", classes="pane-title")
                     yield ListView(id="target-list")
                 with Vertical(id="messages-pane"):
                     yield Label("訊息", classes="pane-title", id="messages-title")
-                    yield RichLog(id="log", wrap=True, highlight=True, markup=True)
+                    yield RichLog(id="log", wrap=True, highlight=True, markup=True, min_width=1)
                     yield Input(
                         placeholder="選一個頻道/node 才能送訊息...", id="send-box", disabled=True
                     )
             with Vertical(id="status-pane"):
                 yield Label("狀態", classes="pane-title")
-                yield RichLog(id="status-log", wrap=True, highlight=True, markup=True)
+                yield RichLog(
+                    id="status-log", wrap=True, highlight=True, markup=True, min_width=1
+                )
 
     def on_mount(self) -> None:
         pub.subscribe(self.on_receive, "meshtastic.receive")
@@ -388,34 +396,34 @@ class MeshtasticTUI(App):
         gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
 
         log.write(f"[bold]韌體[/bold] {self.firmware_version or '查詢中...'}")
-        log.write(f"[bold]Role[/bold] {role}  [bold]Preset[/bold] {preset}")
-        log.write(f"[bold]Region[/bold] {region}  [bold]Slot[/bold] {lora.channel_num or '(Auto)'}")
+        log.write(f"[bold]Role[/bold] {role}")
+        log.write(f"[bold]Preset[/bold] {preset}")
+        log.write(f"[bold]Region[/bold] {region}")
+        log.write(f"[bold]Slot[/bold] {lora.channel_num or '(Auto)'}")
         if lora.override_frequency:
             log.write(f"[bold]頻率[/bold] {lora.override_frequency:.3f} MHz")
         else:
             log.write("[bold]頻率[/bold] 依 Region/Slot 自動")
-        log.write(
-            f"BW {lora.bandwidth}kHz SF{lora.spread_factor} "
-            f"CR{lora.coding_rate} Tx{lora.tx_power}dBm"
-        )
+        log.write(f"[bold]Bandwidth[/bold] {lora.bandwidth} kHz")
+        log.write(f"[bold]Spread Factor[/bold] {lora.spread_factor}")
+        log.write(f"[bold]Coding Rate[/bold] {lora.coding_rate}")
+        log.write(f"[bold]Tx Power[/bold] {lora.tx_power} dBm")
 
         node = (self.interface.nodes or {}).get(self.my_id, {})
         metrics = node.get("deviceMetrics", {})
         log.write(f"[bold]Uptime[/bold] {format_uptime(metrics.get('uptimeSeconds'))}")
         battery = metrics.get("batteryLevel")
         if battery is not None:
-            log.write(
-                f"電量 {battery}%  Ch.Util {metrics.get('channelUtilization', 0):.1f}%  "
-                f"Air Tx {metrics.get('airUtilTx', 0):.1f}%"
-            )
+            log.write(f"[bold]電量[/bold] {battery}%")
+            log.write(f"[bold]Ch.Util[/bold] {metrics.get('channelUtilization', 0):.1f}%")
+            log.write(f"[bold]Air Tx[/bold] {metrics.get('airUtilTx', 0):.1f}%")
 
         if self.last_signal:
             snr = self.last_signal["snr"]
             rssi = self.last_signal["rssi"]
-            log.write(
-                f"[bold]最近收訊[/bold] SNR {snr if snr is not None else '--'} "
-                f"RSSI {rssi if rssi is not None else '--'} (from {self.last_signal['from_id']})"
-            )
+            log.write(f"[bold]最近 SNR[/bold] {snr if snr is not None else '--'}")
+            log.write(f"[bold]最近 RSSI[/bold] {rssi if rssi is not None else '--'}")
+            log.write(f"[bold]來源[/bold] {self.last_signal['from_id']}")
         else:
             log.write("[bold]最近收訊[/bold] --")
 
