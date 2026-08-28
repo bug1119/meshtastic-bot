@@ -412,37 +412,37 @@ class MeshtasticTUI(App):
         role = config_pb2.Config.DeviceConfig.Role.Name(device_cfg.role)
         gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
 
-        log.write(f"[bold]韌體[/bold] {self.firmware_version or '查詢中...'}")
-        log.write(f"[bold]Role[/bold] {role}")
-        log.write(f"[bold]Preset[/bold] {preset}")
-        log.write(f"[bold]Region[/bold] {region}")
-        log.write(f"[bold]Slot[/bold] {lora.channel_num or '(Auto)'}")
+        log.write(f"[bold]韌體:[/bold] {self.firmware_version or '查詢中...'}")
+        log.write(f"[bold]Role:[/bold] {role}")
+        log.write(f"[bold]Preset:[/bold] {preset}")
+        log.write(f"[bold]Region:[/bold] {region}")
+        log.write(f"[bold]Slot:[/bold] {lora.channel_num or '(Auto)'}")
         if lora.override_frequency:
-            log.write(f"[bold]頻率[/bold] {lora.override_frequency:.3f} MHz")
+            log.write(f"[bold]頻率:[/bold] {lora.override_frequency:.3f} MHz")
         else:
-            log.write("[bold]頻率[/bold] 依 Region/Slot 自動")
-        log.write(f"[bold]Bandwidth[/bold] {lora.bandwidth} kHz")
-        log.write(f"[bold]Spread Factor[/bold] {lora.spread_factor}")
-        log.write(f"[bold]Coding Rate[/bold] {lora.coding_rate}")
-        log.write(f"[bold]Tx Power[/bold] {lora.tx_power} dBm")
+            log.write("[bold]頻率:[/bold] 依 Region/Slot 自動")
+        log.write(f"[bold]Bandwidth:[/bold] {lora.bandwidth} kHz")
+        log.write(f"[bold]Spread Factor:[/bold] {lora.spread_factor}")
+        log.write(f"[bold]Coding Rate:[/bold] {lora.coding_rate}")
+        log.write(f"[bold]Tx Power:[/bold] {lora.tx_power} dBm")
 
         node = (self.interface.nodes or {}).get(self.my_id, {})
         metrics = node.get("deviceMetrics", {})
-        log.write(f"[bold]Uptime[/bold] {format_uptime(metrics.get('uptimeSeconds'))}")
+        log.write(f"[bold]Uptime:[/bold] {format_uptime(metrics.get('uptimeSeconds'))}")
         battery = metrics.get("batteryLevel")
         if battery is not None:
-            log.write(f"[bold]電量[/bold] {battery}%")
-            log.write(f"[bold]Ch.Util[/bold] {metrics.get('channelUtilization', 0):.1f}%")
-            log.write(f"[bold]Air Tx[/bold] {metrics.get('airUtilTx', 0):.1f}%")
+            log.write(f"[bold]電量:[/bold] {battery}%")
+            log.write(f"[bold]Ch.Util:[/bold] {metrics.get('channelUtilization', 0):.1f}%")
+            log.write(f"[bold]Air Tx:[/bold] {metrics.get('airUtilTx', 0):.1f}%")
 
         if self.last_signal:
             snr = self.last_signal["snr"]
             rssi = self.last_signal["rssi"]
-            log.write(f"[bold]最近 SNR[/bold] {snr if snr is not None else '--'}")
-            log.write(f"[bold]最近 RSSI[/bold] {rssi if rssi is not None else '--'}")
-            log.write(f"[bold]來源[/bold] {self.last_signal['from_id']}")
+            log.write(f"[bold]最近 SNR:[/bold] {snr if snr is not None else '--'}")
+            log.write(f"[bold]最近 RSSI:[/bold] {rssi if rssi is not None else '--'}")
+            log.write(f"[bold]來源:[/bold] {self.last_signal['from_id']}")
         else:
-            log.write("[bold]最近收訊[/bold] --")
+            log.write("[bold]最近收訊:[/bold] --")
 
         position = node.get("position", {})
         if gps_mode == "NOT_PRESENT":
@@ -453,7 +453,7 @@ class MeshtasticTUI(App):
             gps_line = f"已定位 ({position['latitudeI'] / 1e7:.4f}, {position['longitudeI'] / 1e7:.4f})"
         else:
             gps_line = "已啟用,尚無定位"
-        log.write(f"[bold]GPS[/bold] {gps_line}")
+        log.write(f"[bold]GPS:[/bold] {gps_line}")
 
     # ---- pane 2: channels & nodes -----------------------------------------
 
