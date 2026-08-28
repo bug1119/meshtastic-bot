@@ -67,6 +67,7 @@ if _missing_packages:
     print(f"    pip3 install {' '.join(_missing_packages)}", file=sys.stderr)
     sys.exit(1)
 
+import atexit
 import datetime
 import threading
 from pathlib import Path
@@ -273,6 +274,22 @@ class MeshtasticTUI(App):
         pub.unsubscribe(self.on_receive, "meshtastic.receive")
         pub.unsubscribe(self.on_config_synced, "meshtastic.connection.established")
         if self.interface:
+            # BLEInterface registers its own atexit hook (self._exit_handler)
+            # that also calls the same no-timeout disconnect - if the
+            # background close() below hasn't reached its own
+            # atexit.unregister() yet by the time the process starts shutting
+            # down, that hook fires *again* during interpreter shutdown and
+            # hangs there instead, which is what surfaced as an
+            # "Exception ignored in atexit callback" KeyboardInterrupt
+            # traceback on exit. Unregistering it here first - synchronous,
+            # no BLE I/O, can't hang - closes that race outright.
+            exit_handler = getattr(self.interface, "_exit_handler", None)
+            if exit_handler is not None:
+                try:
+                    atexit.unregister(exit_handler)
+                except Exception:  # noqa: BLE001
+                    pass
+
             # interface.close() disconnects over BLE with no timeout, so a
             # slow/stuck CoreBluetooth disconnect (or an exception from an
             # already-dropped link) would otherwise hang or crash the app
