@@ -462,7 +462,7 @@ class MeshtasticTUI(App):
         log.write(f"[bold]Uptime:[/bold] {format_uptime(metrics.get('uptimeSeconds'))}")
         battery = metrics.get("batteryLevel")
         if battery is not None:
-            log.write(f"[bold]電量:[/bold] {battery}%")
+            log.write(f"[bold]電量:[/bold] {battery}% {metrics.get('voltage', 0):.3f}V")
             log.write(f"[bold]Ch.Util:[/bold] {metrics.get('channelUtilization', 0):.1f}%")
         log.write(f"[bold]OK to MQTT:[/bold] {'是' if lora.config_ok_to_mqtt else '否'}")
 
