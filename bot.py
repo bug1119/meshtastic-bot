@@ -21,9 +21,10 @@ Flow:
      direct message.
   3. Right pane - live message log for whichever target is selected (each
      target keeps its own scrollback), plus an input box to send text.
-     Keyword auto-reply (see rules.txt) only fires on the WATCH_CHANNEL_NAME
-     channel (EDGE_ATS by default) - other channels and node DMs are still
-     browsable/sendable manually, but not auto-monitored or auto-replied to.
+     Every channel and node DM is received, recorded, and browsable/sendable
+     as normal - keyword auto-reply (see rules.txt) is the only thing scoped
+     down, firing only on the WATCH_CHANNEL_NAME channel (EDGE_ATS by
+     default).
 
 Usage:
     python3 bot.py
@@ -67,6 +68,7 @@ if _missing_packages:
     sys.exit(1)
 
 import datetime
+import threading
 from pathlib import Path
 
 from pubsub import pub
@@ -90,9 +92,9 @@ help=指令: ping
 
 BROADCAST_ADDR = "^all"
 
-# The bot only auto-monitors/replies on this one channel (by name, resolved to
-# an index once channels are known - other channels and node DMs are ignored
-# entirely by on_receive, though they're still browsable/sendable manually).
+# The bot only auto-replies on this one channel (by name, resolved to an
+# index once channels are known). Every other channel/DM is still recorded
+# and browsable/sendable as normal - see the gate in on_receive below.
 WATCH_CHANNEL_NAME = "EDGE_ATS"
 
 
@@ -200,6 +202,8 @@ class MeshtasticTUI(App):
     #status-pane { height: 8; border: solid $warning; }
     ListView { height: 1fr; }
     RichLog { height: 1fr; }
+    #devices-pane #device-list { height: 1fr; }
+    #devices-pane #local-status-log { height: 2fr; }
     .pane-title { text-style: bold; background: $accent 20%; padding: 0 1; }
     #status-pane .pane-title { background: $warning 30%; }
     """
@@ -269,7 +273,19 @@ class MeshtasticTUI(App):
         pub.unsubscribe(self.on_receive, "meshtastic.receive")
         pub.unsubscribe(self.on_config_synced, "meshtastic.connection.established")
         if self.interface:
-            self.interface.close()
+            # interface.close() disconnects over BLE with no timeout, so a
+            # slow/stuck CoreBluetooth disconnect (or an exception from an
+            # already-dropped link) would otherwise hang or crash the app
+            # right as it's quitting. Fire-and-forget in a daemon thread so
+            # Ctrl+Q/Q always exits immediately regardless of how that goes -
+            # the device notices the dropped link on its own either way.
+            def close_quietly() -> None:
+                try:
+                    self.interface.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            threading.Thread(target=close_quietly, daemon=True).start()
 
     # ---- pane 1: devices -------------------------------------------------
 
@@ -344,12 +360,12 @@ class MeshtasticTUI(App):
         self.watch_channel_index = self._find_channel_index(WATCH_CHANNEL_NAME)
         if self.watch_channel_index is None:
             self._log_system(
-                f"[red]找不到頻道 {WATCH_CHANNEL_NAME},bot 不會自動監控/回應任何頻道[/red]"
+                f"[red]找不到頻道 {WATCH_CHANNEL_NAME},bot 不會自動回覆任何頻道[/red]"
             )
         else:
             self._log_system(
                 f"[green]設定同步完成[/green] (my id: {self.my_id}),"
-                f"監控頻道: {WATCH_CHANNEL_NAME} (index {self.watch_channel_index})"
+                f"自動回覆頻道: {WATCH_CHANNEL_NAME} (index {self.watch_channel_index})"
             )
         self._populate_targets()
         self._render_local_status()
@@ -422,8 +438,6 @@ class MeshtasticTUI(App):
         else:
             log.write("[bold]頻率:[/bold] 依 Region/Slot 自動")
         log.write(f"[bold]Bandwidth:[/bold] {lora.bandwidth} kHz")
-        log.write(f"[bold]Spread Factor:[/bold] {lora.spread_factor}")
-        log.write(f"[bold]Coding Rate:[/bold] {lora.coding_rate}")
         log.write(f"[bold]Tx Power:[/bold] {lora.tx_power} dBm")
 
         node = (self.interface.nodes or {}).get(self.my_id, {})
@@ -506,8 +520,6 @@ class MeshtasticTUI(App):
         info = parse_incoming(packet, self.my_id)
         if info is None:
             return
-        if info["target"] != ("channel", self.watch_channel_index):
-            return
         line = format_incoming_line(info)
         self.history.setdefault(info["target"], []).append(line)
 
@@ -519,24 +531,59 @@ class MeshtasticTUI(App):
 
         self.call_from_thread(update_ui)
 
-        reply = find_reply(info["text"])
+        reply_line = self._maybe_auto_reply(
+            interface,
+            info["target"],
+            info["text"],
+            when=info["when"],
+            from_id=info["from_id"],
+            transport=info["transport"],
+            snr=info["snr"],
+            rssi=info["rssi"],
+        )
+        if reply_line:
+            def update_ui2():
+                if info["target"] == self.target:
+                    self.query_one("#log", RichLog).write(reply_line)
+
+            self.call_from_thread(update_ui2)
+
+    def _maybe_auto_reply(
+        self,
+        interface,
+        target: tuple,
+        text: str,
+        when: str,
+        from_id: str,
+        transport: str,
+        snr: float | None = None,
+        rssi: int | None = None,
+    ) -> str | None:
+        """Send + record the keyword auto-reply for `text` if it's on the
+        watched channel and matches a rule. Shared by on_receive (messages
+        that arrived over the mesh) and on_input_submitted (messages typed
+        into the send box on this connected device) so both paths get
+        monitored/replied-to identically. Returns the reply line to display,
+        or None if nothing was sent - the caller decides how to write it to
+        the log, since on_receive needs call_from_thread and
+        on_input_submitted (already on the UI thread) doesn't.
+        """
+        if target != ("channel", self.watch_channel_index):
+            return None
+        reply = find_reply(text)
         if reply is None:
-            return
-        full_reply = build_reply_text(reply, info)
-        kind, key = info["target"]
+            return None
+        info_like = {"when": when, "transport": transport, "snr": snr, "rssi": rssi, "from_id": from_id}
+        full_reply = build_reply_text(reply, info_like)
+        kind, key = target
         if kind == "channel":
             interface.sendText(full_reply, channelIndex=key)
         else:
             interface.sendText(full_reply, destinationId=key)
 
         reply_line = f"[yellow]  -> auto-reply: {full_reply}[/yellow]"
-        self.history.setdefault(info["target"], []).append(reply_line)
-
-        def update_ui2():
-            if info["target"] == self.target:
-                self.query_one("#log", RichLog).write(reply_line)
-
-        self.call_from_thread(update_ui2)
+        self.history.setdefault(target, []).append(reply_line)
+        return reply_line
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -553,6 +600,14 @@ class MeshtasticTUI(App):
             self.interface.sendText(text, channelIndex=key)
         else:
             self.interface.sendText(text, destinationId=key)
+
+        # Messages sent from this device (not just ones received over the
+        # mesh) also get checked against rules.txt on the watched channel.
+        reply_line = self._maybe_auto_reply(
+            self.interface, self.target, text, when=now, from_id=self.my_id or "me", transport="LoRa"
+        )
+        if reply_line:
+            self.query_one("#log", RichLog).write(reply_line)
 
     # ---- pane navigation (arrow keys) ------------------------------------
 
