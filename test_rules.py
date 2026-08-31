@@ -97,6 +97,12 @@ def test_split_device_key():
     print("device-list key parsing")
     check("explicit ble", bot._split_device_key("ble:BUG1"), (bot.TRANSPORT_BLE, "BUG1"))
     check("explicit tcp", bot._split_device_key("tcp:Meshtastic.local"), (bot.TRANSPORT_TCP, "Meshtastic.local"))
+    # A device path keeps its slashes; the prefix is stripped, nothing else.
+    check(
+        "explicit serial",
+        bot._split_device_key("serial:/dev/cu.usbmodem2101"),
+        (bot.TRANSPORT_SERIAL, "/dev/cu.usbmodem2101"),
+    )
     # A bare address predates the prefix scheme; treat it as BLE rather than
     # silently failing to connect.
     check("bare address means ble", bot._split_device_key("BUG1"), (bot.TRANSPORT_BLE, "BUG1"))

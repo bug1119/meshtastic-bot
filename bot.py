@@ -110,6 +110,7 @@ from textual.widgets import Input, Label, ListItem, ListView, RichLog
 
 import meshtastic
 import meshtastic.ble_interface
+import meshtastic.serial_interface
 import meshtastic.tcp_interface
 from meshtastic.protobuf import config_pb2
 
@@ -150,6 +151,7 @@ ALL_CHANNELS = "*"
 # and connect_device knows which interface class to build.
 TRANSPORT_BLE = "ble"
 TRANSPORT_TCP = "tcp"
+TRANSPORT_SERIAL = "serial"
 
 # Meshtastic's socket API port. Firmware only accepts one TCP client at a
 # time and force-closes the previous one, so connecting here kicks off a
@@ -197,7 +199,7 @@ def _split_device_key(device_key: str) -> tuple[str, str]:
     transport, sep, address = device_key.partition(":")
     if not sep:
         return TRANSPORT_BLE, device_key
-    if transport not in (TRANSPORT_BLE, TRANSPORT_TCP):
+    if transport not in (TRANSPORT_BLE, TRANSPORT_TCP, TRANSPORT_SERIAL):
         return TRANSPORT_BLE, device_key
     return transport, address
 
@@ -234,6 +236,65 @@ def node_position(node: dict) -> tuple[float, float] | None:
     if lat_i == 0 and lon_i == 0:
         return None
     return lat_i / 1e7, lon_i / 1e7
+
+
+def open_interface(transport: str, address: str):
+    """Build and connect the meshtastic interface for one transport.
+
+    Shared by the TUI and the one-shot --wifi path so both resolve addresses and
+    pick interface classes identically.
+    """
+    if transport == TRANSPORT_TCP:
+        hostname, port = _split_host_port(address)
+        return meshtastic.tcp_interface.TCPInterface(hostname=hostname, portNumber=port)
+    if transport == TRANSPORT_SERIAL:
+        return meshtastic.serial_interface.SerialInterface(devPath=address)
+    return meshtastic.ble_interface.BLEInterface(address=address)
+
+
+def set_wifi(transport: str, address: str, enable: bool) -> int:
+    """Turn the node's WiFi on or off, then exit. Returns a process exit code.
+
+    Deliberately not a TUI action: it reboots the device, and when switching off
+    over TCP it severs the very link it travelled over.
+    """
+    if transport == TRANSPORT_TCP and not enable:
+        print(
+            "注意: 正在透過 WiFi 關閉 WiFi - 這條連線會斷,而且無法再用 WiFi 開回來。\n"
+            "      要開回來需要 USB (--port) 或裝置螢幕上長按 WLAN 按鈕。",
+            file=sys.stderr,
+        )
+
+    print(f"連線 {transport}:{address} ...")
+    try:
+        iface = open_interface(transport, address)
+    except Exception as e:  # noqa: BLE001
+        print(f"連線失敗: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        node = iface.localNode
+        before = node.localConfig.network.wifi_enabled
+        owner = (iface.getMyUser() or {}).get("longName")
+        print(f"節點: {owner}  目前 wifi_enabled={before}")
+        if before == enable:
+            print(f"已經是 {'開' if enable else '關'},不做任何變更")
+            return 0
+
+        node.localConfig.network.wifi_enabled = enable
+        node.writeConfig("network")
+        print(f"已設定 wifi_enabled={enable},裝置會重新開機後生效")
+        if not enable:
+            print("提醒: 之後要開回來只能用 USB (--port) 或裝置螢幕長按 WLAN 按鈕")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"設定失敗: {e}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            iface.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def parse_latlon(text: str) -> tuple[float, float]:
@@ -401,14 +462,26 @@ class MeshtasticTUI(App):
         Binding("right", "focus_pane(1)", "下一欄", show=False, priority=True),
     ]
 
-    def __init__(self, tcp_host: str | None = None, here: tuple[float, float] | None = None) -> None:
+    def __init__(
+        self,
+        tcp_host: str | None = None,
+        serial_port: str | None = None,
+        here: tuple[float, float] | None = None,
+    ) -> None:
         super().__init__()
         # Reference position for node distances, from --here. Local only - it is
         # never sent to the device or broadcast to the mesh.
         self.here = here
-        # Set from --host. When present the bot talks TCP to that one node and
-        # never scans BLE, since there is nothing to discover.
         self.tcp_host = tcp_host
+        self.serial_port = serial_port
+        # Targets named on the command line, listed above the BLE scan results
+        # and connected to without waiting for the ~10s scan. TCP first so the
+        # existing --host behaviour is unchanged when both are given.
+        self.explicit_targets: list[tuple[str, str]] = []
+        if tcp_host:
+            self.explicit_targets.append((TRANSPORT_TCP, tcp_host))
+        if serial_port:
+            self.explicit_targets.append((TRANSPORT_SERIAL, serial_port))
         self.interface = None
         self.transport: str | None = None
         self.peer: str | None = None  # resolved address of the far end
@@ -502,11 +575,12 @@ class MeshtasticTUI(App):
         # Show the TCP row straight away so it is pickable during the scan;
         # _populate_devices rebuilds the list once the BLE results land.
         self._rebuild_device_list([])
-        if self.tcp_host and self.interface is None:
-            # --host is an explicit request for that node, so connect now
-            # rather than making the user wait out the BLE scan. The scan still
-            # runs, so a BLE device can be picked afterwards.
-            self._on_device_selected(f"{TRANSPORT_TCP}:{self.tcp_host}")
+        if self.explicit_targets and self.interface is None:
+            # A target named on the command line is an explicit request, so
+            # connect now rather than making the user wait out the BLE scan. The
+            # scan still runs, so a BLE device can be picked afterwards.
+            transport, address = self.explicit_targets[0]
+            self._on_device_selected(f"{transport}:{address}")
         self.scan_devices()
 
     @work(thread=True)
@@ -528,11 +602,13 @@ class MeshtasticTUI(App):
         """
         listview = self.query_one("#device-list", ListView)
         listview.clear()
-        if self.tcp_host:
+        marks = {TRANSPORT_TCP: "◆", TRANSPORT_SERIAL: "▣"}
+        for transport, address in self.explicit_targets:
+            shown = address.rsplit("/", 1)[-1] if transport == TRANSPORT_SERIAL else address
             listview.append(
                 ListItem(
-                    Label(f"◆ {self.tcp_host}  [dim]TCP[/dim]"),
-                    name=f"{TRANSPORT_TCP}:{self.tcp_host}",
+                    Label(f"{marks[transport]} {shown}  [dim]{transport.upper()}[/dim]"),
+                    name=f"{transport}:{address}",
                 )
             )
         for d in ble_devices:
@@ -560,7 +636,7 @@ class MeshtasticTUI(App):
 
         if not devices:
             self._log_system("沒掃到 BLE 裝置,按 R 重新掃描")
-        elif len(devices) == 1 and not self.tcp_host and self.interface is None:
+        elif len(devices) == 1 and not self.explicit_targets and self.interface is None:
             self._log_system(f"只找到一個裝置,自動連線: {devices[0].name}")
             listview.index = 0
             self._on_device_selected(f"{TRANSPORT_BLE}:{devices[0].name}")
@@ -574,11 +650,7 @@ class MeshtasticTUI(App):
     def connect_device(self, device_key: str) -> None:
         transport, address = _split_device_key(device_key)
         try:
-            if transport == TRANSPORT_TCP:
-                hostname, port = _split_host_port(address)
-                interface = meshtastic.tcp_interface.TCPInterface(hostname=hostname, portNumber=port)
-            else:
-                interface = meshtastic.ble_interface.BLEInterface(address=address)
+            interface = open_interface(transport, address)
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self._log_system, f"[red]連線失敗: {e}[/red]")
             return
@@ -1058,8 +1130,33 @@ def main() -> None:
         "needed when the connected node has no GPS fix. Stays local - it is "
         "never sent to the device or the mesh.",
     )
+    parser.add_argument(
+        "--port",
+        metavar="PATH",
+        help="also offer this node over USB serial, e.g. /dev/cu.usbmodem2101. "
+        "The only transport that still works once the node's WiFi is off and its "
+        "Bluetooth is disabled, which is the normal state on MUI/TFT boards.",
+    )
+    parser.add_argument(
+        "--wifi",
+        choices=("on", "off"),
+        help="turn the node's WiFi on or off, then exit without starting the UI. "
+        "Needs --port or --host. The device reboots to apply it, and switching it "
+        "off over --host severs that link - only USB or the device's own WLAN "
+        "button can switch it back on.",
+    )
     args = parser.parse_args()
-    MeshtasticTUI(tcp_host=args.host, here=args.here).run()
+
+    if args.wifi:
+        if args.port:
+            transport, address = TRANSPORT_SERIAL, args.port
+        elif args.host:
+            transport, address = TRANSPORT_TCP, args.host
+        else:
+            parser.error("--wifi needs a target: --port /dev/... (or --host, which cannot switch WiFi back on)")
+        sys.exit(set_wifi(transport, address, args.wifi == "on"))
+
+    MeshtasticTUI(tcp_host=args.host, serial_port=args.port, here=args.here).run()
 
 
 if __name__ == "__main__":
