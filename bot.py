@@ -23,8 +23,8 @@ Flow:
      target keeps its own scrollback), plus an input box to send text.
      Every channel and node DM is received, recorded, and browsable/sendable
      as normal - keyword auto-reply (see rules.txt) is the only thing scoped
-     down, firing only on the WATCH_CHANNEL_NAME channel (EDGE_ATS by
-     default).
+     down, firing only on channels that have rules of their own, and never
+     on direct messages.
 
 Usage:
     python3 bot.py
@@ -33,10 +33,25 @@ Keyboard: Left/Right cycle devices -> channels/nodes -> messages. Up/Down keep
 their normal per-widget meaning (move the list cursor in the device/target
 lists, scroll the log) - use Tab/Shift+Tab to reach the status pane.
 
-Auto-reply rules live in rules.txt next to this script, one per line as
-    keyword=reply text
+Auto-reply rules live in rules.txt next to this script, grouped by channel:
+
+    [EDGE_ATS]          the channel these rules apply to - either its name, or
+    ping=pong           its index as [#0] for the usually-unnamed primary.
+    help=指令: ping      [*] applies to every channel.
+
+    [#0]
+    ping=pong
+
+A channel's own rules are checked before [*], and the first keyword whose text
+appears in the message (case-insensitive substring) wins. Reply text is taken
+literally - do not quote it. Rules written before the first [header] apply to
+every channel, which keeps a flat pre-sections file working, but will also
+auto-reply on public channels, so prefer an explicit header.
+
 Blank lines and lines starting with # are ignored. The file is re-read on
 every incoming message, so edits take effect immediately - no restart needed.
+On connect, the bot logs which channels it will reply on and flags sections
+that match no channel on this node.
 
 The Meshtastic phone/desktop app must be disconnected from the device first -
 BLE only allows one connected client at a time.
@@ -86,41 +101,76 @@ from meshtastic.protobuf import config_pb2
 RULES_FILE = Path(__file__).parent / "rules.txt"
 
 DEFAULT_RULES = """\
-# keyword=reply text (one per line, case-insensitive substring match on keyword)
+# Auto-reply rules, grouped by channel.
+#
+#   [channel]           the channel the rules below it apply to, given either
+#                       as its Meshtastic name ([EDGE_ATS]) or its index
+#                       ([#0] - useful for the unnamed primary channel).
+#                       [*] applies to every channel.
+#   keyword=reply text  one rule per line, case-insensitive substring match
+#                       on keyword. The reply text is taken literally, so do
+#                       not quote it.
+#
+# The first matching rule wins, and a channel's own rules are checked before
+# [*]. Blank lines and lines starting with # are ignored.
+#
+# Rules placed before the first [channel] header apply to EVERY channel, which
+# is how the old flat format keeps working - but that will auto-reply on public
+# channels too, so prefer an explicit header.
+
+[EDGE_ATS]
 ping=pong
 help=指令: ping
 """
 
 BROADCAST_ADDR = "^all"
 
-# The bot only auto-replies on this one channel (by name, resolved to an
-# index once channels are known). Every other channel/DM is still recorded
-# and browsable/sendable as normal - see the gate in on_receive below.
-WATCH_CHANNEL_NAME = "EDGE_ATS"
+# rules.txt section that applies to every channel.
+ALL_CHANNELS = "*"
 
 
-def load_rules() -> dict[str, str]:
-    """Re-read rules.txt every call so edits take effect without restarting the bot."""
+def load_rules() -> dict[str, dict[str, str]]:
+    """Re-read rules.txt every call so edits take effect without restarting the bot.
+
+    Returns {section: {keyword: reply}}. A section is a channel name, "#<index>",
+    or ALL_CHANNELS. Rules appearing before the first [header] land in
+    ALL_CHANNELS, which is what keeps a flat pre-sections file working.
+    """
     if not RULES_FILE.exists():
         RULES_FILE.write_text(DEFAULT_RULES, encoding="utf-8")
 
-    rules: dict[str, str] = {}
+    rules: dict[str, dict[str, str]] = {}
+    section = ALL_CHANNELS
     for raw_line in RULES_FILE.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
+            continue
+        # Checked before the "=" test so a header is never mistaken for a rule.
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip() or ALL_CHANNELS
+            rules.setdefault(section, {})
+            continue
+        if "=" not in line:
             continue
         keyword, _, reply = line.partition("=")
         keyword = keyword.strip()
         if keyword:
-            rules[keyword] = reply.strip()
+            rules.setdefault(section, {})[keyword] = reply.strip()
     return rules
 
 
-def find_reply(text: str) -> str | None:
+def find_reply(text: str, sections: list[str]) -> str | None:
+    """First rule whose keyword appears in `text`, searching `sections` in order.
+
+    The caller passes the channel's own sections before ALL_CHANNELS, so a
+    channel-specific rule beats a catch-all one for the same keyword.
+    """
     lowered = text.lower()
-    for keyword, reply in load_rules().items():
-        if keyword.lower() in lowered:
-            return reply
+    rules = load_rules()
+    for section in sections:
+        for keyword, reply in rules.get(section, {}).items():
+            if keyword.lower() in lowered:
+                return reply
     return None
 
 
@@ -230,7 +280,6 @@ class MeshtasticTUI(App):
         self.my_id: str | None = None
         self.target: tuple[str, str | int] | None = None  # ("channel", idx) or ("node", id)
         self.history: dict[tuple, list[str]] = {}
-        self.watch_channel_index: int | None = None
         self.firmware_version: str | None = None
         self.last_signal: dict | None = None
         self.scanning = False
@@ -374,25 +423,68 @@ class MeshtasticTUI(App):
     def _config_synced(self, interface) -> None:
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
-        self.watch_channel_index = self._find_channel_index(WATCH_CHANNEL_NAME)
-        if self.watch_channel_index is None:
-            self._log_system(
-                f"[red]找不到頻道 {WATCH_CHANNEL_NAME},bot 不會自動回覆任何頻道[/red]"
-            )
-        else:
-            self._log_system(
-                f"[green]設定同步完成[/green] (my id: {self.my_id}),"
-                f"自動回覆頻道: {WATCH_CHANNEL_NAME} (index {self.watch_channel_index})"
-            )
+        self._log_system(f"[green]設定同步完成[/green] (my id: {self.my_id})")
+        self._report_rule_coverage()
         self._populate_targets()
         self._render_local_status()
         self.fetch_metadata()
 
-    def _find_channel_index(self, name: str) -> int | None:
+    def _channel_name(self, index: int) -> str | None:
+        """The channel's configured name, or None if it has none (the primary
+        channel is typically unnamed - address it as [#0] in rules.txt)."""
         for ch in self.interface.localNode.channels or []:
-            if ch.settings and ch.settings.name == name:
-                return ch.index
+            if ch.index == index and ch.settings:
+                return ch.settings.name or None
         return None
+
+    def _channel_sections(self, index: int) -> list[str]:
+        """rules.txt sections that apply to channel `index`, most specific first."""
+        sections = []
+        name = self._channel_name(index)
+        if name:
+            sections.append(name)
+        sections.append(f"#{index}")
+        sections.append(ALL_CHANNELS)
+        return sections
+
+    def _known_channel_sections(self) -> set[str]:
+        """Every section name that would match one of this node's channels, so
+        _config_synced can warn about rules aimed at a channel that is not
+        configured here (a typo'd name, or a channel on another node)."""
+        known = {ALL_CHANNELS}
+        for ch in self.interface.localNode.channels or []:
+            if not ch.settings:
+                continue
+            known.add(f"#{ch.index}")
+            if ch.settings.name:
+                known.add(ch.settings.name)
+        return known
+
+    def _report_rule_coverage(self) -> None:
+        """Log which channels rules.txt will auto-reply on, and flag anything
+        suspicious - sections that match no channel here, and catch-all rules
+        that would fire on public channels."""
+        rules = load_rules()
+        if not rules:
+            self._log_system("[yellow]rules.txt 沒有任何規則,bot 不會自動回覆[/yellow]")
+            return
+
+        known = self._known_channel_sections()
+        for section, section_rules in sorted(rules.items()):
+            if not section_rules:
+                continue
+            count = len(section_rules)
+            if section == ALL_CHANNELS:
+                self._log_system(
+                    f"[yellow]{count} 條規則適用於「所有頻道」,包含公共頻道 - "
+                    f"建議改用 [頻道名] 或 [#index] 限定[/yellow]"
+                )
+            elif section in known:
+                self._log_system(f"自動回覆頻道 [{section}]: {count} 條規則")
+            else:
+                self._log_system(
+                    f"[red]rules.txt 的 [{section}] 對不上這台的任何頻道,該區規則不會生效[/red]"
+                )
 
     # ---- pane 1b: local device status -------------------------------------
 
@@ -575,8 +667,8 @@ class MeshtasticTUI(App):
         snr: float | None = None,
         rssi: int | None = None,
     ) -> str | None:
-        """Send + record the keyword auto-reply for `text` if it's on the
-        watched channel and matches a rule. Shared by on_receive (messages
+        """Send + record the keyword auto-reply for `text` if its channel has a
+        matching rule in rules.txt. Shared by on_receive (messages
         that arrived over the mesh) and on_input_submitted (messages typed
         into the send box on this connected device) so both paths get
         monitored/replied-to identically. Returns the reply line to display,
@@ -584,14 +676,15 @@ class MeshtasticTUI(App):
         the log, since on_receive needs call_from_thread and
         on_input_submitted (already on the UI thread) doesn't.
         """
-        if target != ("channel", self.watch_channel_index):
+        kind, key = target
+        # Rules are per-channel, so DMs are recorded but never auto-replied to.
+        if kind != "channel":
             return None
-        reply = find_reply(text)
+        reply = find_reply(text, self._channel_sections(key))
         if reply is None:
             return None
         info_like = {"when": when, "transport": transport, "snr": snr, "rssi": rssi, "from_id": from_id}
         full_reply = build_reply_text(reply, info_like)
-        kind, key = target
         if kind == "channel":
             interface.sendText(full_reply, channelIndex=key)
         else:

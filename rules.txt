@@ -1,3 +1,22 @@
-# keyword=reply text (one per line, case-insensitive substring match on keyword)
+# Auto-reply rules, grouped by channel.
+#
+#   [channel]           the channel the rules below it apply to, given either
+#                       as its Meshtastic name ([EDGE_ATS]) or its index
+#                       ([#0] - useful for the unnamed primary channel).
+#                       [*] applies to every channel.
+#   keyword=reply text  one rule per line, case-insensitive substring match
+#                       on keyword. The reply text is taken literally, so do
+#                       not quote it.
+#
+# The first matching rule wins, and a channel's own rules are checked before
+# [*]. Blank lines and lines starting with # are ignored. Direct messages are
+# never auto-replied to.
+#
+# Rules placed before the first [channel] header apply to EVERY channel, which
+# is how the old flat format keeps working - but that will auto-reply on public
+# channels too, so prefer an explicit header.
+
+[EDGE_ATS]
 ping=pong
+test=Bot: Hello!
 help=指令: ping
