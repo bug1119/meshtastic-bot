@@ -97,6 +97,7 @@ import argparse
 import atexit
 import datetime
 import threading
+import unicodedata
 from pathlib import Path
 
 from pubsub import pub
@@ -196,6 +197,17 @@ def _split_device_key(device_key: str) -> tuple[str, str]:
     if transport not in (TRANSPORT_BLE, TRANSPORT_TCP):
         return TRANSPORT_BLE, device_key
     return transport, address
+
+
+# Content width of the local-status pane. CJK glyphs occupy two terminal cells,
+# so a line that looks short in source can still wrap and strand a word on its
+# own row - measure with display_width() before writing a variable-length line.
+STATUS_PANE_WIDTH = 24
+
+
+def display_width(text: str) -> int:
+    """Terminal cells `text` occupies, counting East Asian wide/fullwidth as 2."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
 
 
 def _split_host_port(address: str) -> tuple[str, int]:
@@ -664,7 +676,10 @@ class MeshtasticTUI(App):
         if lora.override_frequency:
             log.write(f"[bold]頻率:[/bold] {lora.override_frequency:.3f} MHz")
         else:
-            log.write("[bold]頻率:[/bold] 依 Region/Slot 自動")
+            # Kept under the pane's 24-column content area: the old wording was
+            # 25 columns wide (CJK counts double) and wrapped, stranding a word
+            # on its own line.
+            log.write("[bold]頻率:[/bold] 依 Region/Slot")
         log.write(f"[bold]Bandwidth:[/bold] {lora.bandwidth} kHz")
         log.write(f"[bold]Tx Power:[/bold] {lora.tx_power} dBm")
 
@@ -695,9 +710,19 @@ class MeshtasticTUI(App):
         else:
             gps_line = "已啟用,尚無定位"
         log.write(f"[bold]GPS:[/bold] {gps_line}")
-        # Last so Region keeps the top of the pane.
-        peer = f" {self.peer}" if self.peer else ""
-        log.write(f"[bold]連線:[/bold] {(self.transport or '?').upper()}{peer}")
+        # Last so Region keeps the top of the pane. The address is variable
+        # length - a long IP or a hostname fallback overflows the pane and wraps
+        # mid-value, so drop it to its own indented row instead of letting the
+        # terminal break it in an arbitrary place.
+        transport = (self.transport or "?").upper()
+        if self.peer:
+            if display_width(f"連線: {transport} {self.peer}") <= STATUS_PANE_WIDTH:
+                log.write(f"[bold]連線:[/bold] {transport} {self.peer}")
+            else:
+                log.write(f"[bold]連線:[/bold] {transport}")
+                log.write(f"  {self.peer}")
+        else:
+            log.write(f"[bold]連線:[/bold] {transport}")
 
     # ---- pane 2: channels & nodes -----------------------------------------
 

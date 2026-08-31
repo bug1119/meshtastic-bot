@@ -164,6 +164,21 @@ def test_describe_peer():
     check("ble without a client", _describe(types.SimpleNamespace(client=None), bot.TRANSPORT_BLE), None)
 
 
+def test_display_width():
+    print("display width (CJK counts double)")
+    check("ascii", bot.display_width("Region: TW"), 10)
+    check("cjk label", bot.display_width("頻率: 依 Region/Slot"), 20)
+    # The wording this replaced was 25 wide and wrapped in a 24-column pane.
+    check("the old wrapping string", bot.display_width("頻率: 依 Region/Slot 自動"), 25)
+    check("fits the pane", bot.display_width("頻率: 依 Region/Slot") <= bot.STATUS_PANE_WIDTH, True)
+
+    # The 連線 line: short IPs fit on one row, long ones must not.
+    check("short ip fits", bot.display_width("連線: TCP 192.168.0.247") <= bot.STATUS_PANE_WIDTH, True)
+    check("long ip does not fit", bot.display_width("連線: TCP 192.168.100.247") <= bot.STATUS_PANE_WIDTH, False)
+    check("hostname does not fit", bot.display_width("連線: TCP Meshtastic.local") <= bot.STATUS_PANE_WIDTH, False)
+    check("ble mac does not fit", bot.display_width("連線: BLE AA:BB:CC:DD:EE:FF") <= bot.STATUS_PANE_WIDTH, False)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -175,6 +190,7 @@ if __name__ == "__main__":
         test_split_device_key()
         test_split_host_port()
         test_describe_peer()
+        test_display_width()
     finally:
         bot.RULES_FILE = original
 
