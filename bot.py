@@ -363,6 +363,10 @@ def build_reply_text(reply: str, info: dict) -> str:
         bits.append(f"snr={info['snr']}")
     if info["rssi"] is not None:
         bits.append(f"rssi={info['rssi']}")
+    # Omitted rather than sent as "--" when unknown: the payload limit is tight,
+    # and a field that is usually blank is worse than no field.
+    if info.get("distance_m") is not None:
+        bits.append(f"dist={format_distance(info['distance_m'])}")
     return f"{reply} | {' '.join(bits)} from={info['from_id']}"
 
 
@@ -622,6 +626,22 @@ class MeshtasticTUI(App):
         self._populate_targets()
         self._render_local_status()
         self.fetch_metadata()
+
+    def _distance_to(self, node_id: str | None) -> float | None:
+        """Distance from this station to `node_id`, or None if either end lacks
+        a position.
+
+        Returns None for our own id too: a reply to a message typed here would
+        otherwise carry a trivially true "dist=0m".
+        """
+        if not node_id or node_id == self.my_id or self.interface is None:
+            return None
+        nodes = self.interface.nodes or {}
+        here = self.here or node_position(nodes.get(self.my_id, {}))
+        there = node_position(nodes.get(node_id, {}))
+        if here is None or there is None:
+            return None
+        return haversine_m(*here, *there)
 
     def _channel_name(self, index: int) -> str | None:
         """The channel's configured name, or None if it has none (the primary
@@ -926,7 +946,14 @@ class MeshtasticTUI(App):
         reply = find_reply(text, self._channel_sections(key))
         if reply is None:
             return None
-        info_like = {"when": when, "transport": transport, "snr": snr, "rssi": rssi, "from_id": from_id}
+        info_like = {
+            "when": when,
+            "transport": transport,
+            "snr": snr,
+            "rssi": rssi,
+            "from_id": from_id,
+            "distance_m": self._distance_to(from_id),
+        }
         full_reply = build_reply_text(reply, info_like)
         if kind == "channel":
             interface.sendText(full_reply, channelIndex=key)

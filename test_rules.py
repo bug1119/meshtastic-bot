@@ -265,6 +265,57 @@ def test_derived_frequency():
     check("region override slot resolves", lora_params.frequency_mhz(forced) is not None, True)
 
 
+def test_reply_text():
+    print("auto-reply text")
+    base = {"when": "12:34:56", "transport": "LoRa", "snr": 6.5, "rssi": -92, "from_id": "!abc"}
+    check(
+        "no distance field when unknown",
+        bot.build_reply_text("pong", base),
+        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 from=!abc",
+    )
+    check(
+        "distance appended when known",
+        bot.build_reply_text("pong", {**base, "distance_m": 5029.0}),
+        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=5.0km from=!abc",
+    )
+    check(
+        "metres for a near node",
+        bot.build_reply_text("pong", {**base, "distance_m": 842.4}),
+        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=842m from=!abc",
+    )
+    # An explicit None must behave like an absent key, not print "None".
+    check(
+        "explicit None is omitted",
+        bot.build_reply_text("pong", {**base, "distance_m": None}),
+        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 from=!abc",
+    )
+
+
+def test_distance_to():
+    print("_distance_to")
+    here = (25.0339, 121.5645)
+    there = {"position": {"latitudeI": 250478000, "longitudeI": 1215170000}}
+    stub = types.SimpleNamespace(
+        my_id="!me",
+        here=here,
+        interface=types.SimpleNamespace(nodes={"!me": {}, "!far": there, "!nopos": {}}),
+    )
+    call = bot.MeshtasticTUI._distance_to
+    check("known sender", round(call(stub, "!far")), 5029)
+    check("sender without a position", call(stub, "!nopos"), None)
+    check("unknown sender", call(stub, "!missing"), None)
+    check("our own id is skipped", call(stub, "!me"), None)
+    check("no sender", call(stub, None), None)
+
+    # No reference position at either end -> nothing to compute from.
+    no_here = types.SimpleNamespace(
+        my_id="!me", here=None, interface=types.SimpleNamespace(nodes={"!me": {}, "!far": there})
+    )
+    check("no reference position", call(no_here, "!far"), None)
+
+    check("no interface", call(types.SimpleNamespace(my_id="!me", here=here, interface=None), "!far"), None)
+
+
 def test_node_position():
     print("node position extraction")
     check("no position key", bot.node_position({}), None)
@@ -318,6 +369,8 @@ if __name__ == "__main__":
         test_derived_frequency()
         test_node_position()
         test_distance()
+        test_distance_to()
+        test_reply_text()
     finally:
         bot.RULES_FILE = original
 
