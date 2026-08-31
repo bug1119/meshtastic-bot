@@ -348,7 +348,7 @@ class MeshtasticTUI(App):
         with Vertical():
             with Horizontal(id="main-row"):
                 with Vertical(id="devices-pane"):
-                    yield Label("裝置 (BLE)", classes="pane-title")
+                    yield Label("裝置", classes="pane-title")
                     yield ListView(id="device-list")
                     yield Label("本機狀態", classes="pane-title")
                     yield RichLog(
