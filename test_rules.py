@@ -12,6 +12,7 @@ runs. Importing bot is safe: the TUI only starts under __main__.
 import pathlib
 import sys
 import tempfile
+import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -117,6 +118,52 @@ def test_split_host_port():
           ("host:nope", bot.DEFAULT_TCP_PORT))
 
 
+class _FakeSocket:
+    def __init__(self, peer):
+        self._peer = peer
+
+    def getpeername(self):
+        if self._peer is None:
+            raise OSError("not connected")
+        return self._peer
+
+
+def _describe(iface, transport, tcp_host="Meshtastic.local"):
+    """Call _describe_peer with a stand-in self.
+
+    The method only reads self.tcp_host, so a namespace avoids constructing a
+    real Textual App just to test address formatting.
+    """
+    return bot.MeshtasticTUI._describe_peer(
+        types.SimpleNamespace(tcp_host=tcp_host), iface, transport
+    )
+
+
+def test_describe_peer():
+    print("connection address shown in the status pane")
+    tcp = types.SimpleNamespace(socket=_FakeSocket(("192.168.0.247", 4403)), hostname="Meshtastic.local")
+    check("tcp shows the resolved ip", _describe(tcp, bot.TRANSPORT_TCP), "192.168.0.247")
+
+    # A hostname was given but the socket knows the real address - report the IP.
+    odd_port = types.SimpleNamespace(socket=_FakeSocket(("192.168.0.247", 9999)), hostname="h")
+    check("non-default port is appended", _describe(odd_port, bot.TRANSPORT_TCP), "192.168.0.247:9999")
+
+    # IPv6 peers come back as 4-tuples; only host and port should be used.
+    v6 = types.SimpleNamespace(socket=_FakeSocket(("fe80::1", 4403, 0, 0)), hostname="h")
+    check("ipv6 peer", _describe(v6, bot.TRANSPORT_TCP), "fe80::1")
+
+    dead = types.SimpleNamespace(socket=_FakeSocket(None), hostname="Meshtastic.local")
+    check("dead socket falls back to hostname", _describe(dead, bot.TRANSPORT_TCP), "Meshtastic.local")
+
+    bare = types.SimpleNamespace(socket=None, hostname=None)
+    check("no socket or hostname falls back to --host", _describe(bare, bot.TRANSPORT_TCP), "Meshtastic.local")
+
+    ble = types.SimpleNamespace(client=types.SimpleNamespace(address="AA:BB:CC:DD:EE:FF"))
+    check("ble reads client.address", _describe(ble, bot.TRANSPORT_BLE), "AA:BB:CC:DD:EE:FF")
+
+    check("ble without a client", _describe(types.SimpleNamespace(client=None), bot.TRANSPORT_BLE), None)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -127,6 +174,7 @@ if __name__ == "__main__":
         test_empty_section_is_kept()
         test_split_device_key()
         test_split_host_port()
+        test_describe_peer()
     finally:
         bot.RULES_FILE = original
 

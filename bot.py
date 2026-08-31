@@ -332,6 +332,7 @@ class MeshtasticTUI(App):
         self.tcp_host = tcp_host
         self.interface = None
         self.transport: str | None = None
+        self.peer: str | None = None  # resolved address of the far end
         self.my_id: str | None = None
         self.target: tuple[str, str | int] | None = None  # ("channel", idx) or ("node", id)
         self.history: dict[tuple, list[str]] = {}
@@ -511,7 +512,28 @@ class MeshtasticTUI(App):
         # (see on_config_synced below). Don't populate the targets pane here.
         self.interface = interface
         self.transport = transport
-        self._log_system(f"[green]{transport.upper()} 已連線[/green],等待設定同步...")
+        self.peer = self._describe_peer(interface, transport)
+        where = f" ({self.peer})" if self.peer else ""
+        self._log_system(f"[green]{transport.upper()} 已連線{where}[/green],等待設定同步...")
+
+    def _describe_peer(self, interface, transport: str) -> str | None:
+        """Address of the far end, for the status pane.
+
+        TCP asks the socket for the resolved peer, so connecting by a hostname
+        like Meshtastic.local still reports the IP actually reached. The port is
+        only shown when it is not the default, to keep the narrow pane readable.
+        BLE keeps its address on the inner client rather than the interface.
+        """
+        if transport == TRANSPORT_TCP:
+            sock = getattr(interface, "socket", None)
+            try:
+                host, port = sock.getpeername()[:2]
+            except Exception:  # noqa: BLE001
+                # Socket already gone, or a stub without getpeername - fall back
+                # to whatever we were asked to connect to.
+                return getattr(interface, "hostname", None) or self.tcp_host
+            return host if port == DEFAULT_TCP_PORT else f"{host}:{port}"
+        return getattr(getattr(interface, "client", None), "address", None)
 
     def on_config_synced(self, interface, topic=pub.AUTO_TOPIC) -> None:
         # Fires on meshtastic's own pubsub thread, not Textual's - hop back.
@@ -674,7 +696,8 @@ class MeshtasticTUI(App):
             gps_line = "已啟用,尚無定位"
         log.write(f"[bold]GPS:[/bold] {gps_line}")
         # Last so Region keeps the top of the pane.
-        log.write(f"[bold]連線:[/bold] {(self.transport or '?').upper()}")
+        peer = f" {self.peer}" if self.peer else ""
+        log.write(f"[bold]連線:[/bold] {(self.transport or '?').upper()}{peer}")
 
     # ---- pane 2: channels & nodes -----------------------------------------
 
