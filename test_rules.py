@@ -17,6 +17,8 @@ import types
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 import bot  # noqa: E402
+import lora_params  # noqa: E402
+from meshtastic.protobuf import config_pb2  # noqa: E402
 
 _failures: list[str] = []
 
@@ -179,6 +181,127 @@ def test_display_width():
     check("ble mac does not fit", bot.display_width("連線: BLE AA:BB:CC:DD:EE:FF") <= bot.STATUS_PANE_WIDTH, False)
 
 
+def _lora(**fields):
+    """A real LoRaConfig with `fields` set, so the tables meet the actual types."""
+    cfg = config_pb2.Config.LoRaConfig()
+    for key, value in fields.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+_REGION = config_pb2.Config.LoRaConfig.RegionCode
+_PRESET = config_pb2.Config.LoRaConfig.ModemPreset
+
+
+def test_derived_bandwidth():
+    print("derived bandwidth")
+    preset = _lora(use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("TW"))
+    # A real TW/MEDIUM_FAST node stores bandwidth 250 even though this one reports 0.
+    check("preset MEDIUM_FAST", lora_params.bandwidth_khz(preset), 250.0)
+
+    slow = _lora(use_preset=True, modem_preset=_PRESET.Value("LONG_SLOW"), region=_REGION.Value("TW"))
+    check("preset LONG_SLOW", lora_params.bandwidth_khz(slow), 125.0)
+
+    # 2.4 GHz widens every preset.
+    wide = _lora(use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("LORA_24"))
+    check("wide-lora widens it", lora_params.bandwidth_khz(wide), 812.5)
+
+    custom = _lora(use_preset=False, bandwidth=62, region=_REGION.Value("TW"))
+    check("custom config uses the stored value", lora_params.bandwidth_khz(custom), 62.0)
+
+    custom_zero = _lora(use_preset=False, bandwidth=0, region=_REGION.Value("TW"))
+    check("custom config with nothing stored", lora_params.bandwidth_khz(custom_zero), None)
+
+
+def test_derived_frequency():
+    print("derived frequency")
+    # The reference case: a real GAT562 on TW/MEDIUM_FAST/slot 1 has
+    # override_frequency pinned to exactly this.
+    tw = _lora(
+        use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("TW"), channel_num=1
+    )
+    check("TW MEDIUM_FAST slot 1", round(lora_params.frequency_mhz(tw), 4), 920.125)
+
+    tw_slot3 = _lora(
+        use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("TW"), channel_num=3
+    )
+    check("TW slot 3 is two slot widths up", round(lora_params.frequency_mhz(tw_slot3), 4), 920.625)
+    check("TW slot count", lora_params.slot_count(tw), 20)
+
+    # EU_866's spacing/padding profile: the firmware documents these four exact
+    # channels, so they pin the formula's padding and spacing handling.
+    eu866 = [
+        round(
+            lora_params.frequency_mhz(
+                _lora(
+                    use_preset=True,
+                    modem_preset=_PRESET.Value("LITE_FAST"),
+                    region=_REGION.Value("EU_866"),
+                    channel_num=slot,
+                )
+            ),
+            4,
+        )
+        for slot in (1, 2, 3, 4)
+    ]
+    check("EU_866 documented channels", eu866, [865.7, 866.3, 866.9, 867.5])
+
+    override = _lora(use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("TW"),
+                     channel_num=5, override_frequency=921.5)
+    check("override_frequency wins over the slot", lora_params.frequency_mhz(override), 921.5)
+
+    offset = _lora(use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("TW"),
+                   channel_num=1, frequency_offset=0.5)
+    check("frequency_offset is applied", round(lora_params.frequency_mhz(offset), 4), 920.625)
+
+    # Slot 0 means the firmware hashes the channel name to pick one; that is not
+    # reproduced, so this must decline rather than guess.
+    auto = _lora(use_preset=True, modem_preset=_PRESET.Value("MEDIUM_FAST"), region=_REGION.Value("TW"), channel_num=0)
+    check("auto slot cannot be derived", lora_params.frequency_mhz(auto), None)
+
+    # EU_N_868 forces slot 1, so it resolves even with channel_num unset.
+    forced = _lora(use_preset=True, modem_preset=_PRESET.Value("NARROW_SLOW"), region=_REGION.Value("EU_N_868"),
+                   channel_num=0)
+    check("region override slot resolves", lora_params.frequency_mhz(forced) is not None, True)
+
+
+def test_node_position():
+    print("node position extraction")
+    check("no position key", bot.node_position({}), None)
+    # What a node with GPS on but no fix actually reports - seen on real hardware.
+    check("timestamp only means no fix", bot.node_position({"position": {"time": 1788193370}}), None)
+    check("exact 0,0 is a placeholder", bot.node_position({"position": {"latitudeI": 0, "longitudeI": 0}}), None)
+    check(
+        "real fix is scaled by 1e7",
+        bot.node_position({"position": {"latitudeI": 250339000, "longitudeI": 1215645000}}),
+        (25.0339, 121.5645),
+    )
+
+
+def test_distance():
+    print("distance")
+    # One degree of latitude on the mean-radius sphere.
+    check("1 degree of latitude", round(bot.haversine_m(0, 0, 1, 0)), 111195)
+    check("same point is zero", bot.haversine_m(25.0, 121.0, 25.0, 121.0), 0.0)
+    check("symmetric", round(bot.haversine_m(25, 121, 24, 120), 3), round(bot.haversine_m(24, 120, 25, 121), 3))
+
+    print("--here parsing")
+    check("plain pair", bot.parse_latlon("25.0339,121.5645"), (25.0339, 121.5645))
+    check("negative and spaced", bot.parse_latlon(" -33.9, 18.4 "), (-33.9, 18.4))
+    for bad in ("25.0339", "25,121,3", "a,b", "91,0", "0,181"):
+        try:
+            bot.parse_latlon(bad)
+            check(f"rejects {bad!r}", "accepted", "rejected")
+        except Exception:
+            check(f"rejects {bad!r}", "rejected", "rejected")
+
+    print("distance formatting")
+    check("unknown", bot.format_distance(None), "--")
+    check("metres below 1 km", bot.format_distance(842.4), "842m")
+    check("kilometres", bot.format_distance(5432.0), "5.4km")
+    check("exactly 1 km", bot.format_distance(1000.0), "1.0km")
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -191,6 +314,10 @@ if __name__ == "__main__":
         test_split_host_port()
         test_describe_peer()
         test_display_width()
+        test_derived_bandwidth()
+        test_derived_frequency()
+        test_node_position()
+        test_distance()
     finally:
         bot.RULES_FILE = original
 

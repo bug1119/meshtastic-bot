@@ -96,6 +96,7 @@ if _missing_packages:
 import argparse
 import atexit
 import datetime
+import math
 import threading
 import unicodedata
 from pathlib import Path
@@ -111,6 +112,8 @@ import meshtastic
 import meshtastic.ble_interface
 import meshtastic.tcp_interface
 from meshtastic.protobuf import config_pb2
+
+import lora_params
 
 RULES_FILE = Path(__file__).parent / "rules.txt"
 
@@ -208,6 +211,63 @@ STATUS_PANE_WIDTH = 24
 def display_width(text: str) -> int:
     """Terminal cells `text` occupies, counting East Asian wide/fullwidth as 2."""
     return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+# IUGG mean Earth radius. Node separations here are tens of kilometres at most,
+# where a spherical model is well inside the error of a LoRa-reported position.
+EARTH_RADIUS_M = 6371008.8
+
+
+def node_position(node: dict) -> tuple[float, float] | None:
+    """(latitude, longitude) in degrees from a nodeDB entry, or None.
+
+    Meshtastic stores degrees as integers scaled by 1e7. None covers three cases
+    that all mean "no usable fix": no position dict at all, a position dict
+    carrying only a timestamp (what a node with GPS enabled but no fix reports),
+    and an exact 0,0 - which is a placeholder in practice, not a real position in
+    the Gulf of Guinea.
+    """
+    position = node.get("position") or {}
+    lat_i, lon_i = position.get("latitudeI"), position.get("longitudeI")
+    if lat_i is None or lon_i is None:
+        return None
+    if lat_i == 0 and lon_i == 0:
+        return None
+    return lat_i / 1e7, lon_i / 1e7
+
+
+def parse_latlon(text: str) -> tuple[float, float]:
+    """Parse "lat,lon" for --here, raising argparse's error type on bad input."""
+    parts = text.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"expected LAT,LON - got {text!r}")
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected two numbers - got {text!r}") from None
+    if not -90 <= lat <= 90:
+        raise argparse.ArgumentTypeError(f"latitude out of range: {lat}")
+    if not -180 <= lon <= 180:
+        raise argparse.ArgumentTypeError(f"longitude out of range: {lon}")
+    return lat, lon
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon pairs, in metres."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = phi2 - phi1
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def format_distance(metres: float | None) -> str:
+    """Compact distance for the node list; "--" when it cannot be computed."""
+    if metres is None:
+        return "--"
+    if metres < 1000:
+        return f"{metres:.0f}m"
+    return f"{metres / 1000:.1f}km"
 
 
 def _split_host_port(address: str) -> tuple[str, int]:
@@ -337,8 +397,11 @@ class MeshtasticTUI(App):
         Binding("right", "focus_pane(1)", "下一欄", show=False, priority=True),
     ]
 
-    def __init__(self, tcp_host: str | None = None) -> None:
+    def __init__(self, tcp_host: str | None = None, here: tuple[float, float] | None = None) -> None:
         super().__init__()
+        # Reference position for node distances, from --here. Local only - it is
+        # never sent to the device or broadcast to the mesh.
+        self.here = here
         # Set from --host. When present the bot talks TCP to that one node and
         # never scans BLE, since there is nothing to discover.
         self.tcp_host = tcp_host
@@ -673,14 +736,23 @@ class MeshtasticTUI(App):
         log.write(f"[bold]Role:[/bold] {role}")
         log.write(f"[bold]Preset:[/bold] {preset}")
         log.write(f"[bold]Slot:[/bold] {lora.channel_num or '(Auto)'}")
+        # A preset config leaves stored bandwidth at 0 and override_frequency at
+        # 0.0, so both of these are reconstructed - see lora_params. A "~" marks
+        # a derived value so it is not mistaken for something the node reported.
+        freq = lora_params.frequency_mhz(lora)
         if lora.override_frequency:
-            log.write(f"[bold]頻率:[/bold] {lora.override_frequency:.3f} MHz")
+            log.write(f"[bold]頻率:[/bold] {freq:.3f} MHz")
+        elif freq is not None:
+            log.write(f"[bold]頻率:[/bold] ~{freq:.3f} MHz")
         else:
-            # Kept under the pane's 24-column content area: the old wording was
-            # 25 columns wide (CJK counts double) and wrapped, stranding a word
-            # on its own line.
-            log.write("[bold]頻率:[/bold] 依 Region/Slot")
-        log.write(f"[bold]Bandwidth:[/bold] {lora.bandwidth} kHz")
+            log.write("[bold]頻率:[/bold] 無法推導")
+        bw = lora_params.bandwidth_khz(lora)
+        if bw is None:
+            log.write("[bold]Bandwidth:[/bold] 無法推導")
+        elif lora.use_preset:
+            log.write(f"[bold]Bandwidth:[/bold] ~{bw:g} kHz")
+        else:
+            log.write(f"[bold]Bandwidth:[/bold] {bw:g} kHz")
         log.write(f"[bold]Tx Power:[/bold] {lora.tx_power} dBm")
 
         node = (self.interface.nodes or {}).get(self.my_id, {})
@@ -738,14 +810,38 @@ class MeshtasticTUI(App):
                 ListItem(Label(f"# {name}"), name=f"channel:{ch.index}")
             )
 
-        for node_id, node in (self.interface.nodes or {}).items():
+        nodes = self.interface.nodes or {}
+        # --here wins over the node's own fix: it is there precisely because this
+        # device has none, and an operator-supplied position is not worth
+        # second-guessing when it disagrees.
+        here = self.here or node_position(nodes.get(self.my_id, {}))
+        with_position = 0
+
+        for node_id, node in nodes.items():
             if node_id == self.my_id:
                 continue
             user = node.get("user", {})
             label = user.get("shortName") or user.get("longName") or node_id
-            listview.append(ListItem(Label(f"@ {label} [dim]{node_id}[/dim]"), name=f"node:{node_id}"))
+            there = node_position(node)
+            if there is not None:
+                with_position += 1
+            distance = haversine_m(*here, *there) if (here and there) else None
+            listview.append(
+                ListItem(
+                    Label(f"@ {label} [dim]{node_id}[/dim] {format_distance(distance)}"),
+                    name=f"node:{node_id}",
+                )
+            )
 
         self._log_system(f"載入 {len(listview.children)} 個頻道/node")
+        # Distance needs a position at both ends, so say which end is missing
+        # rather than leaving a column of "--" unexplained.
+        if here is None:
+            self._log_system("[yellow]本機無定位,無法計算距離(可用 --here LAT,LON 指定)[/yellow]")
+        elif with_position == 0:
+            self._log_system("[yellow]沒有節點回報位置,無法計算距離[/yellow]")
+        else:
+            self._log_system(f"{with_position} 個節點有位置,可計算距離")
 
     def _on_target_selected(self, target_key: str) -> None:
         kind, _, key = target_key.partition(":")
@@ -927,8 +1023,16 @@ def main() -> None:
         f"192.168.0.247. Connected to immediately; BLE is still scanned. "
         f"Port defaults to {DEFAULT_TCP_PORT}.",
     )
+    parser.add_argument(
+        "--here",
+        metavar="LAT,LON",
+        type=parse_latlon,
+        help="this station's position, used to show each node's distance. Only "
+        "needed when the connected node has no GPS fix. Stays local - it is "
+        "never sent to the device or the mesh.",
+    )
     args = parser.parse_args()
-    MeshtasticTUI(tcp_host=args.host).run()
+    MeshtasticTUI(tcp_host=args.host, here=args.here).run()
 
 
 if __name__ == "__main__":
