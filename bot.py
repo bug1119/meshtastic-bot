@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Meshtastic BLE monitor - three-pane interactive TUI.
+"""Meshtastic monitor - three-pane interactive TUI (BLE or WiFi/TCP).
 
 Layout (all visible at once, k9s/ranger style):
     +-----------+-----------+---------------------------+
@@ -12,8 +12,12 @@ Layout (all visible at once, k9s/ranger style):
     +-----------+-----------+---------------------------+
 
 Flow:
-  1. Left pane (top) - scans for Meshtastic BLE peripherals, pick one to
-     connect. Left pane (bottom) - once connected, shows the connected
+  1. Left pane (top) - scans for Meshtastic BLE peripherals and, when --host
+     was given, lists that TCP node alongside them, each row marked with its
+     transport; pick one to connect. --host connects immediately rather than
+     waiting out the ~10s BLE scan, which keeps running so a BLE device can
+     still be picked afterwards.
+     Left pane (bottom) - once connected, shows the connected
      device's own status: firmware version, role/preset/region/slot/
      frequency, uptime, last-heard signal quality, GPS fix.
   2. Middle pane - once connected, lists this node's channels AND all known
@@ -27,7 +31,9 @@ Flow:
      on direct messages.
 
 Usage:
-    python3 bot.py
+    python3 bot.py                          # scan and connect over BLE
+    python3 bot.py --host Meshtastic.local  # connect over WiFi/TCP
+    python3 bot.py --host 192.168.0.247:4403
 
 Keyboard: Left/Right cycle devices -> channels/nodes -> messages. Up/Down keep
 their normal per-widget meaning (move the list cursor in the device/target
@@ -53,8 +59,13 @@ every incoming message, so edits take effect immediately - no restart needed.
 On connect, the bot logs which channels it will reply on and flags sections
 that match no channel on this node.
 
-The Meshtastic phone/desktop app must be disconnected from the device first -
-BLE only allows one connected client at a time.
+The Meshtastic phone/desktop app must be disconnected from the device first,
+on either transport: BLE allows one connected client at a time, and the
+firmware's socket API accepts a single TCP client and force-closes the previous
+one, so connecting here will kick an app already talking to that node.
+
+TCP is the way in to a node whose Bluetooth is off - notably MUI/TFT boards,
+where enabling BLE puts the device UI into programming mode.
 """
 
 import importlib
@@ -82,6 +93,7 @@ if _missing_packages:
     print(f"    pip3 install {' '.join(_missing_packages)}", file=sys.stderr)
     sys.exit(1)
 
+import argparse
 import atexit
 import datetime
 import threading
@@ -96,6 +108,7 @@ from textual.widgets import Input, Label, ListItem, ListView, RichLog
 
 import meshtastic
 import meshtastic.ble_interface
+import meshtastic.tcp_interface
 from meshtastic.protobuf import config_pb2
 
 RULES_FILE = Path(__file__).parent / "rules.txt"
@@ -128,6 +141,17 @@ BROADCAST_ADDR = "^all"
 # rules.txt section that applies to every channel.
 ALL_CHANNELS = "*"
 
+# Device-list items are keyed "<transport>:<address>", mirroring the "kind:key"
+# scheme the targets list already uses, so one list can hold both transports
+# and connect_device knows which interface class to build.
+TRANSPORT_BLE = "ble"
+TRANSPORT_TCP = "tcp"
+
+# Meshtastic's socket API port. Firmware only accepts one TCP client at a
+# time and force-closes the previous one, so connecting here kicks off a
+# phone/desktop app already talking to the same node over WiFi.
+DEFAULT_TCP_PORT = 4403
+
 
 def load_rules() -> dict[str, dict[str, str]]:
     """Re-read rules.txt every call so edits take effect without restarting the bot.
@@ -157,6 +181,33 @@ def load_rules() -> dict[str, dict[str, str]]:
         if keyword:
             rules.setdefault(section, {})[keyword] = reply.strip()
     return rules
+
+
+def _split_device_key(device_key: str) -> tuple[str, str]:
+    """Split a "<transport>:<address>" device-list key.
+
+    A bare address (no prefix) is treated as BLE so an older saved key, or a
+    caller that has not been updated, still connects the way it used to.
+    Partitioning from the left keeps IPv6 literals and "host:port" intact.
+    """
+    transport, sep, address = device_key.partition(":")
+    if not sep:
+        return TRANSPORT_BLE, device_key
+    if transport not in (TRANSPORT_BLE, TRANSPORT_TCP):
+        return TRANSPORT_BLE, device_key
+    return transport, address
+
+
+def _split_host_port(address: str) -> tuple[str, int]:
+    """Split "host:port" into its parts, defaulting to Meshtastic's TCP port.
+
+    Only splits a trailing ":<digits>", and only when the remainder has no
+    colon of its own, so a bare IPv6 literal passes through untouched.
+    """
+    host, sep, port = address.rpartition(":")
+    if sep and port.isdigit() and ":" not in host and host:
+        return host, int(port)
+    return address, DEFAULT_TCP_PORT
 
 
 def find_reply(text: str, sections: list[str]) -> str | None:
@@ -274,9 +325,13 @@ class MeshtasticTUI(App):
         Binding("right", "focus_pane(1)", "下一欄", show=False, priority=True),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, tcp_host: str | None = None) -> None:
         super().__init__()
+        # Set from --host. When present the bot talks TCP to that one node and
+        # never scans BLE, since there is nothing to discover.
+        self.tcp_host = tcp_host
         self.interface = None
+        self.transport: str | None = None
         self.my_id: str | None = None
         self.target: tuple[str, str | int] | None = None  # ("channel", idx) or ("node", id)
         self.history: dict[tuple, list[str]] = {}
@@ -357,15 +412,21 @@ class MeshtasticTUI(App):
 
     def action_rescan(self) -> None:
         # Guard against overlapping scans: BLEInterface.scan() takes ~10s, and
-        # without this, a manual "R" press (or the empty-result auto-retry
-        # below) while one is still running would start a second one, and
-        # since _populate_devices only appends, both scans' results would land
-        # in the list - the same device showing up twice.
+        # without this a manual "R" press (or the empty-result auto-retry in
+        # _populate_devices) while one is still running would start a second
+        # one and land both scans' results in the list.
         if self.scanning:
             self._log_system("已在掃描中,請稍候...")
             return
         self.scanning = True
-        self.query_one("#device-list", ListView).clear()
+        # Show the TCP row straight away so it is pickable during the scan;
+        # _populate_devices rebuilds the list once the BLE results land.
+        self._rebuild_device_list([])
+        if self.tcp_host and self.interface is None:
+            # --host is an explicit request for that node, so connect now
+            # rather than making the user wait out the BLE scan. The scan still
+            # runs, so a BLE device can be picked afterwards.
+            self._on_device_selected(f"{TRANSPORT_TCP}:{self.tcp_host}")
         self.scan_devices()
 
     @work(thread=True)
@@ -378,43 +439,79 @@ class MeshtasticTUI(App):
             return
         self.call_from_thread(self._populate_devices, devices)
 
-    def _populate_devices(self, devices: list) -> None:
-        self.scanning = False
+    def _rebuild_device_list(self, ble_devices: list) -> None:
+        """Redraw the device pane from both sources: the --host TCP node, then
+        whatever the BLE scan found.
+
+        Always rebuilt from scratch rather than appended to, so the TCP row
+        survives a rescan and a repeated scan cannot duplicate a BLE row.
+        """
         listview = self.query_one("#device-list", ListView)
         listview.clear()
-        for d in devices:
-            listview.append(ListItem(Label(d.name), name=d.name))
-        if not devices:
+        if self.tcp_host:
+            listview.append(
+                ListItem(
+                    Label(f"◆ {self.tcp_host}  [dim]TCP[/dim]"),
+                    name=f"{TRANSPORT_TCP}:{self.tcp_host}",
+                )
+            )
+        for d in ble_devices:
+            listview.append(
+                ListItem(
+                    Label(f"● {d.name}  [dim]BLE[/dim]"),
+                    name=f"{TRANSPORT_BLE}:{d.name}",
+                )
+            )
+
+    def _populate_devices(self, devices: list) -> None:
+        self.scanning = False
+        self._rebuild_device_list(devices)
+        listview = self.query_one("#device-list", ListView)
+
+        if not listview.children:
+            # Only reachable without --host, so the retry cannot spin forever
+            # on a list that always holds the TCP row.
             if self.interface is None:
                 self._log_system("沒找到裝置,自動重新掃描...")
                 self.action_rescan()
             else:
                 self._log_system("沒找到裝置,按 R 重新掃描")
-        elif len(devices) == 1 and self.interface is None:
+            return
+
+        if not devices:
+            self._log_system("沒掃到 BLE 裝置,按 R 重新掃描")
+        elif len(devices) == 1 and not self.tcp_host and self.interface is None:
             self._log_system(f"只找到一個裝置,自動連線: {devices[0].name}")
             listview.index = 0
-            self._on_device_selected(devices[0].name)
+            self._on_device_selected(f"{TRANSPORT_BLE}:{devices[0].name}")
 
-    def _on_device_selected(self, device_name: str) -> None:
-        self._log_system(f"連線到 {device_name}...")
-        self.connect_device(device_name)
+    def _on_device_selected(self, device_key: str) -> None:
+        transport, address = _split_device_key(device_key)
+        self._log_system(f"連線到 {address} ({transport.upper()})...")
+        self.connect_device(device_key)
 
     @work(thread=True)
-    def connect_device(self, device_name: str) -> None:
+    def connect_device(self, device_key: str) -> None:
+        transport, address = _split_device_key(device_key)
         try:
-            interface = meshtastic.ble_interface.BLEInterface(address=device_name)
+            if transport == TRANSPORT_TCP:
+                hostname, port = _split_host_port(address)
+                interface = meshtastic.tcp_interface.TCPInterface(hostname=hostname, portNumber=port)
+            else:
+                interface = meshtastic.ble_interface.BLEInterface(address=address)
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self._log_system, f"[red]連線失敗: {e}[/red]")
             return
-        self.call_from_thread(self._connected, interface)
+        self.call_from_thread(self._connected, interface, transport)
 
-    def _connected(self, interface) -> None:
-        # This fires as soon as the raw BLE link is up. Channels/nodes/myUser are
+    def _connected(self, interface, transport: str = TRANSPORT_BLE) -> None:
+        # This fires as soon as the raw link is up. Channels/nodes/myUser are
         # not populated yet at this point - that's a separate, slightly later
         # config-sync phase signalled by "meshtastic.connection.established"
         # (see on_config_synced below). Don't populate the targets pane here.
         self.interface = interface
-        self._log_system("[green]BLE 已連線[/green],等待設定同步...")
+        self.transport = transport
+        self._log_system(f"[green]{transport.upper()} 已連線[/green],等待設定同步...")
 
     def on_config_synced(self, interface, topic=pub.AUTO_TOPIC) -> None:
         # Fires on meshtastic's own pubsub thread, not Textual's - hop back.
@@ -576,6 +673,8 @@ class MeshtasticTUI(App):
         else:
             gps_line = "已啟用,尚無定位"
         log.write(f"[bold]GPS:[/bold] {gps_line}")
+        # Last so Region keeps the top of the pane.
+        log.write(f"[bold]連線:[/bold] {(self.transport or '?').upper()}")
 
     # ---- pane 2: channels & nodes -----------------------------------------
 
@@ -768,5 +867,21 @@ class MeshtasticTUI(App):
             self._on_target_selected(event.item.name)
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Meshtastic monitor TUI. Connects over BLE by default; "
+        "pass --host to talk to a node over WiFi/TCP instead.",
+    )
+    parser.add_argument(
+        "--host",
+        metavar="HOST[:PORT]",
+        help="also offer this node over TCP, e.g. Meshtastic.local or "
+        f"192.168.0.247. Connected to immediately; BLE is still scanned. "
+        f"Port defaults to {DEFAULT_TCP_PORT}.",
+    )
+    args = parser.parse_args()
+    MeshtasticTUI(tcp_host=args.host).run()
+
+
 if __name__ == "__main__":
-    MeshtasticTUI().run()
+    main()

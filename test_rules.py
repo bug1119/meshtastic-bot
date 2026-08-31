@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for the per-channel rules.txt parser in bot.py.
+"""Tests for bot.py's pure helpers: the per-channel rules.txt parser and the
+device-key / host-port parsing behind BLE-vs-TCP connections.
 
 Run with:
     python3 test_rules.py
@@ -89,6 +90,33 @@ def test_empty_section_is_kept():
     check("nothing matches", bot.find_reply("ping", ["EDGE_ATS", "*"]), None)
 
 
+def test_split_device_key():
+    print("device-list key parsing")
+    check("explicit ble", bot._split_device_key("ble:BUG1"), (bot.TRANSPORT_BLE, "BUG1"))
+    check("explicit tcp", bot._split_device_key("tcp:Meshtastic.local"), (bot.TRANSPORT_TCP, "Meshtastic.local"))
+    # A bare address predates the prefix scheme; treat it as BLE rather than
+    # silently failing to connect.
+    check("bare address means ble", bot._split_device_key("BUG1"), (bot.TRANSPORT_BLE, "BUG1"))
+    # BLE names can themselves be MAC addresses, so an unknown prefix must not
+    # be swallowed as a transport.
+    check("mac-like name kept whole", bot._split_device_key("AA:BB:CC:DD:EE:FF"),
+          (bot.TRANSPORT_BLE, "AA:BB:CC:DD:EE:FF"))
+    check("prefixed mac keeps its colons", bot._split_device_key("ble:AA:BB:CC:DD:EE:FF"),
+          (bot.TRANSPORT_BLE, "AA:BB:CC:DD:EE:FF"))
+
+
+def test_split_host_port():
+    print("host:port parsing")
+    check("bare host uses default port", bot._split_host_port("Meshtastic.local"),
+          ("Meshtastic.local", bot.DEFAULT_TCP_PORT))
+    check("explicit default port", bot._split_host_port("192.168.0.247:4403"), ("192.168.0.247", 4403))
+    check("custom port", bot._split_host_port("192.168.0.247:9999"), ("192.168.0.247", 9999))
+    # IPv6 literals carry several colons - splitting them would corrupt the host.
+    check("ipv6 left alone", bot._split_host_port("fe80::1"), ("fe80::1", bot.DEFAULT_TCP_PORT))
+    check("non-numeric port left alone", bot._split_host_port("host:nope"),
+          ("host:nope", bot.DEFAULT_TCP_PORT))
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -97,6 +125,8 @@ if __name__ == "__main__":
         test_legacy_flat_file()
         test_header_edge_cases()
         test_empty_section_is_kept()
+        test_split_device_key()
+        test_split_host_port()
     finally:
         bot.RULES_FILE = original
 
