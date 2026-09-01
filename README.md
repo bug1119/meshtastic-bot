@@ -22,19 +22,11 @@
 
 ## 安裝
 
-**Python 3.9 或更新**(在 3.9.6 與 3.12.1 上都實測過)。
-
 ```sh
 pip3 install textual pypubsub meshtastic
 ```
 
 啟動時會自己檢查這三個套件,缺哪個會直接告訴你要 `pip install` 什麼,不會丟一串 traceback。
-
-### BLE 是選用的
-
-`meshtastic` 會帶進 `pyserial`(USB serial 用)與 `bleak`(BLE 用)。**bleak 缺了也能跑** —— 只是 BLE 掃描不可用,`--host`(TCP)與 `--port`(serial)完全不受影響,啟動時會提示一行而不是直接結束。
-
-這不是假設性的情況:macOS 內建的 Python 3.9 上,bleak 相依的 `pyobjc-core` 沒有 wheel、需要從原始碼編譯而且會失敗。所以 BLE 的檢查是獨立且非致命的。
 
 ## 用法
 
@@ -159,7 +151,7 @@ pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=5.0km from=!f2dcbabe
 python3 test_rules.py
 ```
 
-85 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
+84 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
 
 頻率推導的斷言是對**獨立來源**驗證,不是自我循環:
 
