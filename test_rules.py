@@ -9,6 +9,10 @@ Deliberately dependency-free (no pytest) so it runs anywhere bot.py itself
 runs. Importing bot is safe: the TUI only starts under __main__.
 """
 
+# Deferred annotation evaluation, matching bot.py so this suite imports on
+# Python 3.9 too.
+from __future__ import annotations
+
 import pathlib
 import sys
 import tempfile
@@ -359,6 +363,30 @@ def test_distance():
     check("exactly 1 km", bot.format_distance(1000.0), "1.0km")
 
 
+def test_annotations_are_deferred():
+    """Guard the Python 3.9 fix.
+
+    3.9 parses `str | None` but cannot evaluate it, so the modules only import
+    there while `from __future__ import annotations` keeps every annotation a
+    string. Asserting that here fails on any version the moment someone drops
+    the future import, instead of waiting for a 3.9 machine to hit it.
+    """
+    print("annotations are deferred (Python 3.9 compatibility)")
+    checked = 0
+    for module in (bot, lora_params):
+        for name in dir(module):
+            obj = getattr(module, name)
+            anns = getattr(obj, "__annotations__", None)
+            if not isinstance(anns, dict) or not callable(obj):
+                continue
+            for field, value in anns.items():
+                checked += 1
+                if not isinstance(value, str):
+                    check(f"{module.__name__}.{name}:{field} is a string", type(value).__name__, "str")
+    check("every annotation is an unevaluated string", True, True)
+    print(f"       ({checked} annotations checked across bot + lora_params)")
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -371,6 +399,7 @@ if __name__ == "__main__":
         test_split_host_port()
         test_describe_peer()
         test_display_width()
+        test_annotations_are_deferred()
         test_derived_bandwidth()
         test_derived_frequency()
         test_node_position()

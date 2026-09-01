@@ -32,6 +32,11 @@ Verified against two real nodes and the firmware's own documentation:
     band plan spelled out in the RadioInterface.cpp comments
 """
 
+# Deferred annotation evaluation, so the `X | None` unions below stay strings
+# at runtime instead of being evaluated. Without this the module fails to
+# import on Python 3.9, which parses PEP 604 unions but cannot evaluate them.
+from __future__ import annotations
+
 from meshtastic.protobuf import config_pb2
 
 _LORA = config_pb2.Config.LoRaConfig

@@ -22,6 +22,8 @@
 
 ## 安裝
 
+**Python 3.9 或更新**(在 3.9.6 與 3.12.1 上都實測過)。
+
 ```sh
 pip3 install textual pypubsub meshtastic
 ```
@@ -151,7 +153,7 @@ pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=5.0km from=!f2dcbabe
 python3 test_rules.py
 ```
 
-84 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
+85 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
 
 頻率推導的斷言是對**獨立來源**驗證,不是自我循環:
 

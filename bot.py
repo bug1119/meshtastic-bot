@@ -68,6 +68,11 @@ TCP is the way in to a node whose Bluetooth is off - notably MUI/TFT boards,
 where enabling BLE puts the device UI into programming mode.
 """
 
+# Deferred annotation evaluation, so the `X | None` unions below stay strings
+# at runtime instead of being evaluated. Without this the module fails to
+# import on Python 3.9, which parses PEP 604 unions but cannot evaluate them.
+from __future__ import annotations
+
 import importlib
 import sys
 
