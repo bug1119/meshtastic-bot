@@ -41,17 +41,24 @@ def with_rules(text: str):
     bot.RULES_FILE = path
 
 
-def test_shipped_rules():
-    print("shipped rules.txt")
+def test_default_rules_template():
+    """Check DEFAULT_RULES, the template written when no rules.txt exists.
+
+    Deliberately not the rules.txt sitting next to this file: that one is live
+    operator config, so reading it made the suite fail whenever the rules were
+    edited - which is the normal thing to do to it.
+    """
+    print("DEFAULT_RULES template")
+    with_rules(bot.DEFAULT_RULES)
     shipped = bot.load_rules()
     check("only the EDGE_ATS section", sorted(shipped), ["EDGE_ATS"])
     edge = ["EDGE_ATS", "#3", bot.ALL_CHANNELS]
     check("ping", bot.find_reply("ping", edge), "pong")
     # Regression: the reply is taken literally, so a quoted value would leak
     # its quote characters into the outgoing message.
-    check("test reply has no stray quotes", bot.find_reply("test", edge), "Bot: Hello!")
+    check("reply text has no stray quotes", bot.find_reply("help", edge), "\u6307\u4ee4: ping")
     # Substring matching used to answer this; exact matching must not.
-    check("surrounding words no longer match", bot.find_reply("please test this", edge), None)
+    check("surrounding words no longer match", bot.find_reply("please ping this", edge), None)
     check("another channel gets nothing", bot.find_reply("ping", ["LongFast", "#0", bot.ALL_CHANNELS]), None)
 
 
@@ -445,7 +452,7 @@ def test_annotations_are_deferred():
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
-        test_shipped_rules()
+        test_default_rules_template()
         test_sections_and_precedence()
         test_exact_matching()
         test_should_auto_reply()
