@@ -1,8 +1,3 @@
 __pycache__/
 *.pyc
 .claude/
-
-# Live auto-reply rules are operator config, not repo content. bot.py writes a
-# starter file from DEFAULT_RULES on first run; rules.txt.example is the same
-# content, kept in the repo for reference.
-rules.txt
