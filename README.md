@@ -91,6 +91,12 @@ python3 bot.py --port /dev/cu.usbmodem2101 --wifi on    # 開
 
 ## 自動回覆規則:`rules.txt`
 
+**`rules.txt` 不進版控** —— 它是每台機器自己的設定,不是 repo 內容。第一次跑 bot 時會自動建立一份起始檔;repo 裡的 `rules.txt.example` 是同樣的內容,放著當參考:
+
+```sh
+cp rules.txt.example rules.txt    # 或直接跑 bot,它會自己建
+```
+
 依頻道分區。每則進來的訊息都會重讀這個檔,所以**改完立即生效,不用重啟**。
 
 ```ini

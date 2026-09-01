@@ -11,42 +11,13 @@
 #                       so do not quote it.
 #
 # The first matching rule wins, and a channel's own rules are checked before
-# [*]. Blank lines and lines starting with # are ignored. Direct messages are
-# never auto-replied to. Only messages from other nodes are answered - never
-# our own - and each message is answered at most once, even if the mesh
-# redelivers it.
+# [*]. Blank lines and lines starting with # are ignored. Only messages from
+# other nodes are answered, and each message is answered at most once.
 #
 # Rules placed before the first [channel] header apply to EVERY channel, which
 # is how the old flat format keeps working - but that will auto-reply on public
 # channels too, so prefer an explicit header.
 
-[CLSE]
+[EDGE_ATS]
 ping=pong
-test=Bot: Hello!
 help=指令: ping
-A=Alpha
-B=Bravo
-C=Charlie
-D=Delta
-E=Echo
-F=Foxtrot
-G=Golf
-H=Hotel
-I=India
-J=Juliet
-K=Kilo
-L=Lima
-M=Mike
-N=November
-O=Oscar
-P=Papa
-Q=Quebec
-R=Romeo
-S=Sierra
-T=Tango
-U=Uniform
-V=Victor
-W=Whiskey
-X=X-ray
-Y=Yankee
-Z=Zulu
