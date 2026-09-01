@@ -49,7 +49,9 @@ def test_shipped_rules():
     check("ping", bot.find_reply("ping", edge), "pong")
     # Regression: the reply is taken literally, so a quoted value would leak
     # its quote characters into the outgoing message.
-    check("test reply has no stray quotes", bot.find_reply("please test this", edge), "Bot: Hello!")
+    check("test reply has no stray quotes", bot.find_reply("test", edge), "Bot: Hello!")
+    # Substring matching used to answer this; exact matching must not.
+    check("surrounding words no longer match", bot.find_reply("please test this", edge), None)
     check("another channel gets nothing", bot.find_reply("ping", ["LongFast", "#0", bot.ALL_CHANNELS]), None)
 
 
@@ -67,11 +69,64 @@ def test_sections_and_precedence():
         "ping=global-pong\n"
         "hello=hi everyone\n"
     )
-    check("channel name beats [*]", bot.find_reply("PING", ["EDGE_ATS", "#3", "*"]), "edge-pong")
+    check("channel name beats [*]", bot.find_reply("ping", ["EDGE_ATS", "#3", "*"]), "edge-pong")
+    check("wrong case does not match", bot.find_reply("PING", ["EDGE_ATS", "#3", "*"]), None)
     check("#index section resolves", bot.find_reply("ping", ["#0", "*"]), "primary-pong")
     check("unknown channel falls back to [*]", bot.find_reply("ping", ["Nope", "#7", "*"]), "global-pong")
-    check("[*] key not shadowed still fires", bot.find_reply("say Hello there", ["EDGE_ATS", "#3", "*"]), "hi everyone")
+    check("[*] key not shadowed still fires", bot.find_reply("hello", ["EDGE_ATS", "#3", "*"]), "hi everyone")
     check("no keyword matches", bot.find_reply("nothing here", ["EDGE_ATS", "*"]), None)
+
+
+def test_exact_matching():
+    print("exact, case-sensitive matching")
+    # The real rules file is a NATO alphabet, which is precisely the shape
+    # substring matching cannot survive.
+    with_rules("[CLSE]\nA=Alpha\nB=Bravo\nZ=Zulu\nping=pong\nhelp=指令: ping\n")
+    clse = ["CLSE", "#4", "*"]
+    check("exact single letter", bot.find_reply("A", clse), "Alpha")
+    check("repeated letter is not the letter", bot.find_reply("AAA", clse), None)
+    check("lowercase does not match uppercase rule", bot.find_reply("a", clse), None)
+    check("longer word containing it", bot.find_reply("Apple", clse), None)
+    # Substring matching answered "Alpha" here, because Bravo contains an "a".
+    check("another rule's reply text", bot.find_reply("Bravo", clse), None)
+    # And "Echo" for this, because hello contains an "e".
+    check("hello no longer draws a letter reply", bot.find_reply("hello", clse), None)
+    check("exact word rule", bot.find_reply("ping", clse), "pong")
+    check("wrong case on a word rule", bot.find_reply("Ping", clse), None)
+    check("substring of a word rule", bot.find_reply("pinging", clse), None)
+    check("surrounding whitespace is ignored", bot.find_reply("  A  ", clse), "Alpha")
+    check("empty message", bot.find_reply("", clse), None)
+    check("whitespace-only message", bot.find_reply("   ", clse), None)
+    check("non-ascii reply still exact", bot.find_reply("help", clse), "指令: ping")
+
+
+def test_should_auto_reply():
+    print("one reply per message, and only from others")
+    app = types.SimpleNamespace(
+        my_id="!me",
+        _replied_ids={},
+        REPLIED_ID_LIMIT=bot.MeshtasticTUI.REPLIED_ID_LIMIT,
+    )
+    call = bot.MeshtasticTUI._should_auto_reply
+
+    check("a message from someone else", call(app, {"from_id": "!them", "id": 1}), True)
+    # The same packet again: the mesh rebroadcasts, and MQTT can bridge it back.
+    check("the same packet a second time", call(app, {"from_id": "!them", "id": 1}), False)
+    check("a different packet", call(app, {"from_id": "!them", "id": 2}), True)
+    # Our own outgoing text echoes back; answering it makes the bot self-reply.
+    check("our own echo", call(app, {"from_id": "!me", "id": 3}), False)
+    check("our own echo is not remembered", 3 in app._replied_ids, False)
+    # No id to key on: replying twice beats ignoring a real message.
+    check("packet with no id", call(app, {"from_id": "!them", "id": None}), True)
+    check("packet with no id again", call(app, {"from_id": "!them", "id": None}), True)
+
+    print("reply ledger stays bounded")
+    app2 = types.SimpleNamespace(my_id="!me", _replied_ids={}, REPLIED_ID_LIMIT=8)
+    for i in range(50):
+        call(app2, {"from_id": "!them", "id": i})
+    check("bounded to the limit", len(app2._replied_ids), 8)
+    check("keeps the newest", 49 in app2._replied_ids, True)
+    check("drops the oldest", 0 in app2._replied_ids, False)
 
 
 def test_legacy_flat_file():
@@ -392,6 +447,8 @@ if __name__ == "__main__":
     try:
         test_shipped_rules()
         test_sections_and_precedence()
+        test_exact_matching()
+        test_should_auto_reply()
         test_legacy_flat_file()
         test_header_edge_cases()
         test_empty_section_is_kept()

@@ -49,8 +49,9 @@ Auto-reply rules live in rules.txt next to this script, grouped by channel:
     ping=pong
 
 A channel's own rules are checked before [*], and the first keyword whose text
-appears in the message (case-insensitive substring) wins. Reply text is taken
-literally - do not quote it. Rules written before the first [header] apply to
+equals the whole message - case included, surrounding whitespace ignored -
+wins. Reply text is taken literally, so do not quote it. Only messages from
+other nodes are answered, once each. Rules written before the first [header] apply to
 every channel, which keeps a flat pre-sections file working, but will also
 auto-reply on public channels, so prefer an explicit header.
 
@@ -130,12 +131,15 @@ DEFAULT_RULES = """\
 #                       as its Meshtastic name ([EDGE_ATS]) or its index
 #                       ([#0] - useful for the unnamed primary channel).
 #                       [*] applies to every channel.
-#   keyword=reply text  one rule per line, case-insensitive substring match
-#                       on keyword. The reply text is taken literally, so do
-#                       not quote it.
+#   keyword=reply text  one rule per line. The whole message must equal the
+#                       keyword exactly, case included - only surrounding
+#                       whitespace is ignored. So A=Alpha answers "A" but not
+#                       "a" and not "AAA". The reply text is taken literally,
+#                       so do not quote it.
 #
 # The first matching rule wins, and a channel's own rules are checked before
-# [*]. Blank lines and lines starting with # are ignored.
+# [*]. Blank lines and lines starting with # are ignored. Only messages from
+# other nodes are answered, and each message is answered at most once.
 #
 # Rules placed before the first [channel] header apply to EVERY channel, which
 # is how the old flat format keeps working - but that will auto-reply on public
@@ -349,16 +353,27 @@ def _split_host_port(address: str) -> tuple[str, int]:
 
 
 def find_reply(text: str, sections: list[str]) -> str | None:
-    """First rule whose keyword appears in `text`, searching `sections` in order.
+    """Reply for `text` if some rule's keyword matches it exactly.
+
+    The whole message must equal the whole keyword, case included. Only
+    surrounding whitespace is ignored.
+
+    Both halves of that are deliberate. This used to be a case-insensitive
+    substring test, which a short-keyword rules file makes unusable: with the
+    NATO alphabet (A=Alpha ... Z=Zulu) almost any message contains some single
+    letter, so "hello" answered "Echo" and "Bravo" answered "Alpha". Matching
+    case as well means "a" no longer triggers the rule written as "A".
 
     The caller passes the channel's own sections before ALL_CHANNELS, so a
     channel-specific rule beats a catch-all one for the same keyword.
     """
-    lowered = text.lower()
+    message = text.strip()
+    if not message:
+        return None
     rules = load_rules()
     for section in sections:
         for keyword, reply in rules.get(section, {}).items():
-            if keyword.lower() in lowered:
+            if keyword.strip() == message:
                 return reply
     return None
 
@@ -397,6 +412,7 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
         "transport": "MQTT" if packet.get("viaMqtt") else "LoRa",
         "snr": packet.get("rxSnr"),
         "rssi": packet.get("rxRssi"),
+        "id": packet.get("id"),
     }
 
 
@@ -496,6 +512,11 @@ class MeshtasticTUI(App):
         self.firmware_version: str | None = None
         self.last_signal: dict | None = None
         self.scanning = False
+        # Packet ids already auto-replied to, oldest first. The mesh redelivers
+        # packets (rebroadcast, MQTT bridge), so the same message can arrive more
+        # than once; this holds it to one reply each. Bounded, so a long session
+        # cannot grow it without limit.
+        self._replied_ids: dict = {}
 
     def compose(self) -> ComposeResult:
         # min_width=1 on every RichLog below: RichLog defaults to min_width=78,
@@ -979,22 +1000,53 @@ class MeshtasticTUI(App):
 
         self.call_from_thread(update_ui)
 
-        reply_line = self._maybe_auto_reply(
-            interface,
-            info["target"],
-            info["text"],
-            when=info["when"],
-            from_id=info["from_id"],
-            transport=info["transport"],
-            snr=info["snr"],
-            rssi=info["rssi"],
-        )
+        reply_line = None
+        if self._should_auto_reply(info):
+            reply_line = self._maybe_auto_reply(
+                interface,
+                info["target"],
+                info["text"],
+                when=info["when"],
+                from_id=info["from_id"],
+                transport=info["transport"],
+                snr=info["snr"],
+                rssi=info["rssi"],
+            )
         if reply_line:
             def update_ui2():
                 if info["target"] == self.target:
                     self.query_one("#log", RichLog).write(reply_line)
 
             self.call_from_thread(update_ui2)
+
+    # How many recent packet ids to remember for the once-per-message rule.
+    # Comfortably more than a mesh can redeliver in the window that matters,
+    # while staying trivial in memory.
+    REPLIED_ID_LIMIT = 256
+
+    def _should_auto_reply(self, info: dict) -> bool:
+        """Whether this packet earns an auto-reply.
+
+        Two gates. Only messages from someone else: our own outgoing text comes
+        back as an echo, and answering it would let the bot talk to itself. And
+        only once per packet: the mesh redelivers the same message via
+        rebroadcast or the MQTT bridge, which would otherwise each draw a reply.
+        """
+        if info["from_id"] == self.my_id:
+            return False
+
+        packet_id = info.get("id")
+        if packet_id is None:
+            # Nothing to deduplicate on. Answering is the lesser failure - a
+            # duplicate reply beats silently ignoring a real message.
+            return True
+        if packet_id in self._replied_ids:
+            return False
+
+        self._replied_ids[packet_id] = True
+        while len(self._replied_ids) > self.REPLIED_ID_LIMIT:
+            self._replied_ids.pop(next(iter(self._replied_ids)))
+        return True
 
     def _maybe_auto_reply(
         self,
@@ -1008,13 +1060,12 @@ class MeshtasticTUI(App):
         rssi: int | None = None,
     ) -> str | None:
         """Send + record the keyword auto-reply for `text` if its channel has a
-        matching rule in rules.txt. Shared by on_receive (messages
-        that arrived over the mesh) and on_input_submitted (messages typed
-        into the send box on this connected device) so both paths get
-        monitored/replied-to identically. Returns the reply line to display,
-        or None if nothing was sent - the caller decides how to write it to
-        the log, since on_receive needs call_from_thread and
-        on_input_submitted (already on the UI thread) doesn't.
+        rule matching it exactly.
+
+        Called only from on_receive, and only once the _should_auto_reply gates
+        have passed. Returns the reply line to display, or None if nothing was
+        sent - the caller writes it to the log itself, since on_receive is on
+        meshtastic's thread and needs call_from_thread.
         """
         kind, key = target
         # Rules are per-channel, so DMs are recorded but never auto-replied to.
@@ -1057,13 +1108,8 @@ class MeshtasticTUI(App):
         else:
             self.interface.sendText(text, destinationId=key)
 
-        # Messages sent from this device (not just ones received over the
-        # mesh) also get checked against rules.txt on the watched channel.
-        reply_line = self._maybe_auto_reply(
-            self.interface, self.target, text, when=now, from_id=self.my_id or "me", transport="LoRa"
-        )
-        if reply_line:
-            self.query_one("#log", RichLog).write(reply_line)
+        # Deliberately not auto-replied to. Rules answer what other nodes send;
+        # answering our own outgoing text made the bot reply to itself.
 
     # ---- pane navigation (arrow keys) ------------------------------------
 
