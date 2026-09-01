@@ -388,6 +388,63 @@ def test_distance_to():
     check("no interface", call(types.SimpleNamespace(my_id="!me", here=here, interface=None), "!far"), None)
 
 
+def test_node_label():
+    print("node display names")
+    nodes = {
+        "!short": {"user": {"shortName": "Bug2", "longName": "BUG2 long"}},
+        "!longonly": {"user": {"longName": "Solar Repeater"}},
+        "!blank": {"user": {"shortName": "", "longName": ""}},
+        "!nouser": {},
+        "!nulluser": {"user": None},
+    }
+    check("short name preferred", bot.node_label(nodes, "!short"), "Bug2")
+    check("falls back to long name", bot.node_label(nodes, "!longonly"), "Solar Repeater")
+    # Names arrive as separate NodeInfo packets, so a node can be heard from
+    # before it is named. Showing the id beats showing nothing.
+    check("empty names fall back to the id", bot.node_label(nodes, "!blank"), "!blank")
+    check("entry without a user", bot.node_label(nodes, "!nouser"), "!nouser")
+    check("entry with a null user", bot.node_label(nodes, "!nulluser"), "!nulluser")
+    check("node not in the db", bot.node_label(nodes, "!unknown"), "!unknown")
+    check("empty node db", bot.node_label({}, "!x"), "!x")
+
+
+def test_incoming_line_sender():
+    print("message line shows the sender name")
+    info = {
+        "when": "12:34:56",
+        "from_id": "!f2dcbabe",
+        "transport": "LoRa",
+        "snr": 6.5,
+        "rssi": -92,
+        "text": "ping",
+    }
+    check(
+        "name then bracketed id",
+        bot.format_incoming_line(info, "Bug2"),
+        "[dim]12:34:56[/dim] [bold]Bug2[/bold][dim]\\[!f2dcbabe][/dim](LoRa snr=6.5 rssi=-92): ping",
+    )
+    # The bracket must be escaped or RichLog parses "[!f2dcbabe]" as a style tag.
+    check("opening bracket is escaped", "\\[!f2dcbabe]" in bot.format_incoming_line(info, "Bug2"), True)
+    # No name resolved, so node_label already fell back to the id - printing it
+    # again would read "!f2dcbabe !f2dcbabe".
+    check(
+        "unnamed sender shows the id once",
+        bot.format_incoming_line(info),
+        "[dim]12:34:56[/dim] [bold]!f2dcbabe[/bold](LoRa snr=6.5 rssi=-92): ping",
+    )
+    check(
+        "sender equal to the id is not doubled",
+        bot.format_incoming_line(info, "!f2dcbabe"),
+        "[dim]12:34:56[/dim] [bold]!f2dcbabe[/bold](LoRa snr=6.5 rssi=-92): ping",
+    )
+    quiet = {**info, "snr": None, "rssi": None}
+    check(
+        "no signal figures",
+        bot.format_incoming_line(quiet, "Bug2"),
+        "[dim]12:34:56[/dim] [bold]Bug2[/bold][dim]\\[!f2dcbabe][/dim](LoRa): ping",
+    )
+
+
 def test_node_position():
     print("node position extraction")
     check("no position key", bot.node_position({}), None)
@@ -466,6 +523,8 @@ if __name__ == "__main__":
         test_annotations_are_deferred()
         test_derived_bandwidth()
         test_derived_frequency()
+        test_node_label()
+        test_incoming_line_sender()
         test_node_position()
         test_distance()
         test_distance_to()

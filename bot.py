@@ -416,9 +416,34 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
     }
 
 
-def format_incoming_line(info: dict) -> str:
-    """Render a parsed incoming message as one RichLog line."""
-    line = f"[dim]{info['when']}[/dim] [bold]{info['from_id']}[/bold] ({info['transport']}"
+def node_label(nodes: dict, node_id: str) -> str:
+    """Readable name for a node id: its short name, else long name, else the id.
+
+    Names arrive as separate NodeInfo packets, so a node we have heard a message
+    from may not have one yet - hence the fall back to the raw id rather than
+    showing nothing.
+    """
+    user = (nodes.get(node_id) or {}).get("user") or {}
+    return user.get("shortName") or user.get("longName") or node_id
+
+
+def format_incoming_line(info: dict, sender: str | None = None) -> str:
+    """Render a parsed incoming message as one RichLog line.
+
+    Shaped "12:34:56 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping" - name, then
+    its node id in brackets, then the transport and signal. The id is not
+    repeated when no name resolved, since the name has already fallen back to it.
+
+    The brackets are escaped: RichLog reads this as markup, where "[" opens a
+    style tag, so an unescaped "[!f2dcbabe]" would be parsed as one instead of
+    printed.
+    """
+    node_id = info["from_id"]
+    if sender and sender != node_id:
+        who = f"[bold]{sender}[/bold][dim]\\[{node_id}][/dim]"
+    else:
+        who = f"[bold]{node_id}[/bold]"
+    line = f"[dim]{info['when']}[/dim] {who}({info['transport']}"
     if info["snr"] is not None:
         line += f" snr={info['snr']}"
     if info["rssi"] is not None:
@@ -938,8 +963,7 @@ class MeshtasticTUI(App):
         for node_id, node in nodes.items():
             if node_id == self.my_id:
                 continue
-            user = node.get("user", {})
-            label = user.get("shortName") or user.get("longName") or node_id
+            label = node_label(nodes, node_id)
             there = node_position(node)
             if there is not None:
                 with_position += 1
@@ -989,14 +1013,18 @@ class MeshtasticTUI(App):
         info = parse_incoming(packet, self.my_id)
         if info is None:
             return
-        line = format_incoming_line(info)
+        sender = node_label(interface.nodes or {}, info["from_id"])
+        line = format_incoming_line(info, sender)
         self.history.setdefault(info["target"], []).append(line)
 
         def update_ui():
             if info["target"] == self.target:
                 self.query_one("#log", RichLog).write(line)
             kind, key = info["target"]
-            self._log_system(f"收到訊息 {kind}:{key} from={info['from_id']}")
+            # The status pane keeps the raw id alongside the name: it is the
+            # diagnostic view, and names are neither unique nor always present.
+            who = sender if sender == info["from_id"] else f"{sender} ({info['from_id']})"
+            self._log_system(f"收到訊息 {kind}:{key} from={who}")
 
         self.call_from_thread(update_ui)
 

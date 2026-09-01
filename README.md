@@ -4,7 +4,7 @@
 
 ```
 ┌─ 裝置 ────────────────┐┌─ 頻道 / Node ─────────┐┌─ 訊息 ──────────────────┐
-│◆ Meshtastic.local  TCP ││# (unnamed #0)          ││ 12:34:56 BUG2: ping      │
+│◆ Meshtastic.local  TCP ││# (unnamed #0)          ││ 12:34 Bug2[!f2dc..]: ping │
 │▣ cu.usbmodem2101 SERIAL││# EDGE_ATS              ││   -> auto-reply: pong |  │
 │● Bug2_1ca6         BLE ││@ Bug2 !f2dcbabe 5.0km  ││      dist=5.0km ...      │
 │                        ││@ AKV4 !6984a138 --     ││                          │
@@ -124,6 +124,20 @@ pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=5.0km from=!f2dcbabe
 
 `dist=` 只在算得出來時出現(LoRa 承載有限,不塞沒用的欄位)。
 
+## 訊息裡的發話者名稱
+
+訊息視窗的格式是 `短名稱[裝置ID]`,短名稱取 `shortName`,沒有就退到長名稱,兩者都沒有才只顯示節點 ID:
+
+```
+12:34:56 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping
+```
+
+名稱是透過獨立的 NodeInfo 封包送來的,所以剛聽到、還沒收到名稱的節點會先只顯示 ID(`!a08b0694`),之後自動補上名稱。
+
+方括號在程式裡是**轉義**的(`\[`)—— RichLog 把這行當標記解析,未轉義的 `[!f2dcbabe]` 會被當成樣式標籤而不會顯示出來。有一項測試鎖住這個轉義。
+
+狀態窗格**同時保留名稱與 ID**(`from=Bug2 (!f2dcbabe)`)—— 那是診斷用的視圖,而名稱既不唯一也不保證存在。
+
 ## 節點距離
 
 節點列表與自動回覆都會顯示距離,用 haversine 計算。需要**兩端都有位置**:
@@ -156,7 +170,7 @@ pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=5.0km from=!f2dcbabe
 python3 test_rules.py
 ```
 
-110 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
+120 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
 
 頻率推導的斷言是對**獨立來源**驗證,不是自我循環:
 
