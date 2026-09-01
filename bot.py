@@ -68,18 +68,21 @@ TCP is the way in to a node whose Bluetooth is off - notably MUI/TFT boards,
 where enabling BLE puts the device UI into programming mode.
 """
 
+# Deferred annotation evaluation, so the `X | None` unions below stay strings
+# at runtime instead of being evaluated. Without this the module fails to
+# import on Python 3.9, which parses PEP 604 unions but cannot evaluate them.
+from __future__ import annotations
+
 import importlib
 import sys
 
 # Check dependencies up front so a missing package fails fast with a plain
 # "pip install X" hint instead of a raw ImportError/traceback from somewhere
-# deep inside textual/meshtastic. meshtastic.ble_interface is checked
-# specifically (not just "meshtastic") since it pulls in bleak, which is a
-# separate, occasionally-missing install.
+# deep inside textual/meshtastic.
 _REQUIRED_MODULES = [
     ("textual", "textual"),
     ("pubsub", "pypubsub"),
-    ("meshtastic.ble_interface", "meshtastic"),
+    ("meshtastic", "meshtastic"),
 ]
 _missing_packages = []
 for _module_name, _pip_name in _REQUIRED_MODULES:
@@ -92,6 +95,17 @@ if _missing_packages:
     print("缺少必要的 Python 套件,請先安裝:", file=sys.stderr)
     print(f"    pip3 install {' '.join(_missing_packages)}", file=sys.stderr)
     sys.exit(1)
+
+# BLE is optional, checked separately, and never fatal. It needs bleak, which on
+# macOS pulls pyobjc and has to build from source where no wheel exists - it
+# fails outright on the system Python 3.9, for instance. Treating that as fatal
+# would block --host and --port too, which need nothing but the core package.
+try:
+    importlib.import_module("meshtastic.ble_interface")
+    BLE_AVAILABLE = True
+except ImportError as _ble_error:
+    BLE_AVAILABLE = False
+    _BLE_ERROR = str(_ble_error)
 
 import argparse
 import atexit
@@ -109,7 +123,8 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, Label, ListItem, ListView, RichLog
 
 import meshtastic
-import meshtastic.ble_interface
+if BLE_AVAILABLE:
+    import meshtastic.ble_interface
 import meshtastic.serial_interface
 import meshtastic.tcp_interface
 from meshtastic.protobuf import config_pb2
@@ -249,6 +264,8 @@ def open_interface(transport: str, address: str):
         return meshtastic.tcp_interface.TCPInterface(hostname=hostname, portNumber=port)
     if transport == TRANSPORT_SERIAL:
         return meshtastic.serial_interface.SerialInterface(devPath=address)
+    if not BLE_AVAILABLE:
+        raise RuntimeError(f"BLE 不可用(bleak 未安裝: {_BLE_ERROR});可改用 --host 或 --port")
     return meshtastic.ble_interface.BLEInterface(address=address)
 
 
@@ -581,6 +598,12 @@ class MeshtasticTUI(App):
             # scan still runs, so a BLE device can be picked afterwards.
             transport, address = self.explicit_targets[0]
             self._on_device_selected(f"{transport}:{address}")
+        if not BLE_AVAILABLE:
+            # Nothing to scan without bleak, but --host/--port targets above are
+            # already listed and connected, so this is a note rather than an error.
+            self.scanning = False
+            self._log_system("[yellow]BLE 不可用(bleak 未安裝),只列出 --host/--port 目標[/yellow]")
+            return
         self.scan_devices()
 
     @work(thread=True)
