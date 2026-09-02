@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "meshtastic",
+#     "pypubsub",
+#     "textual",
+# ]
+# ///
 """Meshtastic monitor - three-pane interactive TUI (BLE or WiFi/TCP).
 
 Layout (all visible at once, k9s/ranger style):
@@ -27,13 +35,20 @@ Flow:
      target keeps its own scrollback), plus an input box to send text.
      Every channel and node DM is received, recorded, and browsable/sendable
      as normal - keyword auto-reply (see rules.txt) is the only thing scoped
-     down, firing only on channels that have rules of their own, and never
-     on direct messages.
+     down, firing only where rules were actually written: a channel with a
+     section of its own, or a direct message once [DM] exists.
 
-Usage:
-    python3 bot.py                          # scan and connect over BLE
-    python3 bot.py --host Meshtastic.local  # connect over WiFi/TCP
-    python3 bot.py --host 192.168.0.247:4403
+Usage - the shebang hands the script to `uv run --script`, which resolves the
+dependencies declared at the top of this file into a cached environment, so
+there is no virtualenv to create or activate:
+    ./bot.py                          # scan and connect over BLE
+    ./bot.py --host Meshtastic.local  # connect over WiFi/TCP
+    ./bot.py --host 192.168.0.247:4403
+
+Without uv, invoke an interpreter that already has the dependencies - note
+that `python3 bot.py` bypasses the shebang, so a bare system python3 will
+fail the dependency check below:
+    /path/to/venv/bin/python bot.py --host 192.168.0.247
 
 Keyboard: Left/Right cycle devices -> channels/nodes -> messages. Up/Down keep
 their normal per-widget meaning (move the list cursor in the device/target
@@ -95,8 +110,13 @@ for _module_name, _pip_name in _REQUIRED_MODULES:
         if _pip_name not in _missing_packages:
             _missing_packages.append(_pip_name)
 if _missing_packages:
-    print("缺少必要的 Python 套件,請先安裝:", file=sys.stderr)
-    print(f"    pip3 install {' '.join(_missing_packages)}", file=sys.stderr)
+    print("缺少必要的 Python 套件。", file=sys.stderr)
+    print("    ./bot.py            # 讓 shebang 交給 uv 自動備環境", file=sys.stderr)
+    print(
+        f"    pip install {' '.join(_missing_packages)}"
+        "    # 或手動裝進當前的 interpreter",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 import argparse
