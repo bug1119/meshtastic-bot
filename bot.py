@@ -463,18 +463,37 @@ def format_uptime(seconds: int | None) -> str:
     return f"{hours:02d}:{minutes:02d}"
 
 
+BOT_REPLY_PREFIX = "BOT: "
+
+
 def build_reply_text(reply: str, info: dict) -> str:
-    """Append the collected message info to a keyword reply, compact (LoRa payload limit)."""
-    bits = [info["when"], f"via={info['transport']}"]
+    """Two lines: the rule's reply, then the message details in brackets.
+
+        BOT: pong
+        [12:34:56 from=Bug2 rx=LoRa snr=6.5 rssi=-92 dist=842m]
+
+    Fields that cannot be determined are left out rather than sent as "--": the
+    text payload is tight, and a field that is usually blank costs bytes on
+    every reply while telling the recipient nothing.
+
+    "from" carries the sender's name when one is known, matching the message
+    pane, and falls back to the node id.
+
+    The "BOT: " prefix and the bracketed detail line also keep the bot from
+    answering itself: matching is exact, so a reply can never equal a keyword.
+    """
+    who = info.get("from_name") or info["from_id"]
+    # "rx" rather than "via": every field here describes the message being
+    # answered, not the reply, and rx reads as reception - matching rxSnr and
+    # rxRssi, which is where snr and rssi come from.
+    bits = [info["when"], f"from={who}", f"rx={info['transport']}"]
     if info["snr"] is not None:
         bits.append(f"snr={info['snr']}")
     if info["rssi"] is not None:
         bits.append(f"rssi={info['rssi']}")
-    # Omitted rather than sent as "--" when unknown: the payload limit is tight,
-    # and a field that is usually blank is worse than no field.
     if info.get("distance_m") is not None:
         bits.append(f"dist={format_distance(info['distance_m'])}")
-    return f"{reply} | {' '.join(bits)} from={info['from_id']}"
+    return f"{BOT_REPLY_PREFIX}{reply}\n[{' '.join(bits)}]"
 
 
 class MeshtasticTUI(App):
@@ -1053,13 +1072,26 @@ class MeshtasticTUI(App):
     REPLIED_ID_LIMIT = 256
 
     def _should_auto_reply(self, info: dict) -> bool:
-        """Whether this packet earns an auto-reply.
+        """Whether this *received* packet earns an auto-reply.
 
-        Two gates. Only messages from someone else: our own outgoing text comes
-        back as an echo, and answering it would let the bot talk to itself. And
-        only once per packet: the mesh redelivers the same message via
-        rebroadcast or the MQTT bridge, which would otherwise each draw a reply.
+        Three gates.
+
+        Never answer a bot reply. Every reply starts with BOT_REPLY_PREFIX, so
+        this is what stops the bot answering itself into an endless exchange. It
+        is deliberately an explicit check rather than relying on the fact that
+        exact matching cannot match a two-line reply - that holds today, but it
+        is a subtle property to leave a loop resting on.
+
+        Never answer our own echo. Text typed here is answered directly from
+        on_input_submitted, so if the radio also echoes it back, replying again
+        would double up.
+
+        And only once per packet, since the mesh redelivers the same message via
+        rebroadcast or the MQTT bridge.
         """
+        if info["text"].lstrip().startswith(BOT_REPLY_PREFIX):
+            return False
+
         if info["from_id"] == self.my_id:
             return False
 
@@ -1108,6 +1140,7 @@ class MeshtasticTUI(App):
             "snr": snr,
             "rssi": rssi,
             "from_id": from_id,
+            "from_name": node_label(interface.nodes or {}, from_id),
             "distance_m": self._distance_to(from_id),
         }
         full_reply = build_reply_text(reply, info_like)
@@ -1116,7 +1149,11 @@ class MeshtasticTUI(App):
         else:
             interface.sendText(full_reply, destinationId=key)
 
-        reply_line = f"[yellow]  -> auto-reply: {full_reply}[/yellow]"
+        # The sent text carries literal brackets and a newline; the log line has
+        # to escape the brackets, since RichLog reads it as markup and would
+        # otherwise parse "[12:34:56 ...]" as a style tag and drop it.
+        shown = full_reply.replace("[", "\\[").replace("\n", " ")
+        reply_line = f"[yellow]  -> auto-reply: {shown}[/yellow]"
         self.history.setdefault(target, []).append(reply_line)
         return reply_line
 
@@ -1136,8 +1173,20 @@ class MeshtasticTUI(App):
         else:
             self.interface.sendText(text, destinationId=key)
 
-        # Deliberately not auto-replied to. Rules answer what other nodes send;
-        # answering our own outgoing text made the bot reply to itself.
+        # Text typed here is answered too, so a keyword can be tried without a
+        # second radio. Done directly rather than waiting for the radio to echo
+        # the packet back, because sendText publishes nothing locally and whether
+        # an echo arrives at all is firmware behaviour. _should_auto_reply drops
+        # our own echo if one does turn up, so this cannot answer twice, and it
+        # refuses anything starting with BOT_REPLY_PREFIX, so a reply typed or
+        # echoed back cannot start a loop.
+        if not text.lstrip().startswith(BOT_REPLY_PREFIX):
+            reply_line = self._maybe_auto_reply(
+                self.interface, self.target, text,
+                when=now, from_id=self.my_id or "me", transport="LoRa",
+            )
+            if reply_line:
+                self.query_one("#log", RichLog).write(reply_line)
 
     # ---- pane navigation (arrow keys) ------------------------------------
 

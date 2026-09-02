@@ -116,21 +116,28 @@ def test_should_auto_reply():
     )
     call = bot.MeshtasticTUI._should_auto_reply
 
-    check("a message from someone else", call(app, {"from_id": "!them", "id": 1}), True)
+    check("a message from someone else", call(app, {"from_id": "!them", "id": 1, "text": "ping"}), True)
+    # The loop guard: a bot reply must never draw another reply.
+    reply = bot.build_reply_text("pong", {"when": "1", "transport": "LoRa", "snr": None,
+                                          "rssi": None, "from_id": "!them"})
+    check("a bot reply", call(app, {"from_id": "!them", "id": 90, "text": reply}), False)
+    check("the prefix alone", call(app, {"from_id": "!them", "id": 91, "text": "BOT: pong"}), False)
+    check("prefix after whitespace", call(app, {"from_id": "!them", "id": 92, "text": "  BOT: x"}), False)
+    check("prefix must match case", call(app, {"from_id": "!them", "id": 93, "text": "bot: x"}), True)
     # The same packet again: the mesh rebroadcasts, and MQTT can bridge it back.
-    check("the same packet a second time", call(app, {"from_id": "!them", "id": 1}), False)
-    check("a different packet", call(app, {"from_id": "!them", "id": 2}), True)
+    check("the same packet a second time", call(app, {"from_id": "!them", "id": 1, "text": "ping"}), False)
+    check("a different packet", call(app, {"from_id": "!them", "id": 2, "text": "ping"}), True)
     # Our own outgoing text echoes back; answering it makes the bot self-reply.
-    check("our own echo", call(app, {"from_id": "!me", "id": 3}), False)
+    check("our own echo", call(app, {"from_id": "!me", "id": 3, "text": "ping"}), False)
     check("our own echo is not remembered", 3 in app._replied_ids, False)
     # No id to key on: replying twice beats ignoring a real message.
-    check("packet with no id", call(app, {"from_id": "!them", "id": None}), True)
-    check("packet with no id again", call(app, {"from_id": "!them", "id": None}), True)
+    check("packet with no id", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
+    check("packet with no id again", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
 
     print("reply ledger stays bounded")
     app2 = types.SimpleNamespace(my_id="!me", _replied_ids={}, REPLIED_ID_LIMIT=8)
     for i in range(50):
-        call(app2, {"from_id": "!them", "id": i})
+        call(app2, {"from_id": "!them", "id": i, "text": "ping"})
     check("bounded to the limit", len(app2._replied_ids), 8)
     check("keeps the newest", 49 in app2._replied_ids, True)
     check("drops the oldest", 0 in app2._replied_ids, False)
@@ -339,28 +346,50 @@ def test_derived_frequency():
 
 def test_reply_text():
     print("auto-reply text")
-    base = {"when": "12:34:56", "transport": "LoRa", "snr": 6.5, "rssi": -92, "from_id": "!abc"}
+    base = {"when": "12:34:56", "transport": "LoRa", "snr": 6.5, "rssi": -92,
+            "from_id": "!abc", "from_name": "Bug2"}
+    check(
+        "two lines, details bracketed",
+        bot.build_reply_text("pong", {**base, "distance_m": 842.4}),
+        "BOT: pong\n[12:34:56 from=Bug2 rx=LoRa snr=6.5 rssi=-92 dist=842m]",
+    )
     check(
         "no distance field when unknown",
         bot.build_reply_text("pong", base),
-        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 from=!abc",
+        "BOT: pong\n[12:34:56 from=Bug2 rx=LoRa snr=6.5 rssi=-92]",
     )
     check(
-        "distance appended when known",
+        "kilometres for a far node",
         bot.build_reply_text("pong", {**base, "distance_m": 5029.0}),
-        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=5.0km from=!abc",
-    )
-    check(
-        "metres for a near node",
-        bot.build_reply_text("pong", {**base, "distance_m": 842.4}),
-        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 dist=842m from=!abc",
+        "BOT: pong\n[12:34:56 from=Bug2 rx=LoRa snr=6.5 rssi=-92 dist=5.0km]",
     )
     # An explicit None must behave like an absent key, not print "None".
     check(
         "explicit None is omitted",
         bot.build_reply_text("pong", {**base, "distance_m": None}),
-        "pong | 12:34:56 via=LoRa snr=6.5 rssi=-92 from=!abc",
+        "BOT: pong\n[12:34:56 from=Bug2 rx=LoRa snr=6.5 rssi=-92]",
     )
+    # from falls back to the id for a node whose name has not arrived.
+    check(
+        "unnamed sender falls back to the id",
+        bot.build_reply_text("pong", {"when": "12:34:56", "transport": "MQTT",
+                                      "snr": None, "rssi": None, "from_id": "!a08b0694"}),
+        "BOT: pong\n[12:34:56 from=!a08b0694 rx=MQTT]",
+    )
+    check("exactly two lines", len(bot.build_reply_text("pong", base).splitlines()), 2)
+    check("first line is the rule reply", bot.build_reply_text("pong", base).splitlines()[0], "BOT: pong")
+
+    print("a reply cannot trigger another reply")
+    with_rules("[EDGE_ATS]\nping=pong\npong=ping\nA=Alpha\n")
+    edge = ["EDGE_ATS", "#3", "*"]
+    for rule_reply in ("pong", "ping", "Alpha"):
+        text = bot.build_reply_text(rule_reply, base)
+        # Two independent guards: the text matches no rule, and it is prefixed.
+        check(f"{rule_reply!r} reply matches no rule", bot.find_reply(text, edge), None)
+        check(f"{rule_reply!r} reply is prefixed", text.startswith(bot.BOT_REPLY_PREFIX), True)
+    # Even a rules file that names the prefix itself cannot start a loop, since
+    # _should_auto_reply refuses the prefix before any matching happens.
+    check("prefix constant", bot.BOT_REPLY_PREFIX, "BOT: ")
 
 
 def test_distance_to():
