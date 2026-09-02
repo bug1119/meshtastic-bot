@@ -591,6 +591,14 @@ class MeshtasticTUI(App):
         self.my_id: str | None = None
         self.target: tuple[str, str | int] | None = None  # ("channel", idx) or ("node", id)
         self.history: dict[tuple, list[str]] = {}
+        # Targets that received a message while you were looking somewhere
+        # else, shown in bold in the targets pane. Keyed "kind:key" to match
+        # the ListItem names, so a row can be found without rebuilding it.
+        self.unread: set[str] = set()
+        # Each target row's markup *without* the unread bold. Kept so the bold
+        # can be switched on and off without recomputing the label - a node row
+        # carries a distance that costs a haversine over the node table.
+        self._target_markup: dict[str, str] = {}
         self.firmware_version: str | None = None
         self.last_signal: dict | None = None
         self.scanning = False
@@ -1015,17 +1023,68 @@ class MeshtasticTUI(App):
 
     # ---- pane 2: channels & nodes -----------------------------------------
 
+    @staticmethod
+    def _target_key(target: tuple[str, str | int]) -> str:
+        """A target's row name, matching what _add_target assigns and
+        _on_target_selected parses back."""
+        kind, key = target
+        return f"{kind}:{key}"
+
+    def _styled_target(self, key: str) -> str:
+        """A row's markup, bolded while the target has unread messages."""
+        markup = self._target_markup[key]
+        return f"[bold]{markup}[/bold]" if key in self.unread else markup
+
+    def _add_target(self, listview: ListView, key: str, markup: str) -> None:
+        """Append one target row, remembering its unstyled markup."""
+        self._target_markup[key] = markup
+        listview.append(ListItem(Label(self._styled_target(key)), name=key))
+
+    def _restyle_target(self, key: str) -> None:
+        """Repaint one target row after its unread state changed.
+
+        Best-effort by design: the list is built once, on config sync, so a
+        node heard for the first time afterwards has no row yet. Its key stays
+        in self.unread regardless, and _add_target picks the bold up if the
+        list is ever rebuilt.
+        """
+        if key not in self._target_markup:
+            return
+        for item in self.query_one("#target-list", ListView).query(ListItem):
+            if item.name == key:
+                item.query_one(Label).update(self._styled_target(key))
+                return
+
+    def _mark_unread(self, target: tuple[str, str | int]) -> None:
+        """Bold a target's row because a message arrived for it.
+
+        Skips the selected target: its messages are already being written into
+        the log in front of you, so marking it unread would be a lie that only
+        clears when you switch away and back.
+        """
+        if target == self.target:
+            return
+        key = self._target_key(target)
+        self.unread.add(key)
+        self._restyle_target(key)
+
+    def _clear_unread(self, target: tuple[str, str | int]) -> None:
+        """Drop a target's unread bold, on becoming the selected target."""
+        key = self._target_key(target)
+        if key in self.unread:
+            self.unread.discard(key)
+            self._restyle_target(key)
+
     def _populate_targets(self) -> None:
         listview = self.query_one("#target-list", ListView)
         listview.clear()
+        self._target_markup.clear()
 
         for ch in self.interface.localNode.channels or []:
             if not ch.settings:
                 continue
             name = ch.settings.name or f"(unnamed #{ch.index})"
-            listview.append(
-                ListItem(Label(f"# {name}"), name=f"channel:{ch.index}")
-            )
+            self._add_target(listview, f"channel:{ch.index}", f"# {name}")
 
         nodes = self.interface.nodes or {}
         # --here wins over the node's own fix: it is there precisely because this
@@ -1042,11 +1101,10 @@ class MeshtasticTUI(App):
             if there is not None:
                 with_position += 1
             distance = haversine_m(*here, *there) if (here and there) else None
-            listview.append(
-                ListItem(
-                    Label(f"@ {label} [dim]{node_id}[/dim] {format_distance(distance)}"),
-                    name=f"node:{node_id}",
-                )
+            self._add_target(
+                listview,
+                f"node:{node_id}",
+                f"@ {label} [dim]{node_id}[/dim] {format_distance(distance)}",
             )
 
         self._log_system(f"載入 {len(listview.children)} 個頻道/node")
@@ -1064,6 +1122,7 @@ class MeshtasticTUI(App):
         if kind == "channel":
             key = int(key)
         self.target = (kind, key)
+        self._clear_unread(self.target)
         self.query_one("#messages-title", Label).update(f"訊息 - {kind}:{key}")
         self.query_one("#send-box", Input).disabled = False
         self._redraw_log()
@@ -1094,6 +1153,7 @@ class MeshtasticTUI(App):
         def update_ui():
             if info["target"] == self.target:
                 self.query_one("#log", RichLog).write(line)
+            self._mark_unread(info["target"])
             kind, key = info["target"]
             # The status pane keeps the raw id alongside the name: it is the
             # diagnostic view, and names are neither unique nor always present.
