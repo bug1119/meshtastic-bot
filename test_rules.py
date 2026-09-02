@@ -7,8 +7,10 @@
 #     "textual",
 # ]
 # ///
-"""Tests for bot.py's pure helpers: the per-channel rules.txt parser and the
-device-key / host-port parsing behind BLE-vs-TCP connections.
+"""Tests for bot.py: mostly its pure helpers - the per-channel rules.txt
+parser, the device-key / host-port parsing behind BLE-vs-TCP connections - plus
+one headless run of the App itself, for the unread bold that only shows up once
+real widgets are involved.
 
 Run with:
     ./test_rules.py
@@ -23,6 +25,7 @@ safe: the TUI only starts under __main__.
 # Python 3.9 too.
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import sys
 import tempfile
@@ -49,6 +52,143 @@ def with_rules(text: str):
     path = pathlib.Path(tempfile.mkdtemp()) / "rules.txt"
     path.write_text(text, encoding="utf-8")
     bot.RULES_FILE = path
+
+
+def unread_app(target, unread=(), markup=None):
+    """A stand-in self for the unread-bold helpers.
+
+    They touch only self.target, self.unread, self._target_markup and
+    self._restyle_target, so a namespace avoids a running Textual App. The
+    repaint is recorded rather than performed, since the real one walks widgets.
+    """
+    repainted = []
+    app = types.SimpleNamespace(
+        target=target,
+        unread=set(unread),
+        _target_markup=dict(markup or {"channel:0": "# (unnamed #0)", "channel:3": "# EDGE_ATS",
+                                      "node:!f2dcbabe": "@ Bug2 [dim]!f2dcbabe[/dim] --"}),
+        _target_key=bot.MeshtasticTUI._target_key,
+    )
+    app._restyle_target = repainted.append
+    app._styled_target = lambda key: bot.MeshtasticTUI._styled_target(app, key)
+    return app, repainted
+
+
+def test_unread_bold():
+    print("unread targets are bolded in the targets pane")
+
+    check("channel row name", bot.MeshtasticTUI._target_key(("channel", 3)), "channel:3")
+    check("node row name", bot.MeshtasticTUI._target_key(("node", "!f2dcbabe")), "node:!f2dcbabe")
+
+    print("a message for a target you are not watching")
+    app, repainted = unread_app(target=("channel", 0))
+    bot.MeshtasticTUI._mark_unread(app, ("channel", 3))
+    check("the target is marked unread", app.unread, {"channel:3"})
+    check("its row is repainted", repainted, ["channel:3"])
+    check("the watched target is untouched", "channel:0" in app.unread, False)
+
+    print("a message for the target already on screen")
+    app, repainted = unread_app(target=("channel", 3))
+    bot.MeshtasticTUI._mark_unread(app, ("channel", 3))
+    check("it is not marked unread", app.unread, set())
+    check("and nothing is repainted", repainted, [])
+
+    print("a DM marks the node row too")
+    app, repainted = unread_app(target=("channel", 0))
+    bot.MeshtasticTUI._mark_unread(app, ("node", "!f2dcbabe"))
+    check("the node is marked unread", app.unread, {"node:!f2dcbabe"})
+
+    print("selecting a bold target clears it")
+    app, repainted = unread_app(target=("channel", 0), unread={"channel:3"})
+    bot.MeshtasticTUI._clear_unread(app, ("channel", 3))
+    check("the mark is gone", app.unread, set())
+    check("the row is repainted back to normal", repainted, ["channel:3"])
+
+    print("clearing a target that was never unread does no work")
+    app, repainted = unread_app(target=("channel", 0))
+    bot.MeshtasticTUI._clear_unread(app, ("channel", 3))
+    check("still nothing unread", app.unread, set())
+    check("no repaint", repainted, [])
+
+    print("the markup a row is drawn with")
+    app, _ = unread_app(target=("channel", 0), unread={"channel:3"})
+    check("unread is bolded", app._styled_target("channel:3"), "[bold]# EDGE_ATS[/bold]")
+    check("read is left alone", app._styled_target("channel:0"), "# (unnamed #0)")
+    # The node id keeps its own dim tag inside the bold - nesting, not replacing.
+    app, _ = unread_app(target=("channel", 0), unread={"node:!f2dcbabe"})
+    check(
+        "a node row keeps its dim id",
+        app._styled_target("node:!f2dcbabe"),
+        "[bold]@ Bug2 [dim]!f2dcbabe[/dim] --[/bold]",
+    )
+
+    print("a node heard for the first time has no row yet")
+    # The list is built once, on config sync, so _restyle_target has to cope
+    # with a key it has never drawn - without a widget query it cannot serve.
+    stub = types.SimpleNamespace(_target_markup={}, unread={"node:!newnode"})
+    bot.MeshtasticTUI._restyle_target(stub, "node:!newnode")
+    check("repainting an undrawn row is a no-op, not a crash", True, True)
+    # And the mark survives, so a rebuild would show it.
+    check("the unread mark is still recorded", stub.unread, {"node:!newnode"})
+
+
+async def _unread_bold_widgets():
+    from textual.widgets import Label, ListItem, ListView
+
+    def styles(app, key):
+        """The style names a target row actually renders with. Textual resolves
+        a Label's markup into a Content whose spans carry them, so this reads
+        the rendered result rather than the markup handed in."""
+        for item in app.query_one("#target-list", ListView).query(ListItem):
+            if item.name == key:
+                return sorted({str(s.style) for s in item.query_one(Label).render().spans})
+        return None
+
+    app = bot.MeshtasticTUI()
+    async with app.run_test() as pilot:
+        listview = app.query_one("#target-list", ListView)
+        # Build rows the way _populate_targets would, without needing a radio.
+        app._add_target(listview, "channel:0", "# (unnamed #0)")
+        app._add_target(listview, "channel:3", "# EDGE_ATS")
+        app._add_target(listview, "node:!f2dcbabe", "@ Bug2 [dim]!f2dcbabe[/dim] --")
+        await pilot.pause()
+        app.target = ("channel", 0)
+
+        check("nothing starts bold", styles(app, "channel:3"), [])
+        check("a node row starts dim only", styles(app, "node:!f2dcbabe"), ["dim"])
+
+        app._mark_unread(("channel", 3))
+        await pilot.pause()
+        check("an unwatched channel goes bold", styles(app, "channel:3"), ["bold"])
+
+        app._mark_unread(("channel", 0))
+        await pilot.pause()
+        check("the watched channel stays normal", styles(app, "channel:0"), [])
+
+        app._mark_unread(("node", "!f2dcbabe"))
+        await pilot.pause()
+        check(
+            "a DM bolds the node and keeps its dim id",
+            styles(app, "node:!f2dcbabe"),
+            ["bold", "dim"],
+        )
+
+        app._on_target_selected("channel:3")
+        await pilot.pause()
+        check("selecting it clears the bold", styles(app, "channel:3"), [])
+
+        app._on_target_selected("channel:0")
+        await pilot.pause()
+        check("it stays normal after switching away", styles(app, "channel:3"), [])
+        check("a target never visited keeps its bold", styles(app, "node:!f2dcbabe"), ["bold", "dim"])
+
+
+def test_unread_bold_widgets():
+    print("unread bold through real Textual widgets")
+    # The only test that runs the App: _restyle_target walks the target list
+    # and calls Label.update, which a stand-in self cannot exercise. Headless,
+    # so it still needs no hardware.
+    asyncio.run(_unread_bold_widgets())
 
 
 def coverage_report(rules_text: str, channels: set) -> list[str]:
@@ -668,6 +808,8 @@ if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
         test_default_rules_template()
+        test_unread_bold()
+        test_unread_bold_widgets()
         test_rule_coverage_report()
         test_sections_and_precedence()
         test_exact_matching()
