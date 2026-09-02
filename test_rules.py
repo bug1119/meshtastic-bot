@@ -51,7 +51,7 @@ def test_default_rules_template():
     print("DEFAULT_RULES template")
     with_rules(bot.DEFAULT_RULES)
     shipped = bot.load_rules()
-    check("only the EDGE_ATS section", sorted(shipped), ["EDGE_ATS"])
+    check("a [DM] section and a channel one", sorted(shipped), ["DM", "EDGE_ATS"])
     edge = ["EDGE_ATS", "#3", bot.ALL_CHANNELS]
     check("ping", bot.find_reply("ping", edge), "pong")
     # Regression: the reply is taken literally, so a quoted value would leak
@@ -60,6 +60,9 @@ def test_default_rules_template():
     # Substring matching used to answer this; exact matching must not.
     check("surrounding words no longer match", bot.find_reply("please ping this", edge), None)
     check("another channel gets nothing", bot.find_reply("ping", ["LongFast", "#0", bot.ALL_CHANNELS]), None)
+    # The template shows [DM] answering the same keyword differently.
+    check("[DM] answers privately", bot.find_reply("ping", ["DM", "EDGE_ATS", "#3", bot.ALL_CHANNELS]),
+          "pong (private)")
 
 
 def test_sections_and_precedence():
@@ -141,6 +144,69 @@ def test_should_auto_reply():
     check("bounded to the limit", len(app2._replied_ids), 8)
     check("keeps the newest", 49 in app2._replied_ids, True)
     check("drops the oldest", 0 in app2._replied_ids, False)
+
+
+def test_dm_sections():
+    print("[DM] rules, falling back to the channel")
+    channels = {0: "", 3: "EDGE_ATS", 4: "CLSE"}
+    app = types.SimpleNamespace()
+    app._channel_name = lambda i: channels.get(i) or None
+    app._channel_sections = lambda i: bot.MeshtasticTUI._channel_sections(app, i)
+    call = bot.MeshtasticTUI._reply_sections
+
+    check("a channel message uses its channel", call(app, ("channel", 3), 3),
+          ["EDGE_ATS", "#3", "*"])
+    # A DM tries [DM] first, then the channel it arrived on, so a rule can be
+    # written for private messages or shared with the channel.
+    check("a DM tries [DM] then the channel", call(app, ("node", "!x"), 3),
+          ["DM", "EDGE_ATS", "#3", "*"])
+    check("a DM on the unnamed primary", call(app, ("node", "!x"), 0), ["DM", "#0", "*"])
+    # Typed here, there is no packet and so no channel to fall back to.
+    check("a DM with no known channel", call(app, ("node", "!x"), None), ["DM", "*"])
+
+
+def test_dm_replies():
+    print("DM replies")
+    with_rules("[DM]\nhi=hello there\nping=dm-pong\n\n[EDGE_ATS]\nping=pong\n@A=Alpha\n")
+
+    check("[DM] rule", bot.find_reply("hi", ["DM", "EDGE_ATS", "#3", "*"]), "hello there")
+    # [DM] is searched first, so it wins a keyword the channel also defines.
+    check("[DM] beats the channel", bot.find_reply("ping", ["DM", "EDGE_ATS", "#3", "*"]), "dm-pong")
+    # Not in [DM], so the channel's rules still answer it.
+    check("falls back to the channel", bot.find_reply("@A", ["DM", "EDGE_ATS", "#3", "*"]), "Alpha")
+    # And the reverse must not happen: a channel message must not pick up [DM].
+    check("[DM] does not leak into a channel", bot.find_reply("hi", ["EDGE_ATS", "#3", "*"]), None)
+    check("channel keyword on a channel", bot.find_reply("ping", ["EDGE_ATS", "#3", "*"]), "pong")
+    # With no channel known, only [DM] and [*] apply.
+    check("channel-only keyword without a channel", bot.find_reply("@A", ["DM", "*"]), None)
+    check("[DM] keyword without a channel", bot.find_reply("hi", ["DM", "*"]), "hello there")
+
+    print("a DM reply goes back as a DM")
+    sent = []
+    app = types.SimpleNamespace(
+        my_id="!me", here=None, history={}, _replied_ids={},
+        REPLIED_ID_LIMIT=bot.MeshtasticTUI.REPLIED_ID_LIMIT,
+        interface=types.SimpleNamespace(nodes={}, sendText=lambda t, **k: sent.append((t, k))),
+    )
+    channels = {3: "EDGE_ATS"}
+    app._channel_name = lambda i: channels.get(i) or None
+    app._channel_sections = lambda i: bot.MeshtasticTUI._channel_sections(app, i)
+    app._reply_sections = lambda t, c: bot.MeshtasticTUI._reply_sections(app, t, c)
+    app._distance_to = lambda n: None
+
+    bot.MeshtasticTUI._maybe_auto_reply(
+        app, app.interface, ("node", "!them"), "hi", when="12:34:56",
+        from_id="!them", transport="LoRa", snr=None, rssi=None, channel=3,
+    )
+    check("addressed to the sender, not broadcast", [kw for _, kw in sent], [{"destinationId": "!them"}])
+    check("carries the [DM] reply", sent[0][0].splitlines()[0], "BOT: hello there")
+
+    sent.clear()
+    bot.MeshtasticTUI._maybe_auto_reply(
+        app, app.interface, ("channel", 3), "ping", when="12:34:56",
+        from_id="!them", transport="LoRa", snr=None, rssi=None, channel=3,
+    )
+    check("a channel reply goes to the channel", [kw for _, kw in sent], [{"channelIndex": 3}])
 
 
 def test_legacy_flat_file():
@@ -542,6 +608,8 @@ if __name__ == "__main__":
         test_sections_and_precedence()
         test_exact_matching()
         test_should_auto_reply()
+        test_dm_sections()
+        test_dm_replies()
         test_legacy_flat_file()
         test_header_edge_cases()
         test_empty_section_is_kept()

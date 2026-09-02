@@ -4,6 +4,10 @@
 #                       as its Meshtastic name ([EDGE_ATS]) or its index
 #                       ([#0] - useful for the unnamed primary channel).
 #                       [*] applies to every channel.
+#   [DM]                rules for direct messages. Tried before the channel the
+#                       DM arrived on, so a keyword can be answered differently
+#                       in private, or left out here and shared with the
+#                       channel. A reply to a DM goes back as a DM.
 #   keyword=reply text  one rule per line. The whole message must equal the
 #                       keyword exactly, case included - only surrounding
 #                       whitespace is ignored. So A=Alpha answers "A" but not
@@ -11,10 +15,12 @@
 #                       so do not quote it.
 #
 # The first matching rule wins, and a channel's own rules are checked before
-# [*]. Blank lines and lines starting with # are ignored. Direct messages are
-# never auto-replied to. Only messages from other nodes are answered - never
-# our own - and each message is answered at most once, even if the mesh
-# redelivers it.
+# [*]. Blank lines and lines starting with # are ignored.
+#
+# Messages from other nodes are answered, and so are ones typed on this device,
+# so a keyword can be tried without a second radio. Anything starting with
+# "BOT: " is never answered - that is what stops a reply drawing a reply. Each
+# message is answered at most once, even if the mesh redelivers it.
 #
 # Rules placed before the first [channel] header apply to EVERY channel, which
 # is how the old flat format keeps working - but that will auto-reply on public

@@ -131,6 +131,10 @@ DEFAULT_RULES = """\
 #                       as its Meshtastic name ([EDGE_ATS]) or its index
 #                       ([#0] - useful for the unnamed primary channel).
 #                       [*] applies to every channel.
+#   [DM]                rules for direct messages. Tried before the channel the
+#                       DM arrived on, so a keyword can be answered differently
+#                       in private, or left out here and shared with the
+#                       channel. A reply to a DM goes back as a DM.
 #   keyword=reply text  one rule per line. The whole message must equal the
 #                       keyword exactly, case included - only surrounding
 #                       whitespace is ignored. So A=Alpha answers "A" but not
@@ -138,12 +142,19 @@ DEFAULT_RULES = """\
 #                       so do not quote it.
 #
 # The first matching rule wins, and a channel's own rules are checked before
-# [*]. Blank lines and lines starting with # are ignored. Only messages from
-# other nodes are answered, and each message is answered at most once.
+# [*]. Blank lines and lines starting with # are ignored.
+#
+# Messages from other nodes are answered, and so are ones typed on this device,
+# so a keyword can be tried without a second radio. Anything starting with
+# "BOT: " is never answered - that is what stops a reply drawing a reply. Each
+# message is answered at most once, even if the mesh redelivers it.
 #
 # Rules placed before the first [channel] header apply to EVERY channel, which
 # is how the old flat format keeps working - but that will auto-reply on public
 # channels too, so prefer an explicit header.
+
+[DM]
+ping=pong (private)
 
 [EDGE_ATS]
 ping=pong
@@ -154,6 +165,10 @@ BROADCAST_ADDR = "^all"
 
 # rules.txt section that applies to every channel.
 ALL_CHANNELS = "*"
+
+# rules.txt section for direct messages. A channel actually named "DM"
+# would share it, which is accepted as the price of a readable name.
+DM_SECTION = "DM"
 
 # Device-list items are keyed "<transport>:<address>", mirroring the "kind:key"
 # scheme the targets list already uses, so one list can hold both transports
@@ -405,6 +420,9 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
 
     return {
         "text": decoded.get("text", ""),
+        # Kept for a DM too: a direct message still travels on a channel, and
+        # its rules fall back to that channel's when [DM] has no match.
+        "channel": packet.get("channel", 0),
         "from_id": from_id,
         "to_id": to_id,
         "target": target,
@@ -793,6 +811,23 @@ class MeshtasticTUI(App):
                 return ch.settings.name or None
         return None
 
+    def _reply_sections(self, target: tuple, channel: int | None) -> list[str]:
+        """rules.txt sections to search for `target`, most specific first.
+
+        A channel message uses that channel's sections. A direct message tries
+        [DM] first and then falls back to the sections of the channel it arrived
+        on, so a rule can be written for private messages specifically or simply
+        shared with the channel. `channel` is None when it is not known - a DM
+        typed here, where the target is a node and no packet was received - and
+        then only [DM] and [*] apply.
+        """
+        kind, key = target
+        if kind == "channel":
+            return self._channel_sections(key)
+        if channel is None:
+            return [DM_SECTION, ALL_CHANNELS]
+        return [DM_SECTION] + self._channel_sections(channel)
+
     def _channel_sections(self, index: int) -> list[str]:
         """rules.txt sections that apply to channel `index`, most specific first."""
         sections = []
@@ -1058,6 +1093,7 @@ class MeshtasticTUI(App):
                 transport=info["transport"],
                 snr=info["snr"],
                 rssi=info["rssi"],
+                channel=info["channel"],
             )
         if reply_line:
             def update_ui2():
@@ -1118,9 +1154,14 @@ class MeshtasticTUI(App):
         transport: str,
         snr: float | None = None,
         rssi: int | None = None,
+        channel: int | None = None,
     ) -> str | None:
-        """Send + record the keyword auto-reply for `text` if its channel has a
-        rule matching it exactly.
+        """Send + record the keyword auto-reply for `text` if a rule matches it
+        exactly.
+
+        `channel` is the index the message arrived on. It only matters for a
+        direct message, whose rules fall back to that channel's - see
+        _reply_sections.
 
         Called only from on_receive, and only once the _should_auto_reply gates
         have passed. Returns the reply line to display, or None if nothing was
@@ -1128,10 +1169,7 @@ class MeshtasticTUI(App):
         meshtastic's thread and needs call_from_thread.
         """
         kind, key = target
-        # Rules are per-channel, so DMs are recorded but never auto-replied to.
-        if kind != "channel":
-            return None
-        reply = find_reply(text, self._channel_sections(key))
+        reply = find_reply(text, self._reply_sections(target, channel))
         if reply is None:
             return None
         info_like = {
