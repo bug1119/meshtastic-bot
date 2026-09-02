@@ -183,6 +183,52 @@ async def _unread_bold_widgets():
         check("a target never visited keeps its bold", styles(app, "node:!f2dcbabe"), ["bold", "dim"])
 
 
+def stub_interface(channel_names, node_ids):
+    """Enough of an interface for _populate_targets: channels and a node db."""
+    channels = [
+        types.SimpleNamespace(index=i, settings=types.SimpleNamespace(name=name))
+        for i, name in enumerate(channel_names)
+    ]
+    return types.SimpleNamespace(
+        localNode=types.SimpleNamespace(channels=channels),
+        nodes={node_id: {} for node_id in node_ids},
+    )
+
+
+async def _repopulate_count():
+    from textual.widgets import ListItem, ListView
+
+    app = bot.MeshtasticTUI()
+    async with app.run_test() as pilot:
+        app.my_id = "!me"
+        app.interface = stub_interface(["", "EDGE_ATS"], ["!aaa", "!bbb", "!me"])
+        logged = []
+        app._log_system = logged.append
+
+        def loaded():
+            return [ln for ln in logged if ln.startswith("載入 ")]
+
+        app._populate_targets()
+        await pilot.pause()
+        rows = lambda: len(app.query_one("#target-list", ListView).query(ListItem))  # noqa: E731
+        check("first sync counts the rows it added", loaded()[-1], "載入 4 個頻道/node")
+        check("and that is what the list holds", rows(), 4)
+
+        # A reconnect repopulates. clear() queues the old rows for removal but
+        # leaves them in .children until the loop catches up, so counting the
+        # widget here would report old + new.
+        logged.clear()
+        app._populate_targets()
+        await pilot.pause()
+        check("a repopulate does not double the count", loaded()[-1], "載入 4 個頻道/node")
+        check("and does not duplicate the rows", rows(), 4)
+
+
+def test_repopulate_count():
+    print("repopulating the target list after a reconnect")
+    asyncio.run(_repopulate_count())
+
+
 def test_unread_bold_widgets():
     print("unread bold through real Textual widgets")
     # The only test that runs the App: _restyle_target walks the target list
@@ -242,6 +288,75 @@ def test_rule_coverage_report():
 
     lines = coverage_report("# nothing but a comment\n", channels)
     check("no rules at all is called out", any("沒有任何規則" in ln for ln in lines), True)
+
+
+def link_app(interface="iface", closing=False, link_down=False):
+    """A stand-in self for the link-loss handlers.
+
+    They read self.interface / self._closing / self.link_down and hand the UI
+    work off, so a namespace is enough. call_from_thread records the callback
+    it was given instead of running it, which is how the "did it schedule the
+    UI handler?" checks stay synchronous.
+    """
+    app = types.SimpleNamespace(
+        interface=interface,
+        _closing=closing,
+        link_down=link_down,
+        connected_key="tcp:192.168.0.247",
+        scheduled=[],
+        logged=[],
+        rendered=0,
+        reconnects=0,
+    )
+    app.call_from_thread = lambda fn, *a: app.scheduled.append(getattr(fn, "__name__", str(fn)))
+    app._log_system = app.logged.append
+    app._render_local_status = lambda: setattr(app, "rendered", app.rendered + 1)
+    app.reconnect_loop = lambda: setattr(app, "reconnects", app.reconnects + 1)
+
+    # Named rather than a lambda so call_from_thread records "_link_lost".
+    def _link_lost():
+        bot.MeshtasticTUI._link_lost(app)
+
+    app._link_lost = _link_lost
+    return app
+
+
+def test_connection_lost():
+    print("a dropped link is noticed, reported and retried")
+
+    app = link_app()
+    bot.MeshtasticTUI.on_connection_lost(app, "iface")
+    check("a loss on the current interface is handled", app.scheduled, ["_link_lost"])
+
+    # The library calls _disconnected() for any interface, including one we
+    # have already moved off - that is not our current link going down.
+    app = link_app()
+    bot.MeshtasticTUI.on_connection_lost(app, "some-old-interface")
+    check("a loss on a stale interface is ignored", app.scheduled, [])
+
+    # on_unmount closes the interface deliberately, which also fires the event.
+    app = link_app(closing=True)
+    bot.MeshtasticTUI.on_connection_lost(app, "iface")
+    check("our own shutdown is not treated as a loss", app.scheduled, [])
+
+    print("what the UI handler does")
+    app = link_app()
+    bot.MeshtasticTUI._link_lost(app)
+    check("the link is marked down", app.link_down, True)
+    check("it says so, in red", any("連線中斷" in ln and "red" in ln for ln in app.logged), True)
+    check("the status pane is redrawn", app.rendered, 1)
+    check("a reconnect is started", app.reconnects, 1)
+
+    # A second event for the same outage must not start a second loop.
+    app = link_app(link_down=True)
+    bot.MeshtasticTUI._link_lost(app)
+    check("an already-down link starts nothing more", app.reconnects, 0)
+    check("and logs nothing more", app.logged, [])
+
+    print("reconnect backoff")
+    delays = [bot.MeshtasticTUI._reconnect_delay(n) for n in range(1, 8)]
+    check("quick at first, then a steady poll", delays, [1, 2, 5, 10, 30, 30, 30])
+    check("attempt 0 is treated as the first", bot.MeshtasticTUI._reconnect_delay(0), 1)
 
 
 def test_default_rules_template():
@@ -808,8 +923,10 @@ if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
         test_default_rules_template()
+        test_connection_lost()
         test_unread_bold()
         test_unread_bold_widgets()
+        test_repopulate_count()
         test_rule_coverage_report()
         test_sections_and_precedence()
         test_exact_matching()

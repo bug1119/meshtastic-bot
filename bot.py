@@ -124,6 +124,7 @@ import atexit
 import datetime
 import math
 import threading
+import time
 import unicodedata
 from pathlib import Path
 
@@ -602,6 +603,16 @@ class MeshtasticTUI(App):
         self.firmware_version: str | None = None
         self.last_signal: dict | None = None
         self.scanning = False
+        # The device key currently connected, so a dropped link can be
+        # reopened without asking the user to pick the device again.
+        self.connected_key: str | None = None
+        # Whether the link is down and a reconnect is in flight. Kept separate
+        # from self.interface, which stays set: the status pane and history
+        # still describe the node we were talking to.
+        self.link_down = False
+        # Set while quitting, so the close we perform ourselves is not mistaken
+        # for the link dropping.
+        self._closing = False
         # Packet ids already auto-replied to, oldest first. The mesh redelivers
         # packets (rebroadcast, MQTT bridge), so the same message can arrive more
         # than once; this holds it to one reply each. Bounded, so a long session
@@ -640,12 +651,18 @@ class MeshtasticTUI(App):
     def on_mount(self) -> None:
         pub.subscribe(self.on_receive, "meshtastic.receive")
         pub.subscribe(self.on_config_synced, "meshtastic.connection.established")
+        pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
         self.action_rescan()
         self.set_interval(5.0, self._render_local_status)
 
     def on_unmount(self) -> None:
+        # Before unsubscribing: close() below makes the library publish
+        # connection.lost, and until this is set that looks like the link
+        # failing on its own.
+        self._closing = True
         pub.unsubscribe(self.on_receive, "meshtastic.receive")
         pub.unsubscribe(self.on_config_synced, "meshtastic.connection.established")
+        pub.unsubscribe(self.on_connection_lost, "meshtastic.connection.lost")
         if self.interface:
             # BLEInterface registers its own atexit hook (self._exit_handler)
             # that also calls the same no-timeout disconnect - if the
@@ -770,7 +787,96 @@ class MeshtasticTUI(App):
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self._log_system, f"[red]連線失敗: {e}[/red]")
             return
+        self.connected_key = device_key
         self.call_from_thread(self._connected, interface, transport)
+
+    # ---- losing and regaining the link -------------------------------------
+
+    # Seconds between reconnect attempts. Quick at first so a momentary WiFi
+    # blip recovers almost immediately, then settling into a steady poll rather
+    # than hammering a node that is powered off or rebooting.
+    RECONNECT_DELAYS = (1, 2, 5, 10, 30)
+
+    @classmethod
+    def _reconnect_delay(cls, attempt: int) -> int:
+        """Seconds to wait before reconnect attempt `attempt`, counting from 1.
+
+        Anything past the end of the table repeats the last value, so the
+        retries continue at a fixed interval instead of growing without bound.
+        """
+        index = min(max(attempt, 1), len(cls.RECONNECT_DELAYS)) - 1
+        return cls.RECONNECT_DELAYS[index]
+
+    def on_connection_lost(self, interface) -> None:
+        """The library's reader thread has given up on the link.
+
+        Without this the app goes on claiming to be connected while receiving
+        nothing at all. A TCP timeout arrives as OSError inside
+        StreamInterface.__reader, and its `finally` calls _disconnected(),
+        ending the reader for good; the library only reopens the socket by
+        itself when the peer closes cleanly (recv returning b""), never after
+        an error. So every message sent after a timeout was silently lost -
+        the pane kept saying "已連線" and simply stopped filling.
+
+        Published from the library's own publishing thread, hence the hand-off.
+        """
+        # Neither of these is our link going down: an interface we have already
+        # moved off, or the close we perform ourselves while quitting.
+        if self._closing or interface is not self.interface:
+            return
+        self.call_from_thread(self._link_lost)
+
+    def _link_lost(self) -> None:
+        """Say the link dropped, and start trying to get it back."""
+        # The same outage can be reported more than once (the reader's finally
+        # and an explicit close, say); only the first starts a reconnect.
+        if self.link_down:
+            return
+        self.link_down = True
+        self._log_system("[red]連線中斷,自動重連中...[/red]")
+        self._render_local_status()
+        self.reconnect_loop()
+
+    @work(thread=True)
+    def reconnect_loop(self) -> None:
+        """Reopen the link that dropped, backing off between attempts.
+
+        Keeps trying for as long as the app is up: the usual causes - a WiFi
+        blip, the node rebooting, its single TCP slot taken by a phone app -
+        all clear on their own, and a monitor that gives up needs babysitting
+        at exactly the moment it should not.
+        """
+        key = self.connected_key
+        if key is None:
+            return
+        transport, address = _split_device_key(key)
+        attempt = 0
+        while not self._closing and self.link_down:
+            attempt += 1
+            time.sleep(self._reconnect_delay(attempt))
+            # The app may have quit, or a device been picked by hand, while
+            # this thread was asleep.
+            if self._closing or not self.link_down:
+                return
+            self.call_from_thread(self._log_system, f"重連中(第 {attempt} 次)...")
+            try:
+                interface = open_interface(transport, address)
+            except Exception as e:  # noqa: BLE001
+                self.call_from_thread(self._log_system, f"[yellow]重連失敗: {e}[/yellow]")
+                continue
+            self.call_from_thread(self._relinked, interface, transport)
+            return
+
+    def _relinked(self, interface, transport: str) -> None:
+        """Adopt a reconnected interface.
+
+        _connected does the rest, and the library follows up with
+        connection.established, so on_config_synced rebuilds the channel and
+        node lists - which also picks up any node first heard while the link
+        was down. self.history survives, so nothing already logged is lost.
+        """
+        self.link_down = False
+        self._connected(interface, transport)
 
     def _connected(self, interface, transport: str = TRANSPORT_BLE) -> None:
         # This fires as soon as the raw link is up. Channels/nodes/myUser are
@@ -1021,7 +1127,12 @@ class MeshtasticTUI(App):
         # mid-value, so drop it to its own indented row instead of letting the
         # terminal break it in an arbitrary place.
         transport = (self.transport or "?").upper()
-        if self.peer:
+        if self.link_down:
+            # The rest of this pane is the last known state of a node we can no
+            # longer hear, so say that outright rather than leaving figures on
+            # screen that look live.
+            log.write(f"[bold]連線:[/bold] [red]{transport} 中斷,重連中[/red]")
+        elif self.peer:
             if display_width(f"連線: {transport} {self.peer}") <= STATUS_PANE_WIDTH:
                 log.write(f"[bold]連線:[/bold] {transport} {self.peer}")
             else:
@@ -1116,7 +1227,13 @@ class MeshtasticTUI(App):
                 f"@ {label} [dim]{node_id}[/dim] {format_distance(distance)}",
             )
 
-        self._log_system(f"載入 {len(listview.children)} 個頻道/node")
+        # Counted from what was just added, not len(listview.children): the
+        # clear() above queues the old rows for removal but they are still in
+        # .children at this point, while the new ones mount immediately - so on
+        # a repopulate (which only happens after a reconnect) the widget count
+        # reads as old + new. The rows themselves end up correct; it was only
+        # this number that doubled.
+        self._log_system(f"載入 {len(self._target_markup)} 個頻道/node")
         # Distance needs a position at both ends, so say which end is missing
         # rather than leaving a column of "--" unexplained.
         if here is None:
