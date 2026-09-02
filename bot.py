@@ -898,6 +898,15 @@ class MeshtasticTUI(App):
                     f"[yellow]{count} 條規則適用於「所有頻道」,包含公共頻道 - "
                     f"建議改用 [頻道名] 或 [#index] 限定[/yellow]"
                 )
+            elif section == DM_SECTION:
+                # [DM] is selected by the target being a node, not by matching
+                # a channel name, so it has to skip the "matches no channel"
+                # branch below - which would otherwise report working DM rules
+                # as dead and send you looking for a typo that is not there.
+                # A channel genuinely named DM shares the section (see
+                # DM_SECTION), and is then covered as well.
+                also = " (以及同名的頻道)" if section in known else ""
+                self._log_system(f"自動回覆私訊{also}: {count} 條規則")
             elif section in known:
                 self._log_system(f"自動回覆頻道 [{section}]: {count} 條規則")
             else:

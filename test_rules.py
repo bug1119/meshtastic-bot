@@ -191,6 +191,59 @@ def test_unread_bold_widgets():
     asyncio.run(_unread_bold_widgets())
 
 
+def coverage_report(rules_text: str, channels: set) -> list[str]:
+    """Run _report_rule_coverage with a stand-in self, returning what it logged.
+
+    The method only reaches for _log_system and _known_channel_sections, so a
+    namespace avoids building a real Textual App - and `channels` stands in for
+    what the connected node actually has configured.
+    """
+    with_rules(rules_text)
+    logged: list[str] = []
+    app = types.SimpleNamespace(
+        _log_system=logged.append,
+        _known_channel_sections=lambda: channels,
+    )
+    bot.MeshtasticTUI._report_rule_coverage(app)
+    return logged
+
+
+def test_rule_coverage_report():
+    print("the rule-coverage report logged on connect")
+    # What a node with a primary and one named channel reports, mirroring
+    # _known_channel_sections: "*" is always in there.
+    channels = {bot.ALL_CHANNELS, "#0", "#3", "EDGE_ATS"}
+
+    lines = coverage_report("[EDGE_ATS]\nping=pong\n", channels)
+    check("a configured channel is reported", lines, ["自動回覆頻道 [EDGE_ATS]: 1 條規則"])
+
+    lines = coverage_report("[TYPO]\nping=pong\n", channels)
+    check("a section matching no channel is flagged", len(lines), 1)
+    check("...and says so", "對不上這台的任何頻道" in lines[0], True)
+
+    # The regression: [DM] is chosen by the target being a node, not by
+    # matching a channel name, so the "no such channel" check must not claim
+    # working DM rules are dead.
+    lines = coverage_report("[DM]\nhi=hello there\n", channels)
+    check("[DM] is not flagged as an unmatched channel", any("對不上" in ln for ln in lines), False)
+    check("[DM] is reported as covering DMs", lines, ["自動回覆私訊: 1 條規則"])
+
+    # DM_SECTION's docstring accepts that a channel really named DM shares the
+    # section; when that happens the report should say it covers both.
+    lines = coverage_report("[DM]\nhi=hello there\n", channels | {"DM"})
+    check("a channel named DM is mentioned too", lines, ["自動回覆私訊 (以及同名的頻道): 1 條規則"])
+
+    lines = coverage_report("[DM]\nhi=hi\n[EDGE_ATS]\nping=pong\n[TYPO]\na=b\n", channels)
+    check("all three kinds are reported together", len(lines), 3)
+    check("...DM among them", any("私訊" in ln for ln in lines), True)
+
+    lines = coverage_report("hello=hi\n", channels)
+    check("a catch-all is warned about", any("所有頻道" in ln for ln in lines), True)
+
+    lines = coverage_report("# nothing but a comment\n", channels)
+    check("no rules at all is called out", any("沒有任何規則" in ln for ln in lines), True)
+
+
 def test_default_rules_template():
     """Check DEFAULT_RULES, the template written when no rules.txt exists.
 
@@ -757,6 +810,7 @@ if __name__ == "__main__":
         test_default_rules_template()
         test_unread_bold()
         test_unread_bold_widgets()
+        test_rule_coverage_report()
         test_sections_and_precedence()
         test_exact_matching()
         test_should_auto_reply()
