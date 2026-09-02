@@ -290,6 +290,100 @@ def test_rule_coverage_report():
     check("no rules at all is called out", any("沒有任何規則" in ln for ln in lines), True)
 
 
+def bar_app(**over):
+    """A stand-in self for _status_bar_text: it reads only these figures."""
+    import time as _time
+
+    state = dict(
+        started_at=_time.monotonic(),
+        received_count=0,
+        sent_typed_count=0,
+        sent_auto_count=0,
+        link_down=False,
+        reconnect_attempt=0,
+        reconnect_total=0,
+    )
+    state.update(over)
+    return types.SimpleNamespace(**state)
+
+
+def bar_text(**over):
+    return bot.MeshtasticTUI._status_bar_text(bar_app(**over))
+
+
+def test_status_bar():
+    print("run-time formatting")
+    check("zero", bot.format_elapsed(0), "0:00:00")
+    check("seconds", bot.format_elapsed(9), "0:00:09")
+    check("a minute", bot.format_elapsed(61), "0:01:01")
+    check("an hour", bot.format_elapsed(3661), "1:01:01")
+    # Hours are not wrapped into days: two days and change reads as 51:03:12,
+    # which compares against a log timestamp without arithmetic.
+    check("past a day", bot.format_elapsed(183792), "51:03:12")
+    check("fractional seconds truncate", bot.format_elapsed(59.9), "0:00:59")
+    check("negative is clamped", bot.format_elapsed(-5), "0:00:00")
+    # Distinct from format_uptime, which reports the node's uptime: minute
+    # precision, and "--" when the device has not told us. Naming this one
+    # format_uptime too silently shadowed it - both call sites got the wrong one.
+    check("the node's formatter is untouched", bot.format_uptime(None), "--")
+    check("...still minute precision", bot.format_uptime(3661), "01:01")
+    check("...still days for long spans", bot.format_uptime(183792), "2d 03:03")
+
+    print("the status bar line")
+    # Uptime itself is checked above; here the figures matter, so match on the
+    # parts that do not move.
+    text = bar_text()
+    check("starts at zero received", "收[/bold] 0" in text, True)
+    check("starts at zero sent", "發[/bold] 0 ([dim]自動 0[/dim])" in text, True)
+    check("no reconnect segment before any outage", "重連" in text, False)
+
+    text = bar_text(received_count=42, sent_typed_count=2, sent_auto_count=5)
+    check("received count shown", "收[/bold] 42" in text, True)
+    # 7 is the total, of which 5 were the bot - not 5 on top of 7.
+    check("sent is the total, auto in brackets", "發[/bold] 7 ([dim]自動 5[/dim])" in text, True)
+
+    print("while the link is down")
+    text = bar_text(link_down=True, reconnect_attempt=3, reconnect_total=8)
+    check("shows this outage's attempt, in red", "[red]重連中 第 3 次[/red]" in text, True)
+    check("not the session total", "重連 8 次" in text, False)
+
+    print("after it recovers")
+    text = bar_text(link_down=False, reconnect_attempt=3, reconnect_total=8)
+    check("shows the session total, dimmed", "[dim]重連 8 次[/dim]" in text, True)
+    check("no longer says 重連中", "重連中" in text, False)
+
+
+async def _status_bar_widget():
+    from textual.widgets import Label
+
+    app = bot.MeshtasticTUI()
+    async with app.run_test() as pilot:
+        bar = app.query_one("#status-bar", Label)
+        await pilot.pause()
+        check("the bar is one line tall", bar.size.height, 1)
+        check("it starts filled in", "執行" in bar.render().plain, True)
+
+        app.received_count = 12
+        app.sent_typed_count = 1
+        app.sent_auto_count = 2
+        app._render_status_bar()
+        await pilot.pause()
+        plain = bar.render().plain
+        check("counts reach the widget", "收 12" in plain, True)
+        check("sent total reaches the widget", "發 3 (自動 2)" in plain, True)
+
+        app.link_down = True
+        app.reconnect_attempt = 4
+        app._render_status_bar()
+        await pilot.pause()
+        check("the outage shows on the bar", "重連中 第 4 次" in bar.render().plain, True)
+
+
+def test_status_bar_widget():
+    print("the status bar as a real widget")
+    asyncio.run(_status_bar_widget())
+
+
 def link_app(interface="iface", closing=False, link_down=False):
     """A stand-in self for the link-loss handlers.
 
@@ -504,6 +598,8 @@ def test_dm_replies():
     app = types.SimpleNamespace(
         my_id="!me", here=None, history={}, _replied_ids={},
         REPLIED_ID_LIMIT=bot.MeshtasticTUI.REPLIED_ID_LIMIT,
+        # Tallied for the status bar every time a reply goes out.
+        sent_auto_count=0,
         interface=types.SimpleNamespace(nodes={}, sendText=lambda t, **k: sent.append((t, k))),
     )
     channels = {3: "EDGE_ATS"}
@@ -525,6 +621,8 @@ def test_dm_replies():
         from_id="!them", transport="LoRa", snr=None, rssi=None, channel=3,
     )
     check("a channel reply goes to the channel", [kw for _, kw in sent], [{"channelIndex": 3}])
+    # Both replies above went out, so the status bar's auto tally saw both.
+    check("both replies reached the status bar tally", app.sent_auto_count, 2)
 
 
 def test_legacy_flat_file():
@@ -923,6 +1021,8 @@ if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
         test_default_rules_template()
+        test_status_bar()
+        test_status_bar_widget()
         test_connection_lost()
         test_unread_bold()
         test_unread_bold_widgets()
