@@ -26,6 +26,11 @@
 # is how the old flat format keeps working - but that will auto-reply on public
 # channels too, so prefer an explicit header.
 
+# Private messages. Searched before the channel a DM arrived on, so these
+# override it; anything not listed here falls back to that channel's rules.
+[DM]
+ping=pong (DM)
+
 [EDGE_ATS]
 ping=pong
 test=Bot: Hello!
