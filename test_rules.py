@@ -296,6 +296,7 @@ def bar_app(**over):
 
     state = dict(
         started_at=_time.monotonic(),
+        packet_count=0,
         received_count=0,
         sent_typed_count=0,
         sent_auto_count=0,
@@ -333,11 +334,14 @@ def test_status_bar():
     # Uptime itself is checked above; here the figures matter, so match on the
     # parts that do not move.
     text = bar_text()
+    check("starts at zero packets", "封包[/bold] 0" in text, True)
     check("starts at zero received", "收[/bold] 0" in text, True)
     check("starts at zero sent", "發[/bold] 0 ([dim]自動 0[/dim])" in text, True)
     check("no reconnect segment before any outage", "重連" in text, False)
 
-    text = bar_text(received_count=42, sent_typed_count=2, sent_auto_count=5)
+    text = bar_text(packet_count=1284, received_count=42, sent_typed_count=2, sent_auto_count=5)
+    # Packets dwarf messages - most traffic is position/nodeinfo/telemetry.
+    check("packet count shown", "封包[/bold] 1284" in text, True)
     check("received count shown", "收[/bold] 42" in text, True)
     # 7 is the total, of which 5 were the bot - not 5 on top of 7.
     check("sent is the total, auto in brackets", "發[/bold] 7 ([dim]自動 5[/dim])" in text, True)
@@ -353,6 +357,64 @@ def test_status_bar():
     check("no longer says 重連中", "重連中" in text, False)
 
 
+def test_packet_count():
+    print("every packet counts, not just the text ones")
+
+    def receiving_app():
+        """A stand-in self for on_receive, enough for the counting paths."""
+        app = types.SimpleNamespace(
+            packet_count=0, received_count=0, last_signal=None,
+            my_id="!me", history={}, target=None,
+        )
+        app._track_signal = lambda pkt: bot.MeshtasticTUI._track_signal(app, pkt)
+        app._mark_unread = lambda target: None
+        app._log_system = lambda line: None
+        # on_receive hands its UI work off; running it is not what is under test.
+        app.call_from_thread = lambda fn, *a: None
+        app._should_auto_reply = lambda info: False
+        return app
+
+    # A position packet carries no text, so parse_incoming returns None and
+    # on_receive stops early - but the packet still arrived.
+    app = receiving_app()
+    bot.MeshtasticTUI.on_receive(
+        app, {"decoded": {"portnum": "POSITION_APP"}, "fromId": "!them"}, None
+    )
+    check("a position packet is counted", app.packet_count, 1)
+    check("but is not a received message", app.received_count, 0)
+
+    # Nothing decoded at all - encrypted for a channel this node has no key
+    # for. Still traffic, still proof the radio is hearing something.
+    bot.MeshtasticTUI.on_receive(app, {"fromId": "!them"}, None)
+    check("an undecoded packet is counted", app.packet_count, 2)
+
+    # A text message is both.
+    app = receiving_app()
+    bot.MeshtasticTUI.on_receive(
+        app,
+        {
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"},
+            "fromId": "!them", "toId": bot.BROADCAST_ADDR, "id": 1,
+        },
+        types.SimpleNamespace(nodes={}),
+    )
+    check("a text packet counts as a packet", app.packet_count, 1)
+    check("...and as a received message", app.received_count, 1)
+
+    # Our own echo is a packet, but not something we received from the mesh.
+    app = receiving_app()
+    bot.MeshtasticTUI.on_receive(
+        app,
+        {
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"},
+            "fromId": "!me", "toId": bot.BROADCAST_ADDR, "id": 2,
+        },
+        types.SimpleNamespace(nodes={}),
+    )
+    check("our own echo is a packet", app.packet_count, 1)
+    check("...but not a received message", app.received_count, 0)
+
+
 async def _status_bar_widget():
     from textual.widgets import Label
 
@@ -363,12 +425,14 @@ async def _status_bar_widget():
         check("the bar is one line tall", bar.size.height, 1)
         check("it starts filled in", "執行" in bar.render().plain, True)
 
+        app.packet_count = 1284
         app.received_count = 12
         app.sent_typed_count = 1
         app.sent_auto_count = 2
         app._render_status_bar()
         await pilot.pause()
         plain = bar.render().plain
+        check("the packet count reaches the widget", "封包 1284" in plain, True)
         check("counts reach the widget", "收 12" in plain, True)
         check("sent total reaches the widget", "發 3 (自動 2)" in plain, True)
 
@@ -1023,6 +1087,7 @@ if __name__ == "__main__":
         test_default_rules_template()
         test_status_bar()
         test_status_bar_widget()
+        test_packet_count()
         test_connection_lost()
         test_unread_bold()
         test_unread_bold_widgets()
