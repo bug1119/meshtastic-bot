@@ -22,22 +22,43 @@
 
 ## 安裝
 
-**Python 3.9 或更新**(在 3.9.6 與 3.12.1 上都實測過)。
+換一台新機器只要兩行:
 
 ```sh
-pip3 install textual pypubsub meshtastic
+git clone https://github.com/bug1119/meshtastic-bot.git && cd meshtastic-bot
+./setup.sh
 ```
 
-啟動時會自己檢查這三個套件,缺哪個會直接告訴你要 `pip install` 什麼,不會丟一串 traceback。
+唯一的前置是 [uv](https://docs.astral.sh/uv/),而 `setup.sh` 會處理掉它:有 Homebrew 就 `brew install uv`,沒有就用官方 installer 裝到 `~/.local/bin`(不需要 sudo);接著預先下載套件、跑一次測試確認這台機器沒問題。可以重複執行,已經滿足的步驟會直接跳過。
+
+之後 `./bot.py` 就能直接跑,**不用建 venv、也不用 activate**。原理是 `bot.py` 的 shebang 是 `uv run --script`,而它需要的套件用 [PEP 723](https://peps.python.org/pep-0723/) 宣告在檔案開頭,uv 讀到就自己準備並快取環境。**Python 3.9 或更新**(在 3.9.6 與 3.12.1 上都實測過)這個條件也一併交給 uv —— 版本不合時它會自己抓一個合用的 Python,不動系統那支。
+
+`setup.sh` 唯一沒辦法替你做的是 **PATH**:`./bot.py` 是由 shebang 把檔案交給 `uv`,而那要靠你當下 shell 的 PATH 找得到 `uv`。所以它會用一個全新的 login shell 去驗,找不到就直接印出該加進 `~/.zshrc` 的那行。
+
+<details>
+<summary>不想裝 uv 的話</summary>
+
+把套件裝進任何一個 interpreter 也行:
+
+```sh
+python3 -m venv ~/.venvs/meshtastic-bot
+~/.venvs/meshtastic-bot/bin/pip install textual pypubsub meshtastic
+~/.venvs/meshtastic-bot/bin/python bot.py --host Meshtastic.local
+```
+
+這時要**明確寫出 interpreter 路徑**。`./bot.py` 仍然會走 shebang 交給 uv;而 `python3 bot.py` 用的是系統那支 —— 在裝了 Homebrew 的 macOS 上,它還會因為 [PEP 668](https://peps.python.org/pep-0668/) 直接拒絕 `pip3 install`(`externally-managed-environment`),這正是要開 venv 的原因。
+
+啟動時會自己檢查那三個套件,缺哪個會直接告訴你,不會丟一串 traceback。
+</details>
 
 ## 用法
 
 ```sh
-python3 bot.py                                    # 掃描並連 BLE
-python3 bot.py --host Meshtastic.local            # 走 WiFi (TCP 4403)
-python3 bot.py --port /dev/cu.usbmodem2101        # 走 USB serial
-python3 bot.py --host Meshtastic.local --port /dev/cu.usbmodem2101   # 三種都列出來
-python3 bot.py --host Meshtastic.local --here 25.0339,121.5645       # 顯示節點距離
+./bot.py                                          # 掃描並連 BLE
+./bot.py --host Meshtastic.local                  # 走 WiFi (TCP 4403)
+./bot.py --port /dev/cu.usbmodem2101              # 走 USB serial
+./bot.py --host Meshtastic.local --port /dev/cu.usbmodem2101         # 三種都列出來
+./bot.py --host Meshtastic.local --here 25.0339,121.5645             # 顯示節點距離
 ```
 
 | 參數 | 說明 |
@@ -81,8 +102,8 @@ python3 bot.py --host Meshtastic.local --here 25.0339,121.5645       # 顯示節
 ### WiFi 開關
 
 ```sh
-python3 bot.py --port /dev/cu.usbmodem2101 --wifi off   # 關
-python3 bot.py --port /dev/cu.usbmodem2101 --wifi on    # 開
+./bot.py --port /dev/cu.usbmodem2101 --wifi off         # 關
+./bot.py --port /dev/cu.usbmodem2101 --wifi on          # 開
 ```
 
 **WiFi 關掉之後只有 USB 或裝置螢幕能開回來** —— 因為開 WiFi 這個指令沒辦法透過 WiFi 下,而 MUI 機種的藍牙預設是關的。裝置螢幕上的方式是 **home 畫面的 WLAN 按鈕長按**(短按無效)。
@@ -176,10 +197,10 @@ BOT: pong
 ## 測試
 
 ```sh
-python3 test_rules.py
+./test_rules.py
 ```
 
-151 項檢查,無外部依賴(不需要 pytest,也不需要硬體)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
+151 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導,以及自動回覆的文字組成。
 
 頻率推導的斷言是對**獨立來源**驗證,不是自我循環:
 

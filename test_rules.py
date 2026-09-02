@@ -1,12 +1,22 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "meshtastic",
+#     "pypubsub",
+#     "textual",
+# ]
+# ///
 """Tests for bot.py's pure helpers: the per-channel rules.txt parser and the
 device-key / host-port parsing behind BLE-vs-TCP connections.
 
 Run with:
-    python3 test_rules.py
+    ./test_rules.py
 
-Deliberately dependency-free (no pytest) so it runs anywhere bot.py itself
-runs. Importing bot is safe: the TUI only starts under __main__.
+Deliberately pytest-free so it runs anywhere bot.py itself runs; the shebang
+resolves the same three dependencies bot.py declares, which this suite needs
+because it imports bot (and meshtastic's protobufs) directly. Importing bot is
+safe: the TUI only starts under __main__.
 """
 
 # Deferred annotation evaluation, matching bot.py so this suite imports on
