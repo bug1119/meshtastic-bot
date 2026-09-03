@@ -78,6 +78,7 @@ import meshtastic
 import meshtastic.ble_interface
 import meshtastic.serial_interface
 import meshtastic.tcp_interface
+import meshtastic.util
 from meshtastic.protobuf import config_pb2
 
 RULES_FILE = Path(__file__).parent / "rules.txt"
@@ -921,6 +922,45 @@ class ServerBot(ReplyEngine):
         return 0
 
 
+def list_devices() -> int:
+    """Print every node we could connect to right now, then exit.
+
+    resolve_server_target() already scans, but only as a step towards asking
+    which one you want. This answers "what is out there" on its own - which is
+    what you actually need before writing a --ble name into a launchd plist, or
+    when a node has stopped appearing and you want to know whether it is
+    advertising at all.
+
+    Printed as the flags you would pass, so a line can go straight onto a
+    command line.
+    """
+    print("掃描 BLE(約 10 秒)...", file=sys.stderr)
+    try:
+        devices = meshtastic.ble_interface.BLEInterface.scan()
+    except Exception as e:  # noqa: BLE001
+        print(f"BLE 掃描失敗: {e}", file=sys.stderr)
+        return 1
+
+    # scan() filters on Meshtastic's service UUID, so everything here is a node
+    # rather than every bluetooth thing in the room.
+    print(f"BLE 節點 ({len(devices)}):")
+    for device in devices:
+        address = getattr(device, "address", "") or ""
+        print(f"  --ble {device.name}" + (f"    {address}" if address else ""))
+    if not devices:
+        print("  (沒有節點在廣播 - 已經連上手機的節點通常就不廣播了)")
+
+    # findPorts prefers known USB-serial vendor ids and falls back to listing
+    # everything not blacklisted, so this is "likely a node", not "any port".
+    ports = meshtastic.util.findPorts(True)
+    print(f"\nUSB serial ({len(ports)}):")
+    for port in ports:
+        print(f"  --port {port}")
+    if not ports:
+        print("  (沒有接上的裝置)")
+    return 0
+
+
 def resolve_server_target(
     tcp_host: str | None, serial_port: str | None, ble_address: str | None
 ) -> tuple[str, str] | None:
@@ -1057,6 +1097,12 @@ def main() -> None:
         "unattended.",
     )
     parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list the nodes you could connect to right now - BLE names and USB "
+        "serial ports - then exit without connecting to any of them.",
+    )
+    parser.add_argument(
         "--daemon",
         action="store_true",
         help="relaunch in the background once the device is chosen, writing "
@@ -1079,6 +1125,9 @@ def main() -> None:
         "it off, logging only what actually happens. (default: %(default)s)",
     )
     args = parser.parse_args()
+
+    if args.list:
+        sys.exit(list_devices())
 
     target = resolve_server_target(args.host, args.port, args.ble)
     if target is None:

@@ -109,6 +109,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 ./bot_server.py --host 192.168.0.247                 # WiFi
 ./bot_server.py --ble Bug2_1ca6                      # BLE,指定名稱
 ./bot_server.py                                      # 不指定 → 列出裝置讓你選編號
+./bot_server.py --list                               # 只列出有哪些裝置,不連線
 ./bot_server.py --ble Bug2_1ca6 --daemon --log ~/bot.log    # 丟到背景
 
 # bot_dual.py 是一樣的東西,多一個 --server
@@ -133,10 +134,31 @@ python3 -m venv ~/.venvs/meshtastic-bot
 
 | 參數 | 說明 |
 |---|---|
+| `--list` | 列出現在連得到哪些節點(BLE 名稱 + USB serial 埠),然後結束,不連任何一台 |
 | `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒的掃描。`--daemon` 要能無人啟動就靠這個 |
 | `--daemon` | 選好裝置後丟到背景,輸出寫到 `--log`,並印出 pid |
 | `--log PATH` | `--daemon` 的輸出檔,**附加**不覆蓋。預設 `meshtastic-bot.log` |
 | `--heartbeat SECS` | 多久印一行「還活著」與計數。`0` 關閉,只印真正發生的事。預設 600 |
+
+### 先看有哪些裝置
+
+```
+$ ./bot_server.py --list
+掃描 BLE(約 10 秒)...
+BLE 節點 (2):
+  --ble Bug2_1ca6    F891A520-7FDB-A7FB-998C-04A6C606B42C
+  --ble bug_530c     E9FF9C79-E898-E0B8-867B-2015A1D74ECD
+
+USB serial (0):
+  (沒有接上的裝置)
+```
+
+輸出直接就是**要傳的參數**,所以那一行可以整段貼到命令列上。
+
+BLE 掃描是用 Meshtastic 的 service UUID 過濾的,所以列出來的都是真節點,不是房間裡所有藍牙裝置。
+**列不到通常不是壞掉** —— 已經連上手機 app 的節點通常就停止廣播了。
+
+USB 那份用的是函式庫自己的 `findPorts()`,會優先挑已知的 USB-serial vendor id。
 
 ### 怎麼結束
 
@@ -349,7 +371,7 @@ BOT: pong
 ./test_rules.py
 ```
 
-337 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。
+350 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。
 
 其中未讀粗體有一項是**唯一會真的把 App 跑起來**的測試(Textual 的 headless 模式,仍然不需要硬體)—— 因為「找到那一列並重畫」這件事只有真的 widget 在時才存在,假造的 self 測不到。
 

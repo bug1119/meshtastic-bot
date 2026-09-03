@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import contextlib
 import inspect
 import io
 import pathlib
@@ -1374,6 +1375,7 @@ def test_bot_server_is_generated_not_rewritten():
         "_split_device_key",
         "_split_host_port",
         "open_interface",
+        "list_devices",
         "resolve_server_target",
         "detached_argv",
         "spawn_detached",
@@ -1558,6 +1560,68 @@ def test_stop_wakes_the_wait():
     check("closing is set", server._closing, True)
 
 
+def test_list_devices():
+    print("--list prints what could be connected to")
+    original_scan = bot.meshtastic.ble_interface.BLEInterface.scan
+    original_ports = bot.meshtastic.util.findPorts
+    try:
+        bot.meshtastic.ble_interface.BLEInterface.scan = staticmethod(
+            lambda: [
+                types.SimpleNamespace(name="Bug2_1ca6", address="AA:BB:CC:DD:EE:FF"),
+                types.SimpleNamespace(name="Meshtastic_9f9c", address=None),
+            ]
+        )
+        bot.meshtastic.util.findPorts = lambda *a, **k: ["/dev/cu.usbmodem2101"]
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = bot.list_devices()
+        out = buffer.getvalue()
+
+        check("exits 0", code, 0)
+        check("counts the BLE nodes", "BLE 節點 (2):" in out, True)
+        # Printed as the flag you would pass, so a line is copy-pasteable.
+        check("names are ready to paste", "  --ble Bug2_1ca6    AA:BB:CC:DD:EE:FF" in out, True)
+        check("an address-less device still lists", "  --ble Meshtastic_9f9c\n" in out, True)
+        check("lists serial ports too", "  --port /dev/cu.usbmodem2101" in out, True)
+        check("counts them", "USB serial (1):" in out, True)
+        # It connects to nothing, so nothing about a node should appear.
+        check("does not claim to connect", "已連線" in out, False)
+
+        print("and says so when there is nothing")
+        bot.meshtastic.ble_interface.BLEInterface.scan = staticmethod(lambda: [])
+        bot.meshtastic.util.findPorts = lambda *a, **k: []
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = bot.list_devices()
+        out = buffer.getvalue()
+        check("still exits 0 - an empty list is not an error", code, 0)
+        check("explains the empty BLE list", "沒有節點在廣播" in out, True)
+        check("explains the empty port list", "沒有接上的裝置" in out, True)
+
+        print("a failed scan is reported, not raised")
+        def boom():
+            raise RuntimeError("bluetooth off")
+
+        bot.meshtastic.ble_interface.BLEInterface.scan = staticmethod(boom)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = bot.list_devices()
+        check("exits non-zero", code, 1)
+        # The message goes to stderr, so stdout stays parseable by a script.
+        check("nothing misleading on stdout", buffer.getvalue().strip(), "")
+    finally:
+        bot.meshtastic.ble_interface.BLEInterface.scan = original_scan
+        bot.meshtastic.util.findPorts = original_ports
+
+    print("bot_server has it too, from the same source")
+    check(
+        "one implementation",
+        inspect.getsource(bot.list_devices) == inspect.getsource(bot_server.list_devices),
+        True,
+    )
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -1604,6 +1668,7 @@ if __name__ == "__main__":
         test_config_sync_before_adopt()
         test_shutdown_is_bounded()
         test_stop_wakes_the_wait()
+        test_list_devices()
     finally:
         bot.RULES_FILE = original
 
