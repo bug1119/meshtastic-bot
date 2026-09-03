@@ -1753,6 +1753,87 @@ def test_packet_count_in_all_three_files():
         check(f"{name} shows it in the heartbeat", "f\" 封包 {self.packet_count}\"" in text, True)
 
 
+async def _device_rows_widgets():
+    from textual.widgets import Label, ListItem, ListView
+
+    def rows(app):
+        """(row name, rendered text) for every device row, in order."""
+        return [
+            (item.name, str(item.query_one(Label).render()))
+            for item in app.query_one("#device-list", ListView).query(ListItem)
+        ]
+
+    # on_mount starts a scan and, with targets named on the command line, a
+    # connection - neither of which may touch real hardware here.
+    original_open = bot.open_interface
+    original_scan = bot.meshtastic.ble_interface.BLEInterface.scan
+
+    def no_hardware(*_args, **_kwargs):
+        raise RuntimeError("no hardware in tests")
+
+    bot.open_interface = no_hardware
+    bot.meshtastic.ble_interface.BLEInterface.scan = staticmethod(lambda: [])
+    try:
+        app = bot.MeshtasticTUI(
+            tcp_host="192.168.0.247",
+            serial_port="/dev/cu.usbmodem2101",
+            ble_address="Bug2_1ca6",
+        )
+        async with app.run_test() as pilot:
+            # Reaching here at all is the regression: DEVICE_MARKS had no entry
+            # for "ble", so a --ble target raised KeyError('ble') inside
+            # _rebuild_device_list while the first frame was being drawn, and
+            # the app exited before showing anything.
+            await pilot.pause()
+            check("the app started with a --ble target", app.is_running, True)
+
+            app._rebuild_device_list(
+                [
+                    types.SimpleNamespace(name="Bug2_1ca6"),
+                    types.SimpleNamespace(name="bug_530c"),
+                ]
+            )
+            await pilot.pause()
+            listed = rows(app)
+
+            check(
+                "one row per distinct device",
+                [name for name, _ in listed],
+                [
+                    "tcp:192.168.0.247",
+                    "serial:/dev/cu.usbmodem2101",
+                    "ble:Bug2_1ca6",
+                    "ble:bug_530c",
+                ],
+            )
+            text = dict(listed)
+            check("tcp is marked", text["tcp:192.168.0.247"].startswith("◆ "), True)
+            # Serial shows the basename: the full path overflows a 28-column pane.
+            check("serial shows the basename", text["serial:/dev/cu.usbmodem2101"], "▣ cu.usbmodem2101  SERIAL")
+            check("the --ble target is marked like any BLE row", text["ble:Bug2_1ca6"], "● Bug2_1ca6  BLE")
+            # The scan finds the named node again; it must not be offered twice.
+            check(
+                "the named node is listed once",
+                [name for name, _ in listed].count("ble:Bug2_1ca6"),
+                1,
+            )
+            check("other scanned nodes still appear", text["ble:bug_530c"], "● bug_530c  BLE")
+    finally:
+        bot.open_interface = original_open
+        bot.meshtastic.ble_interface.BLEInterface.scan = original_scan
+
+
+def test_device_rows():
+    print("the device pane lists every transport, including --ble")
+    asyncio.run(_device_rows_widgets())
+
+    # The table itself, so a transport added later without a mark fails here
+    # rather than at the first frame of a real run.
+    marks = bot.MeshtasticTUI.DEVICE_MARKS
+    for transport in (bot.TRANSPORT_TCP, bot.TRANSPORT_SERIAL, bot.TRANSPORT_BLE):
+        check(f"{transport} has a mark", transport in marks, True)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -1803,6 +1884,7 @@ if __name__ == "__main__":
         test_list_devices()
         test_server_packet_count()
         test_packet_count_in_all_three_files()
+        test_device_rows()
     finally:
         bot.RULES_FILE = original
 
