@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rasterise message-flow.html to message-flow.png.
+"""Rasterise the diagram HTML files in this folder to PNG.
 
 The PNG is what the README embeds - GitHub sanitises inline SVG, so a remote
 web font never loads there and the Chinese labels would fall back to whatever
@@ -10,8 +10,9 @@ down through Playwright. The SVG is wrapped in a page sized to exactly its
 viewBox, which makes a viewport screenshot identical to an element screenshot -
 no cropping guesswork - and --force-device-scale-factor doubles the pixels.
 
-    ./render_png.py            # 2x, the README size
-    ./render_png.py 3          # 3x, for print
+    ./render_png.py                        # every *.html here, at 2x
+    ./render_png.py tui-layout.html        # just one
+    ./render_png.py --scale 3              # 3x, for print
 
 Chrome refuses to load a local file over file:// in some configurations, so the
 page is served over loopback for the duration and the server is shut down after.
@@ -28,19 +29,17 @@ import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE / "message-flow.html"
-OUT = HERE / "message-flow.png"
 RASTER = HERE / "_raster.html"
 CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 
 
-def build_raster_page():
+def build_raster_page(src):
     """Write a wrapper page holding just the SVG at its exact pixel size."""
-    html = SRC.read_text(encoding="utf-8")
+    html = src.read_text(encoding="utf-8")
 
     svg = re.search(r"<svg\b.*?</svg>", html, re.S)
     if not svg:
-        sys.exit(f"no <svg> found in {SRC.name}")
+        sys.exit(f"no <svg> found in {src.name}")
     markup = svg.group(0)
 
     box = re.search(r'viewBox="0 0 (\d+) (\d+)"', markup)
@@ -63,13 +62,64 @@ def build_raster_page():
     return width, height
 
 
+def render(src, scale, port):
+    """Screenshot one diagram; returns the PNG path."""
+    out = src.with_suffix(".png")
+    width, height = build_raster_page(src)
+    print(f"{src.name}: viewBox {width}x{height} -> {width * scale}x{height * scale}")
+    out.unlink(missing_ok=True)
+    result = subprocess.run(
+        [
+            str(CHROME),
+            "--headless",
+            "--disable-gpu",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            f"--force-device-scale-factor={scale}",
+            f"--window-size={width},{height}",
+            # Lets the web fonts finish before the frame is captured; without it
+            # the CJK glyphs can rasterise with fallback metrics.
+            "--virtual-time-budget=10000",
+            f"--screenshot={out}",
+            f"http://127.0.0.1:{port}/{RASTER.name}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if not out.exists():
+        print(result.stderr[-800:], file=sys.stderr)
+        sys.exit(f"Chrome produced no PNG for {src.name}")
+    data = out.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        sys.exit(f"{out.name} is not a PNG")
+    got_w, got_h = struct.unpack(">II", data[16:24])
+    print(f"  wrote {out.name}: {got_w}x{got_h} px, {len(data) / 1024:.0f} KB")
+    return out
+
+
 def main():
-    scale = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+    args = [a for a in sys.argv[1:]]
+    scale = 2
+    if "--scale" in args:
+        i = args.index("--scale")
+        scale = int(args[i + 1])
+        del args[i : i + 2]
+
+    if args:
+        sources = [HERE / a for a in args]
+        missing = [s for s in sources if not s.exists()]
+        if missing:
+            sys.exit("not found: " + ", ".join(m.name for m in missing))
+    else:
+        # Every diagram here except the intermediate the script writes itself.
+        sources = sorted(p for p in HERE.glob("*.html") if p.name != RASTER.name)
+    if not sources:
+        sys.exit(f"no diagram HTML in {HERE}")
+
     if not CHROME.exists():
         sys.exit(f"Chrome not found at {CHROME}")
-
-    width, height = build_raster_page()
-    print(f"viewBox {width}x{height} -> {width * scale}x{height * scale} px at {scale}x")
 
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
         """Same server, without an access log line per request - Chrome also
@@ -83,40 +133,12 @@ def main():
     with socketserver.TCPServer(("127.0.0.1", 0), handler) as server:
         port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        OUT.unlink(missing_ok=True)
-        result = subprocess.run(
-            [
-                str(CHROME),
-                "--headless",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                "--no-first-run",
-                "--no-default-browser-check",
-                f"--force-device-scale-factor={scale}",
-                f"--window-size={width},{height}",
-                # Lets the web fonts finish before the frame is captured; without
-                # it the CJK glyphs can rasterise with fallback metrics.
-                "--virtual-time-budget=10000",
-                f"--screenshot={OUT}",
-                f"http://127.0.0.1:{port}/_raster.html",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        server.shutdown()
-
-    RASTER.unlink(missing_ok=True)
-
-    if not OUT.exists():
-        print(result.stderr[-800:], file=sys.stderr)
-        sys.exit("Chrome produced no PNG")
-
-    data = OUT.read_bytes()
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        sys.exit("output is not a PNG")
-    got_w, got_h = struct.unpack(">II", data[16:24])
-    print(f"wrote {OUT.name}: {got_w}x{got_h} px, {len(data) / 1024:.0f} KB")
+        try:
+            for src in sources:
+                render(src, scale, port)
+        finally:
+            server.shutdown()
+            RASTER.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
