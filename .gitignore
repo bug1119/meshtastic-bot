@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 .claude/
+
+# Playwright MCP scratch: it writes screenshots and page snapshots into the
+# working directory, which is not where anything durable belongs.
+.playwright-mcp/
+
+# Intermediate page render_png.py builds and removes; only present mid-run.
+docs/_raster.html

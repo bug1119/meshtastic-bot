@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>meshtastic-bot 三窗格介面</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600&family=Noto+Serif+TC:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', 'Noto Sans TC', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif TC', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1200px; width: 100%; }
+    .eyebrow {
+      font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500;
+      letter-spacing: 0.18em; text-transform: uppercase;
+      color: var(--color-muted); margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400; letter-spacing: -0.02em; line-height: 1.15;
+      color: var(--color-ink); margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Nested · meshtastic-bot</p>
+    <h1>三窗格介面:裝置 · 頻道/Node · 訊息</h1>
+
+    <svg viewBox="0 0 1200 820" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tui-layout-title tui-layout-desc">
+      <title id="tui-layout-title">三窗格介面:裝置 · 頻道/Node · 訊息</title>
+      <desc id="tui-layout-desc">介面配置圖:左欄上半是可連線的裝置、下半是連上節點的即時狀態;中欄是頻道與節點清單;右欄是選定對象的訊息與送出框;底下橫跨全寬的是系統訊息窗格,最下面一列固定顯示執行時間與收發計數。</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- ═══════════ 裝置 pane (left column, top) ═══════════ -->
+      <rect x="40" y="40" width="248" height="144" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <path d="M 40 64 L 288 64" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <rect x="41" y="41" width="246" height="23" fill="rgba(45,49,66,0.06)"/>
+      <text x="52" y="57" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif">裝置</text>
+
+      <text x="52" y="86" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">◆ 192.168.0.247</text>
+      <text x="276" y="86" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">TCP</text>
+      <text x="52" y="108" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">▣ cu.usbmodem2101</text>
+      <text x="276" y="108" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">SERIAL</text>
+      <text x="52" y="130" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">● Bug2_1ca6</text>
+      <text x="276" y="130" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">BLE</text>
+
+      <!-- ═══════════ 本機狀態 pane (left column, bottom) ═══════════ -->
+      <rect x="40" y="192" width="248" height="288" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <path d="M 40 216 L 288 216" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <rect x="41" y="193" width="246" height="23" fill="rgba(45,49,66,0.06)"/>
+      <text x="52" y="209" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif">本機狀態</text>
+
+      <text x="52" y="240" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">Firmware: 2.8.0.5b720bb</text>
+      <text x="52" y="264" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">Region: TW</text>
+      <text x="52" y="288" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">Preset: MEDIUM_FAST</text>
+      <text x="52" y="312" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif">頻率<tspan font-family="'Geist Mono', monospace" font-size="10">: ~920.125 MHz</tspan></text>
+      <text x="52" y="336" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">Bandwidth: ~250 kHz</text>
+      <text x="52" y="360" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">Uptime: 03:41</text>
+      <text x="52" y="384" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif">電量<tspan font-family="'Geist Mono', monospace" font-size="10">: 92%  4.012V</tspan></text>
+      <text x="52" y="408" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif">GPS<tspan font-family="'Geist Mono', monospace" font-size="10">: </tspan>無 GPS 模組</text>
+      <text x="52" y="432" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif">連線<tspan font-family="'Geist Mono', monospace" font-size="10">: BLE Bug2_1ca6</tspan></text>
+
+      <!-- ═══════════ 頻道 / Node pane (middle column) ═══════════ -->
+      <rect x="296" y="40" width="248" height="440" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <path d="M 296 64 L 544 64" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <rect x="297" y="41" width="246" height="23" fill="rgba(45,49,66,0.06)"/>
+      <text x="308" y="57" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif">頻道 / Node</text>
+
+      <text x="308" y="90" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace"># (unnamed #0)</text>
+      <text x="308" y="114" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace"># SignalTest</text>
+      <!-- Bold row: a target with unread messages -->
+      <text x="308" y="138" fill="#2d3142" font-size="10" font-weight="700" font-family="'Geist Mono', monospace"># EDGE_ATS</text>
+      <text x="308" y="162" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace"># CLSE</text>
+      <text x="308" y="200" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">@ Bug2</text>
+      <text x="376" y="200" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace">!f2dcbabe</text>
+      <text x="532" y="200" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">5.0km</text>
+      <text x="308" y="224" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">@ AKV4</text>
+      <text x="376" y="224" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace">!6984a138</text>
+      <text x="532" y="224" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">--</text>
+
+      <!-- ═══════════ 訊息 pane (right column) ═══════════ -->
+      <rect x="552" y="40" width="608" height="440" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <path d="M 552 64 L 1160 64" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <rect x="553" y="41" width="606" height="23" fill="rgba(45,49,66,0.06)"/>
+      <text x="564" y="57" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif">訊息</text>
+      <text x="1148" y="57" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">channel:3 EDGE_ATS</text>
+
+      <text x="564" y="94" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">~23:54:28 Bug2<tspan fill="#7a8399">[!f2dcbabe]</tspan>(LoRa snr=11.0 rssi=-37): Q</text>
+      <!-- The auto-reply: the one focal element. This is what the bot is for. -->
+      <text x="580" y="118" fill="#eb6c36" font-size="10" font-weight="600" font-family="'Geist Mono', monospace">-&gt; auto-reply: BOT: Quebec</text>
+      <text x="580" y="138" fill="rgba(235,108,54,0.75)" font-size="9" font-family="'Geist Mono', monospace">[~23:54:28 from=Bug2 rx=LoRa snr=11.0 rssi=-37]</text>
+
+      <text x="564" y="174" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">~23:56:24 Bug2<tspan fill="#7a8399">[!f2dcbabe]</tspan>(LoRa snr=11.0 rssi=-45): @ab test</text>
+      <text x="564" y="198" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace">~23:56:25 !909e8780(MQTT snr=10.75): [AB] 09/03 23:56:23 …</text>
+
+      <!-- Send box, disabled until a target is picked -->
+      <rect x="568" y="416" width="576" height="48" rx="4" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.20)" stroke-width="1"/>
+      <text x="584" y="445" fill="#7a8399" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif">輸入訊息…</text>
+      <text x="1128" y="445" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace" text-anchor="end">ENTER</text>
+
+      <!-- ═══════════ 狀態 pane (full width) ═══════════ -->
+      <rect x="40" y="488" width="1120" height="152" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <path d="M 40 512 L 1160 512" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <rect x="41" y="489" width="1118" height="23" fill="rgba(45,49,66,0.06)"/>
+      <text x="52" y="505" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif">狀態</text>
+
+      <text x="52" y="540" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif"><tspan font-family="'Geist Mono', monospace" font-size="10" fill="#7a8399">00:26:46  </tspan>BLE 已連線 (Bug2_1ca6),等待設定同步…</text>
+      <text x="52" y="564" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif"><tspan font-family="'Geist Mono', monospace" font-size="10" fill="#7a8399">00:26:46  </tspan>設定同步完成 (my id: !1d7e2212)</text>
+      <text x="52" y="588" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif"><tspan font-family="'Geist Mono', monospace" font-size="10" fill="#7a8399">00:26:46  </tspan>[*] 不適用於這些頻道: SignalTest, Emergency!</text>
+      <text x="52" y="612" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif"><tspan font-family="'Geist Mono', monospace" font-size="10" fill="#7a8399">00:26:47  </tspan>自動回覆頻道 [EDGE_ATS]: 4 條規則</text>
+
+      <!-- ═══════════ 固定狀態列 (the one line that is always there) ═══════════ -->
+      <rect x="40" y="648" width="1120" height="32" rx="4" fill="rgba(235,108,54,0.08)" stroke="rgba(235,108,54,0.50)" stroke-width="1"/>
+      <text x="56" y="669" fill="#2d3142" font-size="12" font-family="'Geist', 'Noto Sans TC', sans-serif"><tspan font-weight="600">執行</tspan><tspan font-family="'Geist Mono', monospace" font-size="10"> 3:24:07     </tspan><tspan font-weight="600">封包</tspan><tspan font-family="'Geist Mono', monospace" font-size="10"> 4821     </tspan><tspan font-weight="600">收</tspan><tspan font-family="'Geist Mono', monospace" font-size="10"> 128     </tspan><tspan font-weight="600">發</tspan><tspan font-family="'Geist Mono', monospace" font-size="10"> 41 </tspan>(<tspan fill="#7a8399">自動 39</tspan>)<tspan font-family="'Geist Mono', monospace" font-size="10">     </tspan><tspan font-weight="600">重連</tspan><tspan font-family="'Geist Mono', monospace" font-size="10"> 2 </tspan>次</text>
+
+      <!-- ═══════════ EDITORIAL CALLOUT ═══════════ -->
+      <text x="40" y="728" fill="#eb6c36" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif TC', serif">唯一每秒重畫的一列</text>
+      <path d="M 192 722 Q 248 714 296 684" fill="none" stroke="rgba(235,108,54,0.50)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="300" cy="682" r="2" fill="#eb6c36"/>
+
+      <!-- ═══════════ LEGEND — horizontal strip, outside the diagram ═══════════ -->
+      <line x1="40" y1="756" x2="1160" y2="756" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="40" y="780" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <text x="128" y="780" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace">◆ TCP  ·  ▣ SERIAL  ·  ● BLE</text>
+      <text x="360" y="780" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace"># <tspan font-size="11" font-family="'Geist', 'Noto Sans TC', sans-serif">頻道</tspan>  ·  @ Node</text>
+      <text x="536" y="780" fill="#4f5d75" font-size="11" font-family="'Geist', 'Noto Sans TC', sans-serif"><tspan font-weight="700">粗體</tspan> = 有未讀</text>
+      <text x="688" y="780" fill="#4f5d75" font-size="11" font-family="'Geist', 'Noto Sans TC', sans-serif">R = 重新掃描裝置</text>
+      <text x="860" y="780" fill="#4f5d75" font-size="11" font-family="'Geist', 'Noto Sans TC', sans-serif">← → = 切換窗格</text>
+    </svg>
+  </div>
+</body>
+</html>

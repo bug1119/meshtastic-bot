@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import datetime as _dt
 import inspect
 import io
 import pathlib
@@ -2097,6 +2098,139 @@ def test_readme_worked_example():
         check(f"README shows {line!r}", any(l.split("#")[0].strip() == line or l.startswith(line) for l in readme.splitlines()), True)
 
 
+def test_when_falls_back_to_our_clock():
+    print("a node with no clock no longer renders as ??:??:??")
+    base = {
+        "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "Q"},
+        "from": 0xF2DCBABE,
+        "fromId": "!f2dcbabe",
+        "toId": bot.BROADCAST_ADDR,
+        "channel": 3,
+        "id": 1,
+    }
+
+    # rxTime is the node's own clock. One that has never had a GPS fix or a
+    # phone connected reports 0, which is the normal state for a bench node - so
+    # this was every message, not an edge case.
+    for label, packet in (
+        ("absent", dict(base)),
+        ("zero", dict(base, rxTime=0)),
+    ):
+        when = bot.parse_incoming(packet, "!me")["when"]
+        check(f"rxTime {label}: marked as derived", when.startswith("~"), True)
+        check(f"rxTime {label}: is a clock time", len(when), 9)
+        check(f"rxTime {label}: no question marks", "?" in when, False)
+        # Within a minute of now - the packet is parsed as it arrives, which is
+        # what makes our clock an honest stand-in for the node's.
+        now = _dt.datetime.now().strftime("%H:%M")
+        check(f"rxTime {label}: close to now", when[1:6] == now, True)
+
+    print("and a node that does report one is believed")
+    stamped = bot.parse_incoming(dict(base, rxTime=1772800000), "!me")["when"]
+    check("no ~ when it was reported", stamped.startswith("~"), False)
+    check(
+        "the node's time is used verbatim",
+        stamped,
+        _dt.datetime.fromtimestamp(1772800000).strftime("%H:%M:%S"),
+    )
+
+    print("the reply carries it too, since that line describes the message")
+    info = bot.parse_incoming(dict(base), "!me")
+    reply = bot.build_reply_text("Quebec", {**info, "from_name": "Bug2", "distance_m": None})
+    check("first line is the rule's reply", reply.splitlines()[0], "BOT: Quebec")
+    check("the detail line is marked derived", reply.splitlines()[1].startswith("[~"), True)
+    check("and has no question marks", "?" in reply, False)
+
+
+def _server_report(rules_text, channels):
+    """What ServerBot logs on config sync, with `channels` as {index: name}."""
+    with_rules(rules_text)
+    logged = []
+    server = bot.ServerBot()
+    server.log = logged.append
+    server.interface = types.SimpleNamespace(
+        getMyUser=lambda: {"id": "!me", "longName": "BUG1119"},
+        localNode=types.SimpleNamespace(
+            channels=[
+                types.SimpleNamespace(index=i, settings=types.SimpleNamespace(name=n))
+                for i, n in channels.items()
+            ]
+        ),
+    )
+    server.on_config_synced(server.interface)
+    return logged
+
+
+def test_server_report_understands_exclusions():
+    print("the server's config-sync report handles [!exclude]")
+    channels = {0: "", 1: "SignalTest", 3: "EDGE_ATS"}
+    logged = _server_report(
+        "[!exclude]\nSignalTest\nLongFast\n\n[*]\nping=pong\nhello=hi\n", channels
+    )
+    blob = "\n".join(logged)
+
+    # This is the bug as reported: the server warned that a working exclusion
+    # matched no channel, because only the TUI's copy of the report had been
+    # taught about the section.
+    check(
+        "no longer calls [!exclude] a dead section",
+        "這些區段對應不到本機頻道,不會生效: !exclude" in blob,
+        False,
+    )
+    # And it was counted among the rules, so five excluded channels read as five
+    # loaded keywords.
+    check("not counted as rules", "[!exclude]=" in blob, False)
+    check("the real rules are still counted", "[*]=2" in blob, True)
+
+    check("says what [*] does not cover", "[*] 不適用於這些頻道: LongFast, SignalTest" in blob, True)
+    check(
+        "and which entries excluded nothing",
+        "LongFast" in blob and "沒有排除到任何東西" in blob,
+        True,
+    )
+    # SignalTest does match a channel here, so it must not be in that warning.
+    warning = next((l for l in logged if "沒有排除到任何東西" in l), "")
+    check("the working entry is not in the warning", "SignalTest" in warning, False)
+
+    print("a genuinely unknown section is still reported")
+    logged = _server_report("[!exclude]\nSignalTest\n\n[TYPOO]\nx=y\n", channels)
+    blob = "\n".join(logged)
+    check("the typo is caught", "TYPOO" in blob and "不會生效" in blob, True)
+    check("but the exclusion is not", "!exclude" not in blob.split("不會生效")[-1], True)
+
+    print("and with no exclusions at all it says nothing about them")
+    logged = _server_report("[*]\nping=pong\n", channels)
+    blob = "\n".join(logged)
+    check("no exclusion line", "不適用於這些頻道" in blob, False)
+    check("no exclusion warning", "沒有排除到任何東西" in blob, False)
+
+
+def test_urllib3_warning_filtered():
+    print("the LibreSSL warning is filtered, in all three programs")
+    # It printed on every single start. Nothing here makes an HTTPS request
+    # through urllib3 - it arrives as a dependency of meshtastic - so there was
+    # nothing to act on, just noise above the first line of real output.
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(bot.__file__).parent
+    for name in ("bot.py", "bot_dual.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        check(
+            f"{name} filters it",
+            'warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")' in text,
+            True,
+        )
+        # Before the import that triggers it, or the warning is already out.
+        check(
+            f"{name} filters before importing meshtastic",
+            text.index("urllib3 v2 only supports OpenSSL") < text.index("\nimport meshtastic"),
+            True,
+        )
+        # Filtered by message, not by category: a different urllib3 warning
+        # should still be seen.
+        check(f"{name} does not silence urllib3 wholesale", 'module="urllib3"' in text, False)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -2155,6 +2289,9 @@ if __name__ == "__main__":
         test_exclude_coverage_report()
         test_exclude_shipped_defaults()
         test_readme_worked_example()
+        test_when_falls_back_to_our_clock()
+        test_server_report_understands_exclusions()
+        test_urllib3_warning_filtered()
     finally:
         bot.RULES_FILE = original
 

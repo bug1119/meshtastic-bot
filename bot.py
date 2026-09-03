@@ -126,7 +126,16 @@ import math
 import threading
 import time
 import unicodedata
+import warnings
 from pathlib import Path
+
+# urllib3 v2 prints a NotOpenSSLWarning on import when the interpreter is linked
+# against LibreSSL instead of OpenSSL, which macOS system Python is. Nothing
+# here makes an HTTPS request through urllib3 - it arrives as a dependency of
+# meshtastic - so the warning is noise on every start and there is nothing to
+# act on. Filtered by message rather than by category, so a different urllib3
+# warning would still be seen, and set before the import chain that triggers it.
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 from pubsub import pub
 from textual import work
@@ -517,9 +526,17 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
         return None
 
+    # rxTime is the *node's* clock, and a node that has never had a GPS fix or a
+    # phone connected reports 0 - which is the normal state for a bench node, so
+    # this used to render as "??:??:??" on every single message. Falling back to
+    # our own clock is honest: the packet is parsed as it arrives, so the two are
+    # within a second of each other. Marked with "~" to say it was derived here
+    # rather than reported, the same convention the status pane uses.
     rx_time = packet.get("rxTime")
     when = (
-        datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S") if rx_time else "??:??:??"
+        datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S")
+        if rx_time
+        else "~" + datetime.datetime.now().strftime("%H:%M:%S")
     )
 
     to_id = packet.get("toId", BROADCAST_ADDR)

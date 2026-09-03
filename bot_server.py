@@ -71,7 +71,16 @@ import signal
 import subprocess
 import threading
 import time
+import warnings
 from pathlib import Path
+
+# urllib3 v2 prints a NotOpenSSLWarning on import when the interpreter is linked
+# against LibreSSL instead of OpenSSL, which macOS system Python is. Nothing
+# here makes an HTTPS request through urllib3 - it arrives as a dependency of
+# meshtastic - so the warning is noise on every start and there is nothing to
+# act on. Filtered by message rather than by category, so a different urllib3
+# warning would still be seen, and set before the import chain that triggers it.
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 from pubsub import pub
 import meshtastic
@@ -424,9 +433,17 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
         return None
 
+    # rxTime is the *node's* clock, and a node that has never had a GPS fix or a
+    # phone connected reports 0 - which is the normal state for a bench node, so
+    # this used to render as "??:??:??" on every single message. Falling back to
+    # our own clock is honest: the packet is parsed as it arrives, so the two are
+    # within a second of each other. Marked with "~" to say it was derived here
+    # rather than reported, the same convention the status pane uses.
     rx_time = packet.get("rxTime")
     when = (
-        datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S") if rx_time else "??:??:??"
+        datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S")
+        if rx_time
+        else "~" + datetime.datetime.now().strftime("%H:%M:%S")
     )
 
     to_id = packet_node_id(packet, "toId", "to") or BROADCAST_ADDR
@@ -901,11 +918,34 @@ class ServerBot(ReplyEngine):
         ]
         self.log(f"頻道: {', '.join(channels) if channels else '(無)'}")
         rules = load_rules()
-        summary = ", ".join(f"[{sec}]={len(r)}" for sec, r in rules.items())
+        known = self._known_channel_sections()
+        # [!exclude] is not a rules section - counting its channels as "5 rules"
+        # among the others reads as though five keywords were loaded.
+        summary = ", ".join(
+            f"[{sec}]={len(r)}" for sec, r in rules.items() if sec != EXCLUDE_SECTION
+        )
         self.log(f"規則: {summary if summary else '(無)'}")
-        # The same warning the TUI gives: a section aimed at a channel this node
-        # does not have will never fire, and a typo looks exactly like that.
-        unknown = sorted(set(rules) - self._known_channel_sections() - {DM_SECTION})
+
+        excluded = sorted(rules.get(EXCLUDE_SECTION, {}))
+        if excluded:
+            self.log(f"[*] 不適用於這些頻道: {', '.join(excluded)}")
+            # An entry matching no channel here excludes nothing, and looks
+            # exactly like one that works - the line is in the file and reads
+            # correctly. LongFast and MediumFast are modem preset names rather
+            # than channel names, so this fires more often than you would think.
+            missing = [c for c in excluded if c not in known]
+            if missing:
+                self.log(
+                    f"注意: [!exclude] 的 {', '.join(missing)} 對不上這台的任何頻道,"
+                    "沒有排除到任何東西"
+                )
+
+        # A section aimed at a channel this node does not have will never fire,
+        # and a typo looks exactly like that. [DM] and [!exclude] are selected
+        # by other means, so neither belongs here - reporting a working
+        # exclusion as dead sends you hunting a typo that is not there, which is
+        # exactly what this did.
+        unknown = sorted(set(rules) - known - {DM_SECTION, EXCLUDE_SECTION})
         if unknown:
             self.log(
                 "注意: 這些區段對應不到本機頻道,不會生效: "

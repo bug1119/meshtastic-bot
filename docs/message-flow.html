@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>meshtastic-bot 訊息處理流程</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600&family=Noto+Serif+TC:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;   /* white-smoke */
+      --color-ink:     #2d3142;   /* jet-black */
+      --color-muted:   #4f5d75;   /* blue-slate */
+      --color-accent:  #eb6c36;   /* atomic-tangerine */
+      --font-sans:     'Geist', 'Noto Sans TC', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif TC', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Flowchart · meshtastic-bot</p>
+    <h1>一則訊息怎麼變成一則回覆</h1>
+
+    <svg viewBox="0 0 1000 848" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="bot-flow-title bot-flow-desc">
+      <title id="bot-flow-title">一則訊息怎麼變成一則回覆</title>
+      <desc id="bot-flow-desc">流程圖:節點交上來的每個封包都先計數,只有文字訊息會往下走;通過三道防迴圈閘門後,依廣播或私訊決定要查 rules.txt 的哪些區段,完全相符才送出兩行回覆。</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- ============ ARROWS (drawn first, behind nodes) ============ -->
+
+      <!-- 1 → 2 : oval bottom to diamond top -->
+      <line x1="400" y1="96" x2="400" y2="124" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 2 → 3 : YES, straight down -->
+      <line x1="400" y1="220" x2="400" y2="252" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 2 → 9 : NO, right then down into the top edge of 不回覆 -->
+      <path d="M 500 172 L 812 172 A 8 8 0 0 1 820 180 L 820 400" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 3 → 4 : PASS, straight down -->
+      <line x1="400" y1="348" x2="400" y2="380" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 3 → 9 : BLOCKED, right, down, right into the left edge -->
+      <path d="M 500 300 L 732 300 A 8 8 0 0 1 740 308 L 740 432 A 8 8 0 0 0 748 440 L 780 440" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 4 → 5 : CHANNEL, left then down -->
+      <path d="M 300 428 L 240 428 A 8 8 0 0 0 232 436 L 232 512" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 4 → 6 : DM, right then down -->
+      <path d="M 500 428 L 560 428 A 8 8 0 0 1 568 436 L 568 512" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 5 → merge dot -->
+      <path d="M 232 576 L 232 592 A 8 8 0 0 0 240 600 L 392 600" fill="none" stroke="#4f5d75" stroke-width="1.2"/>
+
+      <!-- 6 → merge dot -->
+      <path d="M 568 576 L 568 592 A 8 8 0 0 1 560 600 L 408 600" fill="none" stroke="#4f5d75" stroke-width="1.2"/>
+
+      <!-- merge dot → 7 -->
+      <line x1="400" y1="604" x2="400" y2="628" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 7 → 8 : MATCH — the happy path, coral -->
+      <line x1="400" y1="724" x2="400" y2="748" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+
+      <!-- 7 → 9 : NO MATCH, right then up into the bottom edge -->
+      <path d="M 500 676 L 892 676 A 8 8 0 0 0 900 668 L 900 456" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- ============ ARROW LABELS (masked, 6-10px clear of the stroke) ============ -->
+
+      <rect x="542" y="152" width="24" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="554" y="161" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">NO</text>
+
+      <rect x="408" y="228" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="424" y="237" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">YES</text>
+
+      <rect x="540" y="280" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="566" y="289" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">BLOCKED</text>
+
+      <rect x="408" y="356" width="36" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="426" y="365" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">PASS</text>
+
+      <rect x="240" y="404" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="266" y="413" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">CHANNEL</text>
+
+      <rect x="516" y="404" width="28" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="530" y="413" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">DM</text>
+
+      <rect x="408" y="730" width="44" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="430" y="739" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">MATCH</text>
+
+      <rect x="560" y="656" width="60" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="590" y="665" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">NO MATCH</text>
+
+      <!-- ============ NODES ============ -->
+
+      <!-- 1. Start oval — every packet, of every kind -->
+      <rect x="300" y="40" width="200" height="56" rx="28" fill="#f5f5f5"/>
+      <rect x="300" y="40" width="200" height="56" rx="28" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <text x="400" y="66" fill="#2d3142" font-size="13" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">封包進來</text>
+      <text x="400" y="82" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">packet_count += 1</text>
+
+      <!-- 2. Decision — text message? -->
+      <polygon points="400,124 500,172 400,220 300,172" fill="#f5f5f5"/>
+      <polygon points="400,124 500,172 400,220 300,172" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="400" y="168" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">是文字訊息?</text>
+      <text x="400" y="184" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEXT_MESSAGE_APP</text>
+
+      <!-- 3. Decision — the three loop gates -->
+      <polygon points="400,252 500,300 400,348 300,300" fill="#f5f5f5"/>
+      <polygon points="400,252 500,300 400,348 300,300" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="400" y="292" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">三道防迴圈閘門</text>
+      <text x="400" y="308" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BOT: · own echo</text>
+      <text x="400" y="320" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">· packet id</text>
+
+      <!-- 4. Decision — broadcast or direct message -->
+      <polygon points="400,380 500,428 400,476 300,428" fill="#f5f5f5"/>
+      <polygon points="400,380 500,428 400,476 300,428" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="400" y="432" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">廣播還是私訊?</text>
+
+      <!-- 5. Step — sections for a broadcast. ([*]) is parenthesised because
+           [!exclude] takes it away; the callout says so. -->
+      <rect x="120" y="512" width="224" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="120" y="512" width="224" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="232" y="538" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">廣播:查頻道區段</text>
+      <text x="232" y="558" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" text-anchor="middle">[NAME] [#N] <tspan fill="#eb6c36" font-weight="600">([*])</tspan></text>
+
+      <!-- 6. Step — sections for a direct message -->
+      <rect x="456" y="512" width="224" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="456" y="512" width="224" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="568" y="538" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">私訊:[DM] 優先</text>
+      <text x="568" y="558" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" text-anchor="middle">[DM] [NAME] [#N] [*]</text>
+
+      <!-- Merge dot where the two branches rejoin -->
+      <circle cx="400" cy="600" r="4" fill="#2d3142"/>
+
+      <!-- 7. Decision — exact match -->
+      <polygon points="400,628 500,676 400,724 300,676" fill="#f5f5f5"/>
+      <polygon points="400,628 500,676 400,724 300,676" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="400" y="672" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">完全相符?</text>
+      <text x="400" y="688" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">case-sensitive</text>
+
+      <!-- 8. End oval — the outcome. The one focal element. -->
+      <rect x="296" y="748" width="208" height="56" rx="28" fill="#f5f5f5"/>
+      <rect x="296" y="748" width="208" height="56" rx="28" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="400" y="774" fill="#2d3142" font-size="13" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">送出兩行回覆</text>
+      <text x="400" y="790" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">BOT: … + [detail]</text>
+
+      <!-- 9. End oval — the shared negative outcome for all three gates -->
+      <rect x="780" y="400" width="160" height="56" rx="28" fill="#f5f5f5"/>
+      <rect x="780" y="400" width="160" height="56" rx="28" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <text x="860" y="434" fill="#2d3142" font-size="13" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">不回覆</text>
+
+      <!-- ============ EDITORIAL CALLOUT ============ -->
+      <!-- Sits in the empty bottom-left margin so the leader stays short and
+           crosses nothing. It names the section, because "([*])" alone does not
+           say who takes it away. -->
+      <text x="40" y="680" fill="#eb6c36" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif TC', serif">[!exclude] 只拿掉 [*]</text>
+      <path d="M 184 672 Q 120 624 138 580" fill="none" stroke="rgba(235,108,54,0.50)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="138" cy="576" r="2" fill="#eb6c36"/>
+    </svg>
+  </div>
+</body>
+</html>

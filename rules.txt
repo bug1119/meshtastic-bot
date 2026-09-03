@@ -33,29 +33,26 @@
 # is how the old flat format keeps working - but that will auto-reply on public
 # channels too, so prefer an explicit header.
 
-# Private messages. Searched before the channel a DM arrived on, so these
-# override it; anything not listed here falls back to that channel's rules.
 # Busy or public channels, where a blanket [*] rule would answer everybody.
 # Delete a line to let [*] apply there again.
 [!exclude]
+# 主頻道:這台的 #0 沒有名字,所以只能用索引指到它。LongFast / MediumFast 是
+# 「調變預設」的名字而不是頻道名稱,對不上任何頻道 —— 少了這行,底下 [*] 的
+# A-Z 會在公共主頻道上回每一則單字訊息。
+#0
 SignalTest
 Emergency!
+# 這三個在這台對不上任何頻道(留著,換到有這些頻道的節點就會生效)。
+# 連線時的覆蓋報告會把它們列出來提醒。
 LongFast
 MediumFast
 MeshTW
 
-[DM]
-ping=pong (DM)
-
-[EDGE_ATS]
+[*]
+mdfk=ㄇㄉㄈㄎ
+Hi=Hello
 ping=pong
-test=Bot: Hello!
-@A=Alpha
-@B=Bravo
-
-[CLSE]
-ping=pong
-test=Bot: Hello!
+test=TeSt
 help=指令: ping
 A=Alpha
 B=Bravo
