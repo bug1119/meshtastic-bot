@@ -538,7 +538,16 @@ def test_default_rules_template():
     print("DEFAULT_RULES template")
     with_rules(bot.DEFAULT_RULES)
     shipped = bot.load_rules()
-    check("a [DM] section and a channel one", sorted(shipped), ["DM", "EDGE_ATS"])
+    check(
+        "a [DM] section, a channel one, and the exclusions",
+        sorted(shipped),
+        ["!exclude", "DM", "EDGE_ATS"],
+    )
+    check(
+        "the public channels are excluded out of the box",
+        sorted(shipped["!exclude"]),
+        ["Emergency!", "LongFast", "MediumFast", "MeshTW", "SignalTest"],
+    )
     edge = ["EDGE_ATS", "#3", bot.ALL_CHANNELS]
     check("ping", bot.find_reply("ping", edge), "pong")
     # Regression: the reply is taken literally, so a quoted value would leak
@@ -1834,6 +1843,192 @@ def test_device_rows():
         check(f"{transport} has a mark", transport in marks, True)
 
 
+def _channel_app(channels):
+    """A stand-in self for the section-resolution helpers."""
+    app = types.SimpleNamespace()
+    app._channel_name = lambda i: channels.get(i) or None
+    app._channel_sections = lambda i: bot.MeshtasticTUI._channel_sections(app, i)
+    app._reply_sections = lambda t, c: bot.MeshtasticTUI._reply_sections(app, t, c)
+    return app
+
+
+def test_exclude_parsing():
+    print("[!exclude] is a list of channels, not keyword=reply pairs")
+    with_rules(
+        "[!exclude]\n"
+        "SignalTest\n"
+        "Emergency!\n"
+        "#0\n"
+        "# 這行是註解,不是頻道\n"
+        "\n"
+        "[EDGE_ATS]\n"
+        "ping=pong\n"
+    )
+    check(
+        "bare lines become the channel list",
+        sorted(bot.excluded_channels()),
+        ["#0", "Emergency!", "SignalTest"],
+    )
+    # A comment inside the section must stay a comment. Only a bare "#<digits>"
+    # is an index - otherwise "# 這行是註解" would be read as a channel.
+    check(
+        "a real comment is not a channel",
+        any("註解" in c for c in bot.excluded_channels()),
+        False,
+    )
+    check("the other sections are untouched", bot.load_rules()["EDGE_ATS"], {"ping": "pong"})
+    # It must never be reachable as a rules section, or a message reading
+    # "SignalTest" would be answered with an empty string.
+    check("it holds no answerable rules", bot.find_reply("SignalTest", ["!exclude"]), None)
+
+    print("indexes are normalised, so #00 and #0 are one channel")
+    with_rules("[!exclude]\n#00\n")
+    check("padded index", sorted(bot.excluded_channels()), ["#0"])
+
+    print("no section, no exclusions")
+    with_rules("[EDGE_ATS]\nping=pong\n")
+    check("nothing excluded", bot.excluded_channels(), set())
+    check("is_excluded says no", bot.is_excluded("EDGE_ATS", 3), False)
+
+
+def test_is_excluded():
+    print("a channel matches by name or by index")
+    with_rules("[!exclude]\nSignalTest\n#0\n")
+    check("by name", bot.is_excluded("SignalTest", 1), True)
+    check("by index", bot.is_excluded(None, 0), True)
+    # Either form is enough: #1 is SignalTest, named in the list.
+    check("named channel found by its name alone", bot.is_excluded("SignalTest", 99), True)
+    check("an unlisted channel", bot.is_excluded("EDGE_ATS", 3), False)
+    check("an unlisted index", bot.is_excluded(None, 4), False)
+    # Exact matching, like every other section name in this file.
+    check("case matters", bot.is_excluded("signaltest", 1), False)
+    check("no name and no index", bot.is_excluded(None, None), False)
+
+
+def test_exclude_drops_star():
+    print("[*] does not apply to an excluded channel")
+    with_rules("[!exclude]\nSignalTest\n#0\n\n[*]\nping=pong\n")
+    channels = {0: "", 1: "SignalTest", 3: "EDGE_ATS"}
+    app = _channel_app(channels)
+
+    check("an excluded named channel", app._channel_sections(1), ["SignalTest", "#1"])
+    # The primary is normally unnamed, so its index is the only way to name it -
+    # and the primary is usually the public channel most worth excluding.
+    check("an excluded unnamed primary", app._channel_sections(0), ["#0"])
+    check("an ordinary channel keeps [*]", app._channel_sections(3), ["EDGE_ATS", "#3", "*"])
+
+    print("so a [*] rule fires only where it is allowed to")
+    check("not on the excluded channel", bot.find_reply("ping", app._channel_sections(1)), None)
+    check("not on the excluded primary", bot.find_reply("ping", app._channel_sections(0)), None)
+    check("but yes elsewhere", bot.find_reply("ping", app._channel_sections(3)), "pong")
+
+    print("an explicit rule for an excluded channel still works")
+    # Excluding a channel silences the blanket default there, not the channel.
+    with_rules("[!exclude]\nSignalTest\n\n[SignalTest]\nstatus=ok\n\n[*]\nping=pong\n")
+    sections = app._channel_sections(1)
+    check("its own rule answers", bot.find_reply("status", sections), "ok")
+    check("the blanket rule still does not", bot.find_reply("ping", sections), None)
+
+
+def test_exclude_leaves_dms_alone():
+    print("[!exclude] is about broadcast traffic, so DMs are unaffected")
+    with_rules("[!exclude]\nSignalTest\n#0\n\n[DM]\nhi=private hello\n\n[*]\nping=pong\n")
+    channels = {0: "", 1: "SignalTest", 3: "EDGE_ATS"}
+    app = _channel_app(channels)
+
+    # A DM is addressed to us personally; that it happened to travel on an
+    # excluded channel says nothing about whether we should answer it.
+    check(
+        "a DM on an excluded channel keeps [*]",
+        app._reply_sections(("node", "!them"), 1),
+        ["DM", "SignalTest", "#1", "*"],
+    )
+    check(
+        "and on the excluded primary",
+        app._reply_sections(("node", "!them"), 0),
+        ["DM", "#0", "*"],
+    )
+    check(
+        "an ordinary channel is unchanged",
+        app._reply_sections(("node", "!them"), 3),
+        ["DM", "EDGE_ATS", "#3", "*"],
+    )
+    check(
+        "a DM with no known channel",
+        app._reply_sections(("node", "!them"), None),
+        ["DM", "*"],
+    )
+    # And the broadcast side of the same channel is still silenced.
+    check(
+        "the channel itself stays excluded",
+        app._reply_sections(("channel", 1), 1),
+        ["SignalTest", "#1"],
+    )
+
+    print("end to end")
+    check("[*] answers a DM on an excluded channel",
+          bot.find_reply("ping", app._reply_sections(("node", "!them"), 1)), "pong")
+    check("but not a broadcast on it",
+          bot.find_reply("ping", app._reply_sections(("channel", 1), 1)), None)
+    check("[DM] still wins where it matches",
+          bot.find_reply("hi", app._reply_sections(("node", "!them"), 1)), "private hello")
+
+
+def test_exclude_coverage_report():
+    print("what the coverage report says about exclusions")
+    known = {bot.ALL_CHANNELS, "#0", "#1", "SignalTest", "#3", "EDGE_ATS"}
+
+    logged = coverage_report(
+        "[!exclude]\nSignalTest\n\n[*]\nping=pong\n\n[EDGE_ATS]\n@A=Alpha\n", known
+    )
+    blob = "\n".join(logged)
+    check("names the excluded channels", "[*] 不適用於這些頻道: SignalTest" in blob, True)
+    # The [*] warning changes tone: with exclusions in place it is a statement
+    # of fact, not a caution about answering the whole mesh.
+    check("[*] is reported as narrowed", "但已排除 1 個: SignalTest" in blob, True)
+    check("no scolding about public channels", "包含公共頻道" in blob, False)
+    check("[!exclude] is not reported as a dead section", "對不上這台的任何頻道,該區規則" in blob, False)
+
+    print("an exclusion matching no channel is called out")
+    # This is the failure that looks exactly like success: the entry is there,
+    # it reads fine, and it excludes nothing at all.
+    logged = coverage_report("[!exclude]\nLongFast\nSignalTest\n\n[*]\nping=pong\n", known)
+    blob = "\n".join(logged)
+    check("warns about the one that matches nothing", "LongFast" in blob and "沒有排除到任何東西" in blob, True)
+    check("and does not warn about the one that matches", "SignalTest,？" in blob, False)
+
+    print("without [!exclude], the old warning stands")
+    logged = coverage_report("[*]\nping=pong\n", known)
+    check("still cautions about public channels", "包含公共頻道" in "\n".join(logged), True)
+
+
+def test_exclude_shipped_defaults():
+    print("the section ships in rules.txt and in the built-in template")
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(bot.__file__).parent
+    wanted = ["SignalTest", "Emergency!", "LongFast", "MediumFast", "MeshTW"]
+
+    # DEFAULT_RULES, not the rules.txt next to this file: that one is live
+    # operator config, and this feature's whole point is that lines get deleted
+    # from it. Asserting on it would fail the suite for doing the intended thing.
+    check("the template has the section", "[!exclude]" in bot.DEFAULT_RULES, True)
+    for channel in wanted:
+        check(f"the template excludes {channel}", f"\n{channel}\n" in bot.DEFAULT_RULES, True)
+    # And that the template it writes actually parses back to those channels,
+    # rather than merely containing the words.
+    with_rules(bot.DEFAULT_RULES)
+    check("and they parse back", sorted(bot.excluded_channels()), sorted(wanted))
+    check("and documents it", "channels [*] must NOT fire on" in bot.DEFAULT_RULES, True)
+
+    # All three programs read the same rules.txt, so one of them answering on a
+    # channel the others stay quiet on would be the worst of both.
+    for name in ("bot.py", "bot_dual.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        check(f"{name} knows the section", 'EXCLUDE_SECTION = "!exclude"' in text, True)
+        check(f"{name} applies it", "if not is_excluded(name, index):" in text, True)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -1885,6 +2080,12 @@ if __name__ == "__main__":
         test_server_packet_count()
         test_packet_count_in_all_three_files()
         test_device_rows()
+        test_exclude_parsing()
+        test_is_excluded()
+        test_exclude_drops_star()
+        test_exclude_leaves_dms_alone()
+        test_exclude_coverage_report()
+        test_exclude_shipped_defaults()
     finally:
         bot.RULES_FILE = original
 
