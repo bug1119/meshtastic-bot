@@ -156,7 +156,14 @@ DEFAULT_RULES = """\
 #   [channel]           the channel the rules below it apply to, given either
 #                       as its Meshtastic name ([EDGE_ATS]) or its index
 #                       ([#0] - useful for the unnamed primary channel).
-#                       [*] applies to every channel.
+#                       [*] applies to every channel except those listed
+#                       under [!exclude].
+#   [!exclude]          channels [*] must NOT fire on, one per line, by name or
+#                       as #index. Blanket rules are how a bot becomes a
+#                       nuisance on a busy public channel; an excluded channel
+#                       answers only from rules written for it explicitly.
+#                       Direct messages are unaffected - a DM is addressed to
+#                       you, so [*] still applies to it.
 #   [DM]                rules for direct messages. Tried before the channel the
 #                       DM arrived on, so a keyword can be answered differently
 #                       in private, or left out here and shared with the
@@ -179,6 +186,15 @@ DEFAULT_RULES = """\
 # is how the old flat format keeps working - but that will auto-reply on public
 # channels too, so prefer an explicit header.
 
+# Busy or public channels, where a blanket [*] rule would answer everybody.
+# Delete a line to let [*] apply there again.
+[!exclude]
+SignalTest
+Emergency!
+LongFast
+MediumFast
+MeshTW
+
 [DM]
 ping=pong (private)
 
@@ -195,6 +211,12 @@ ALL_CHANNELS = "*"
 # rules.txt section for direct messages. A channel actually named "DM"
 # would share it, which is accepted as the price of a readable name.
 DM_SECTION = "DM"
+
+# rules.txt section listing channels that [*] must not apply to, one per line
+# rather than as keyword=reply pairs. The "!" makes it unmistakably not a
+# channel name - Meshtastic names do not start with one, and "!" already reads
+# as "not a channel" here because node ids wear it.
+EXCLUDE_SECTION = "!exclude"
 
 # Device-list items are keyed "<transport>:<address>", mirroring the "kind:key"
 # scheme the targets list already uses, so one list can hold both transports
@@ -219,8 +241,12 @@ def load_rules() -> dict[str, dict[str, str]]:
     """Re-read rules.txt every call so edits take effect without restarting the bot.
 
     Returns {section: {keyword: reply}}. A section is a channel name, "#<index>",
-    or ALL_CHANNELS. Rules appearing before the first [header] land in
-    ALL_CHANNELS, which is what keeps a flat pre-sections file working.
+    ALL_CHANNELS, DM_SECTION, or EXCLUDE_SECTION. Rules appearing before the
+    first [header] land in ALL_CHANNELS, which is what keeps a flat pre-sections
+    file working.
+
+    EXCLUDE_SECTION holds channel names as keys with empty values, since its
+    lines are a list rather than pairs - see excluded_channels().
     """
     if not RULES_FILE.exists():
         RULES_FILE.write_text(DEFAULT_RULES, encoding="utf-8")
@@ -229,14 +255,30 @@ def load_rules() -> dict[str, dict[str, str]]:
     section = ALL_CHANNELS
     for raw_line in RULES_FILE.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
+        if line.startswith("#"):
+            # A bare "#0" under [!exclude] is a channel index, not a comment.
+            # It has to be: the primary channel is normally unnamed, so its
+            # index is the only way to name it at all - and the primary is
+            # usually the public one you most want excluded. Anything else
+            # beginning with "#" stays a comment, "# 主頻道" included.
+            if not (section == EXCLUDE_SECTION and line[1:].isdigit()):
+                continue
+            # Normalised, so "#00" and "#0" mean the same channel.
+            line = f"#{int(line[1:])}"
         # Checked before the "=" test so a header is never mistaken for a rule.
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip() or ALL_CHANNELS
             rules.setdefault(section, {})
             continue
         if "=" not in line:
+            # [!exclude] is a list of channels, not keyword=reply pairs, so it
+            # is the one section where a bare line means something. Everywhere
+            # else a line without "=" is a typo, and skipping it quietly is the
+            # long-standing behaviour.
+            if section == EXCLUDE_SECTION:
+                rules.setdefault(section, {})[line] = ""
             continue
         keyword, _, reply = line.partition("=")
         keyword = keyword.strip()
@@ -399,6 +441,30 @@ def _split_host_port(address: str) -> tuple[str, int]:
     return address, DEFAULT_TCP_PORT
 
 
+def excluded_channels() -> set[str]:
+    """Channels listed under [!exclude], as names and/or "#index" forms.
+
+    Read from the file on each call, like the rules themselves: editing
+    rules.txt takes effect without a restart, and this has to follow the same
+    rule or the exclusions would silently lag behind the rules they modify.
+    """
+    return set(load_rules().get(EXCLUDE_SECTION, {}))
+
+
+def is_excluded(name: str | None, index: int | None) -> bool:
+    """Whether channel `name`/`index` is listed under [!exclude].
+
+    Either form matches, so a channel can be excluded by the name it is
+    configured with or by its index - the same two ways a section addresses it.
+    """
+    excluded = excluded_channels()
+    if not excluded:
+        return False
+    if name and name in excluded:
+        return True
+    return index is not None and f"#{index}" in excluded
+
+
 def find_reply(text: str, sections: list[str]) -> str | None:
     """Reply for `text` if some rule's keyword matches it exactly.
 
@@ -419,6 +485,13 @@ def find_reply(text: str, sections: list[str]) -> str | None:
         return None
     rules = load_rules()
     for section in sections:
+        # EXCLUDE_SECTION holds channel names with empty replies, so a message
+        # that happens to equal one of them would be "answered" with nothing at
+        # all - the bot putting an empty line on the mesh. Nothing puts that
+        # section in `sections` today; this is what makes it harmless if
+        # something ever does.
+        if section == EXCLUDE_SECTION:
+            continue
         for keyword, reply in rules.get(section, {}).items():
             if keyword.strip() == message:
                 return reply
@@ -667,22 +740,38 @@ class ReplyEngine:
         shared with the channel. `channel` is None when it is not known - a DM
         typed here, where the target is a node and no packet was received - and
         then only [DM] and [*] apply.
+
+        [!exclude] applies to channel messages only; see below.
         """
         kind, key = target
         if kind == "channel":
             return self._channel_sections(key)
         if channel is None:
             return [DM_SECTION, ALL_CHANNELS]
-        return [DM_SECTION] + self._channel_sections(channel)
+        # [!exclude] is about broadcast traffic: it stops the bot answering
+        # everyone on a busy channel. A direct message is addressed to us
+        # personally, so [*] still applies to it even when the channel it
+        # happened to travel on is excluded.
+        sections = self._channel_sections(channel)
+        if ALL_CHANNELS not in sections:
+            sections.append(ALL_CHANNELS)
+        return [DM_SECTION] + sections
 
     def _channel_sections(self, index: int) -> list[str]:
-        """rules.txt sections that apply to channel `index`, most specific first."""
+        """rules.txt sections that apply to channel `index`, most specific first.
+
+        [*] is left out for a channel listed under [!exclude]. It is the blanket
+        default, and a blanket default on a busy public channel is how a bot
+        becomes a nuisance - so an excluded channel answers only from rules
+        written for it by name or index.
+        """
         sections = []
         name = self._channel_name(index)
         if name:
             sections.append(name)
         sections.append(f"#{index}")
-        sections.append(ALL_CHANNELS)
+        if not is_excluded(name, index):
+            sections.append(ALL_CHANNELS)
         return sections
 
     def _known_channel_sections(self) -> set[str]:
@@ -1211,11 +1300,30 @@ class MeshtasticTUI(ReplyEngine, App):
             if not section_rules:
                 continue
             count = len(section_rules)
-            if section == ALL_CHANNELS:
-                self._log_system(
-                    f"[yellow]{count} 條規則適用於「所有頻道」,包含公共頻道 - "
-                    f"建議改用 [頻道名] 或 [#index] 限定[/yellow]"
-                )
+            if section == EXCLUDE_SECTION:
+                # Reported as its own line, and checked for typos: an entry that
+                # matches no channel here excludes nothing, and looks identical
+                # to a working one until the bot answers where it should not.
+                listed = sorted(section_rules)
+                unknown = [c for c in listed if c not in known]
+                self._log_system(f"[*] 不適用於這些頻道: {', '.join(listed)}")
+                if unknown:
+                    self._log_system(
+                        f"[yellow][!exclude] 的 {', '.join(unknown)} 對不上這台的任何頻道,"
+                        f"沒有排除到任何東西[/yellow]"
+                    )
+            elif section == ALL_CHANNELS:
+                excluded = sorted(rules.get(EXCLUDE_SECTION, {}))
+                if excluded:
+                    self._log_system(
+                        f"{count} 條規則適用於「所有頻道」,但已排除 "
+                        f"{len(excluded)} 個: {', '.join(excluded)}"
+                    )
+                else:
+                    self._log_system(
+                        f"[yellow]{count} 條規則適用於「所有頻道」,包含公共頻道 - "
+                        f"建議改用 [頻道名]、[#index] 或 [!exclude] 限定[/yellow]"
+                    )
             elif section == DM_SECTION:
                 # [DM] is selected by the target being a node, not by matching
                 # a channel name, so it has to skip the "matches no channel"

@@ -3,7 +3,14 @@
 #   [channel]           the channel the rules below it apply to, given either
 #                       as its Meshtastic name ([EDGE_ATS]) or its index
 #                       ([#0] - useful for the unnamed primary channel).
-#                       [*] applies to every channel.
+#                       [*] applies to every channel except those listed
+#                       under [!exclude].
+#   [!exclude]          channels [*] must NOT fire on, one per line, by name or
+#                       as #index. Blanket rules are how a bot becomes a
+#                       nuisance on a busy public channel; an excluded channel
+#                       answers only from rules written for it explicitly.
+#                       Direct messages are unaffected - a DM is addressed to
+#                       you, so [*] still applies to it.
 #   [DM]                rules for direct messages. Tried before the channel the
 #                       DM arrived on, so a keyword can be answered differently
 #                       in private, or left out here and shared with the
@@ -28,6 +35,15 @@
 
 # Private messages. Searched before the channel a DM arrived on, so these
 # override it; anything not listed here falls back to that channel's rules.
+# Busy or public channels, where a blanket [*] rule would answer everybody.
+# Delete a line to let [*] apply there again.
+[!exclude]
+SignalTest
+Emergency!
+LongFast
+MediumFast
+MeshTW
+
 [DM]
 ping=pong (DM)
 
