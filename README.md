@@ -53,33 +53,6 @@ python3 -m venv ~/.venvs/meshtastic-bot
 啟動時會自己檢查那三個套件,缺哪個會直接告訴你,不會丟一串 traceback。
 </details>
 
-## 用法
-
-```sh
-./bot.py                                          # 掃描並連 BLE
-./bot.py --host Meshtastic.local                  # 走 WiFi (TCP 4403)
-./bot.py --port /dev/cu.usbmodem2101              # 走 USB serial
-./bot.py --host Meshtastic.local --port /dev/cu.usbmodem2101         # 三種都列出來
-./bot.py --host Meshtastic.local --here 25.0339,121.5645             # 顯示節點距離
-```
-
-| 參數 | 說明 |
-|---|---|
-| `--host HOST[:PORT]` | 用 TCP 連;port 預設 4403。指定後會**立刻連線**,不用等 BLE 掃描,BLE 掃描仍會繼續 |
-| `--port PATH` | 用 USB serial 連 |
-| `--here LAT,LON` | 本機座標,用來算各節點距離。只在連上的節點沒有 GPS 定位時才需要 |
-| `--wifi on\|off` | 開關節點的 WiFi,做完直接結束(不啟動 UI)。需要 `--port` 或 `--host` |
-
-### 按鍵
-
-| 鍵 | 動作 |
-|---|---|
-| `←` `→` | 在三個窗格間移動(在輸入框內則是移動文字游標) |
-| `↑` `↓` | 各窗格原本的行為 —— 清單移動游標、log 捲動 |
-| `Tab` / `Shift+Tab` | 循環所有可聚焦元件,含本機狀態窗格 |
-| `R` | 重新掃描裝置 |
-| `Q` | 離開 |
-
 ## 三個檔案該用哪一個
 
 | 檔案 | 是什麼 | 什麼時候用 |
@@ -102,19 +75,82 @@ python3 -m venv ~/.venvs/meshtastic-bot
 
 `bot_server.py` 不需要 `textual`,所以要部署到只跑服務的機器時,少一個相依。
 
-## Server mode(無 UI,可背景執行)
+## 用法
+
+三支吃的參數大致相同,差別在有沒有 UI、有沒有 server:
+
+| 參數 | `bot.py` | `bot_dual.py` | `bot_server.py` | 說明 |
+|---|:---:|:---:|:---:|---|
+| `--host HOST[:PORT]` | ✅ | ✅ | ✅ | 用 TCP 連,port 預設 4403 |
+| `--port PATH` | ✅ | ✅ | ✅ | 用 USB serial 連 |
+| `--ble NAME` | — | ✅ | ✅ | 指定 BLE 節點名稱,跳過約 10 秒掃描 |
+| `--here LAT,LON` | ✅ | ✅ | ✅ | 本機座標,用來算節點距離 |
+| `--list` | — | ✅ | ✅ | 列出連得到哪些裝置,然後結束 |
+| `--server` | — | ✅ | 本來就是 | 不開 UI,跑自動回覆 server |
+| `--daemon` | — | ✅ | ✅ | 選好裝置後丟到背景 |
+| `--log PATH` | — | ✅ | ✅ | `--daemon` 的輸出檔 |
+| `--heartbeat SECS` | — | ✅ | ✅ | 多久印一行「還活著」 |
+| `--wifi on\|off` | ✅ | ✅ | — | 開關節點的 WiFi 後結束 |
+
+`bot.py` 沒有 `--ble`,是因為它本來就會掃 BLE 並列在裝置窗格裡讓你點。
+
+### bot.py — 互動 TUI
 
 ```sh
-./bot_server.py --port /dev/cu.usbmodem2101          # USB
-./bot_server.py --host 192.168.0.247                 # WiFi
-./bot_server.py --ble Bug2_1ca6                      # BLE,指定名稱
-./bot_server.py                                      # 不指定 → 列出裝置讓你選編號
-./bot_server.py --list                               # 只列出有哪些裝置,不連線
-./bot_server.py --ble Bug2_1ca6 --daemon --log ~/bot.log    # 丟到背景
-
-# bot_dual.py 是一樣的東西,多一個 --server
-./bot_dual.py --server --port /dev/cu.usbmodem2101
+./bot.py                                              # 掃描並連 BLE
+./bot.py --host Meshtastic.local                      # 走 WiFi (TCP 4403)
+./bot.py --host 192.168.0.247:4403                    # 指定 port
+./bot.py --port /dev/cu.usbmodem2101                  # 走 USB serial
+./bot.py --host Meshtastic.local --port /dev/cu.usbmodem2101   # 兩個都列出來,BLE 也繼續掃
+./bot.py --host Meshtastic.local --here 25.0339,121.5645       # 顯示節點距離
+./bot.py --port /dev/cu.usbmodem2101 --wifi on        # 只開節點的 WiFi,不啟動 UI
 ```
+
+| 參數 | 說明 |
+|---|---|
+| `--host HOST[:PORT]` | 用 TCP 連;port 預設 4403。指定後會**立刻連線**,不用等 BLE 掃描,BLE 掃描仍會繼續 |
+| `--port PATH` | 用 USB serial 連 |
+| `--here LAT,LON` | 本機座標,用來算各節點距離。只在連上的節點沒有 GPS 定位時才需要。**只留在本機**,不會送給裝置或 mesh |
+| `--wifi on\|off` | 開關節點的 WiFi,做完直接結束(不啟動 UI)。需要 `--port` 或 `--host` |
+
+### bot_dual.py — 同一支,可選要不要 UI
+
+不加 `--server` 就跟 `bot.py` 一樣是 TUI;加了就是無 UI 的 server。
+
+```sh
+./bot_dual.py                                         # 開 TUI(等同 bot.py)
+./bot_dual.py --ble Bug2_1ca6                         # 開 TUI,直接連指定的 BLE 節點
+./bot_dual.py --server --port /dev/cu.usbmodem2101    # 無 UI,USB
+./bot_dual.py --server --host 192.168.0.247           # 無 UI,WiFi
+./bot_dual.py --server --ble Bug2_1ca6 --daemon --log ~/bot.log   # 無 UI,背景
+./bot_dual.py --list                                  # 只列出裝置
+```
+
+多出來的參數除了 `--server` 之外,都跟 `bot_server.py` 相同(見下)。
+`--daemon` 必須跟 `--server` 一起用,單獨給會被擋掉。
+
+### bot_server.py — 只有 server,沒有 UI
+
+```sh
+./bot_server.py --port /dev/cu.usbmodem2101           # USB
+./bot_server.py --host 192.168.0.247                  # WiFi
+./bot_server.py --ble Bug2_1ca6                       # BLE,指定名稱
+./bot_server.py                                       # 不指定 → 列出裝置讓你選編號
+./bot_server.py --list                                # 只列出裝置,不連線
+./bot_server.py --ble Bug2_1ca6 --daemon --log ~/bot.log         # 丟到背景
+./bot_server.py --port /dev/cu.usbmodem2101 --heartbeat 0        # 關掉心跳
+./bot_server.py --host 192.168.0.247 --here 25.0339,121.5645     # 回覆帶 dist=
+```
+
+| 參數 | 說明 |
+|---|---|
+| `--list` | 列出現在連得到哪些節點(BLE 名稱 + USB serial 埠),然後結束,不連任何一台 |
+| `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒的掃描。`--daemon` 要能無人啟動就靠這個 |
+| `--daemon` | 選好裝置後丟到背景,輸出寫到 `--log`,並印出 pid |
+| `--log PATH` | `--daemon` 的輸出檔,**附加**不覆蓋。預設 `meshtastic-bot.log` |
+| `--heartbeat SECS` | 多久印一行「還活著」與計數。`0` 關閉,只印真正發生的事。預設 600 |
+
+一個裝置都不指定時,它會掃一遍、列出編號讓你選,選完就開始服務。
 
 跑起來長這樣(實機輸出):
 
@@ -126,19 +162,12 @@ python3 -m venv ~/.venvs/meshtastic-bot
 2026-09-03 20:23:57 規則: [DM]=1, [EDGE_ATS]=4, [CLSE]=29
 2026-09-03 20:24:03 channel:1 20:24:01 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping
 2026-09-03 20:24:03   -> auto-reply: BOT: pong [20:24:01 from=Bug2 rx=LoRa snr=6.5 rssi=-92]
-2026-09-03 20:24:17 [心跳] 已連線 執行 0:00:45 收訊 22 自動回覆 1 重連 0
+2026-09-03 20:24:17 [心跳] 已連線 執行 0:00:45 封包 249 收訊 22 自動回覆 1 重連 0
 ```
 
-每個事件一行、附完整日期(log 是隔幾天才看的,只有時鐘看不出哪一天),而且每行都 flush,
-所以 `tail -f` 看得到即時內容。
-
-| 參數 | 說明 |
-|---|---|
-| `--list` | 列出現在連得到哪些節點(BLE 名稱 + USB serial 埠),然後結束,不連任何一台 |
-| `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒的掃描。`--daemon` 要能無人啟動就靠這個 |
-| `--daemon` | 選好裝置後丟到背景,輸出寫到 `--log`,並印出 pid |
-| `--log PATH` | `--daemon` 的輸出檔,**附加**不覆蓋。預設 `meshtastic-bot.log` |
-| `--heartbeat SECS` | 多久印一行「還活著」與計數。`0` 關閉,只印真正發生的事。預設 600 |
+一個事件一行、附完整日期(log 是隔幾天才看的,只有時鐘看不出哪一天),而且每行都 flush,
+所以 `tail -f` 看得到即時內容。心跳那行的 `封包` 跟狀態列的同一個意思 ——
+包含 position / nodeinfo / telemetry,見[最底下那一列固定狀態列](#最底下那一列固定狀態列)。
 
 ### 先看有哪些裝置
 
@@ -208,22 +237,37 @@ $ kill 98523
 這種情況**不要**加 `--daemon`:launchd 要自己盯著行程,所以讓它跑在前景、
 由 `StandardOutPath` 收 log 就好。
 
+### 按鍵
+
+| 鍵 | 動作 |
+|---|---|
+| `←` `→` | 在三個窗格間移動(在輸入框內則是移動文字游標) |
+| `↑` `↓` | 各窗格原本的行為 —— 清單移動游標、log 捲動 |
+| `Tab` / `Shift+Tab` | 循環所有可聚焦元件,含本機狀態窗格 |
+| `R` | 重新掃描裝置 |
+| `Q` | 離開 |
+
 ## 最底下那一列固定狀態列
 
 畫面最下方永遠有一列,每秒更新:
 
 ```
-執行 3:24:07   收 128   發 41 (自動 39)   重連 2 次
+執行 3:24:07   封包 4821   收 128   發 41 (自動 39)   重連 2 次
 ```
 
 | 欄位 | 意思 |
 |---|---|
 | `執行` | 這個程式跑了多久(`H:MM:SS`)。用 `time.monotonic()`,所以系統時鐘被校正也不會跳 |
+| `封包` | 節點交上來的**所有**封包,不分種類(position / nodeinfo / telemetry / 解不開的加密封包都算)。文字訊息很稀少,這些卻一直在流,所以這是「連線還活著嗎」最靈敏的那個數字 |
 | `收` | 收到的文字訊息數,**不含自己這台的回音** —— 否則送一則會同時算成收 1 發 1 |
 | `發` | 送出的**總數**,括號裡是其中自動回覆的數量。`發 41 (自動 39)` 是「41 則裡有 39 則是 bot 回的」,不是 41+39 |
 | `重連` | 斷線時顯示**這次**是第幾次嘗試(紅字);接回來之後改顯示**整個 session 的累計次數**(暗色),所以離開一陣子回來也看得出連線有沒有一直在抖。從沒斷過就不顯示這欄 |
 
 小時不會折成天:跑好幾天時 `51:03:12` 一眼就能跟 log 的時間戳對照,`2d 3:03:12` 還要心算一下。
+
+**`封包` 開場會先跳一大筆,那不是空中流量。** 實測連上節點的**同一秒**就湧入 249 個封包(130 個 `POSITION_APP` + 119 個 `TELEMETRY_APP`),之後 89 秒一個都沒有。那是設定同步時節點把自己 node DB 裡存的資料透過 API 倒過來 —— LoRa 在 MEDIUM_FAST/250kHz 下一秒鐘塞不進 130 個封包,光空中時間就不可能。所以開場那筆的量級大致等於「node DB 裡有位置/遙測的節點數」,**要看真實流量請看它從那個數字往上爬多少**,不是看絕對值。
+
+這裡刻意不把開場那筆濾掉:寧可數字誠實、規則簡單(就是「節點交上來的每一個封包」),也不要偷偷從某個時間點才開始算而讓人對不上帳。
 
 注意「執行」與本機狀態窗格的 `Uptime:` 是**兩件事** —— 後者是**節點自己**開機多久(節點回報的,分鐘精度,沒資料時顯示 `--`)。程式裡也是兩個函式(`format_elapsed` 與 `format_uptime`),當初把它們取同名會讓後定義的那個靜靜蓋掉前面那個,有測試鎖住這件事。
 
@@ -371,7 +415,7 @@ BOT: pong
 ./test_rules.py
 ```
 
-350 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。
+382 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。
 
 其中未讀粗體有一項是**唯一會真的把 App 跑起來**的測試(Textual 的 headless 模式,仍然不需要硬體)—— 因為「找到那一列並重畫」這件事只有真的 widget 在時才存在,假造的 self 測不到。
 

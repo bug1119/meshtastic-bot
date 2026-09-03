@@ -307,6 +307,7 @@ def bar_app(**over):
 
     state = dict(
         started_at=_time.monotonic(),
+        packet_count=0,
         received_count=0,
         sent_typed_count=0,
         sent_auto_count=0,
@@ -344,11 +345,14 @@ def test_status_bar():
     # Uptime itself is checked above; here the figures matter, so match on the
     # parts that do not move.
     text = bar_text()
+    check("starts at zero packets", "封包[/bold] 0" in text, True)
     check("starts at zero received", "收[/bold] 0" in text, True)
     check("starts at zero sent", "發[/bold] 0 ([dim]自動 0[/dim])" in text, True)
     check("no reconnect segment before any outage", "重連" in text, False)
 
-    text = bar_text(received_count=42, sent_typed_count=2, sent_auto_count=5)
+    text = bar_text(packet_count=1284, received_count=42, sent_typed_count=2, sent_auto_count=5)
+    # Packets dwarf messages - most traffic is position/nodeinfo/telemetry.
+    check("packet count shown", "封包[/bold] 1284" in text, True)
     check("received count shown", "收[/bold] 42" in text, True)
     # 7 is the total, of which 5 were the bot - not 5 on top of 7.
     check("sent is the total, auto in brackets", "發[/bold] 7 ([dim]自動 5[/dim])" in text, True)
@@ -364,6 +368,64 @@ def test_status_bar():
     check("no longer says 重連中", "重連中" in text, False)
 
 
+def test_packet_count():
+    print("every packet counts, not just the text ones")
+
+    def receiving_app():
+        """A stand-in self for on_receive, enough for the counting paths."""
+        app = types.SimpleNamespace(
+            packet_count=0, received_count=0, last_signal=None,
+            my_id="!me", history={}, target=None,
+        )
+        app._track_signal = lambda pkt: bot.MeshtasticTUI._track_signal(app, pkt)
+        app._mark_unread = lambda target: None
+        app._log_system = lambda line: None
+        # on_receive hands its UI work off; running it is not what is under test.
+        app.call_from_thread = lambda fn, *a: None
+        app._should_auto_reply = lambda info: False
+        return app
+
+    # A position packet carries no text, so parse_incoming returns None and
+    # on_receive stops early - but the packet still arrived.
+    app = receiving_app()
+    bot.MeshtasticTUI.on_receive(
+        app, {"decoded": {"portnum": "POSITION_APP"}, "fromId": "!them"}, None
+    )
+    check("a position packet is counted", app.packet_count, 1)
+    check("but is not a received message", app.received_count, 0)
+
+    # Nothing decoded at all - encrypted for a channel this node has no key
+    # for. Still traffic, still proof the radio is hearing something.
+    bot.MeshtasticTUI.on_receive(app, {"fromId": "!them"}, None)
+    check("an undecoded packet is counted", app.packet_count, 2)
+
+    # A text message is both.
+    app = receiving_app()
+    bot.MeshtasticTUI.on_receive(
+        app,
+        {
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"},
+            "fromId": "!them", "toId": bot.BROADCAST_ADDR, "id": 1,
+        },
+        types.SimpleNamespace(nodes={}),
+    )
+    check("a text packet counts as a packet", app.packet_count, 1)
+    check("...and as a received message", app.received_count, 1)
+
+    # Our own echo is a packet, but not something we received from the mesh.
+    app = receiving_app()
+    bot.MeshtasticTUI.on_receive(
+        app,
+        {
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"},
+            "fromId": "!me", "toId": bot.BROADCAST_ADDR, "id": 2,
+        },
+        types.SimpleNamespace(nodes={}),
+    )
+    check("our own echo is a packet", app.packet_count, 1)
+    check("...but not a received message", app.received_count, 0)
+
+
 async def _status_bar_widget():
     from textual.widgets import Label
 
@@ -374,12 +436,14 @@ async def _status_bar_widget():
         check("the bar is one line tall", bar.size.height, 1)
         check("it starts filled in", "執行" in bar.render().plain, True)
 
+        app.packet_count = 1284
         app.received_count = 12
         app.sent_typed_count = 1
         app.sent_auto_count = 2
         app._render_status_bar()
         await pilot.pause()
         plain = bar.render().plain
+        check("the packet count reaches the widget", "封包 1284" in plain, True)
         check("counts reach the widget", "收 12" in plain, True)
         check("sent total reaches the widget", "發 3 (自動 2)" in plain, True)
 
@@ -1622,12 +1686,80 @@ def test_list_devices():
     )
 
 
+def test_server_packet_count():
+    print("the server counts every packet too, and says so in the heartbeat")
+    out = io.StringIO()
+    server, sent = _fake_server("[EDGE_ATS]\nping=pong\n", out)
+
+    # A position packet: not a message, but very much traffic. This is the whole
+    # point of the count - text is rare, this is not.
+    position = {
+        "decoded": {"portnum": "POSITION_APP", "position": {"latitudeI": 250000000}},
+        "from": 0xF2DCBABE,
+        "fromId": "!them",
+        "toId": bot.BROADCAST_ADDR,
+        "channel": 1,
+        "id": 601,
+    }
+    server.on_receive(position, server.interface)
+    check("a position packet is counted", server.packet_count, 1)
+    check("but is not a received message", server.received_count, 0)
+    check("and nothing was replied to", sent, [])
+
+    # An undecodable packet - a channel this node has no key for - still arrived.
+    server.on_receive({"from": 0x1EF840CA, "toId": bot.BROADCAST_ADDR, "id": 602}, server.interface)
+    check("an undecoded packet is counted", server.packet_count, 2)
+
+    server.on_receive(_text_packet("ping", bot.BROADCAST_ADDR, 603), server.interface)
+    check("a text packet counts as a packet", server.packet_count, 3)
+    check("...and as a received message", server.received_count, 1)
+    check("...and got its reply", len(sent), 1)
+
+    # Our own echo is traffic on the link, but not something we received.
+    server.on_receive(
+        _text_packet("hello", bot.BROADCAST_ADDR, 604, from_id="!me"), server.interface
+    )
+    check("our own echo is a packet", server.packet_count, 4)
+    check("...but not a received message", server.received_count, 1)
+
+    line = server._heartbeat_line()
+    check("the heartbeat carries the packet count", "封包 4" in line, True)
+    check("and still the message counts", "收訊 1" in line, True)
+    # Order matters only in that packets come first, being the coarse figure.
+    check("packets before 收訊", line.index("封包") < line.index("收訊"), True)
+
+
+def test_packet_count_in_all_three_files():
+    print("all three entry points count packets, not just the one that added it")
+    # bot.py is frozen by policy and no longer imported here, so the only thing
+    # holding it in step is a check on its source. Without this, updating the
+    # status bar in one file and not the other is invisible until someone
+    # notices a missing column.
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(bot.__file__).parent
+    for name, expect_bar in (
+        ("bot.py", True),
+        ("bot_dual.py", True),
+        ("bot_server.py", False),  # no status bar; it has the heartbeat instead
+    ):
+        text = (root / name).read_text(encoding="utf-8")
+        check(f"{name} has the counter", "self.packet_count = 0" in text, True)
+        check(f"{name} increments it", "self.packet_count += 1" in text, True)
+        if expect_bar:
+            check(f"{name} shows it in the status bar", "[bold]封包[/bold]" in text, True)
+    for name in ("bot_dual.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        check(f"{name} shows it in the heartbeat", "f\" 封包 {self.packet_count}\"" in text, True)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
         test_default_rules_template()
         test_status_bar()
         test_status_bar_widget()
+        test_packet_count()
         test_connection_lost()
         test_unread_bold()
         test_unread_bold_widgets()
@@ -1669,6 +1801,8 @@ if __name__ == "__main__":
         test_shutdown_is_bounded()
         test_stop_wakes_the_wait()
         test_list_devices()
+        test_server_packet_count()
+        test_packet_count_in_all_three_files()
     finally:
         bot.RULES_FILE = original
 

@@ -714,6 +714,11 @@ class ServerBot(ReplyEngine):
         self.sent_auto_count = 0
         self.received_count = 0
         self.started_at = time.monotonic()
+        # As in the TUI's status bar: text messages are rare, everything else is
+        # not, so this is the number that shows the link is still carrying
+        # something. In a heartbeat line it is the difference between "quiet
+        # mesh" and "we stopped hearing anything".
+        self.packet_count = 0
         self.connected_key: str | None = None
         self.link_down = False
         self._closing = False
@@ -819,6 +824,8 @@ class ServerBot(ReplyEngine):
             )
 
     def on_receive(self, packet, interface) -> None:
+        # Before the text filter, for the reason the TUI does the same.
+        self.packet_count += 1
         info = parse_incoming(packet, self.my_id)
         if info is None:
             return
@@ -849,6 +856,7 @@ class ServerBot(ReplyEngine):
         state = "連線中斷" if self.link_down else "已連線"
         return (
             f"[心跳] {state} 執行 {format_elapsed(time.monotonic() - self.started_at)}"
+            f" 封包 {self.packet_count}"
             f" 收訊 {self.received_count}"
             f" 自動回覆 {self.sent_auto_count}"
             f" 重連 {self.reconnect_total}"

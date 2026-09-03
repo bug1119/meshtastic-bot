@@ -157,8 +157,9 @@ drop_arg("--server")
 drop_arg("--wifi")
 
 sub(
-    '''        description="Meshtastic monitor TUI. Connects over BLE by default; "
-        "pass --host to talk to a node over WiFi/TCP instead.",''',
+    '''        description="Meshtastic monitor TUI, or a headless auto-reply server "
+        "with --server. Connects over BLE by default; pass --host to talk to a "
+        "node over WiFi/TCP instead.",''',
     '''        description="Headless Meshtastic auto-reply server: answers messages "
         "from rules.txt with no UI, one log line per event. Give it one of "
         "--port / --host / --ble to start straight away, or none to pick from "
