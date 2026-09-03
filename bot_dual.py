@@ -1021,28 +1021,39 @@ class MeshtasticTUI(ReplyEngine, App):
             return
         self.call_from_thread(self._populate_devices, devices)
 
-    def _rebuild_device_list(self, ble_devices: list) -> None:
-        """Redraw the device pane from both sources: the --host TCP node, then
-        whatever the BLE scan found.
+    # Row mark per transport. Every transport that can reach explicit_targets
+    # needs an entry: a missing one is a KeyError raised while drawing the first
+    # frame, which is how --ble arrived - added as a target without being given
+    # a mark here.
+    DEVICE_MARKS = {TRANSPORT_TCP: "◆", TRANSPORT_SERIAL: "▣", TRANSPORT_BLE: "●"}
 
-        Always rebuilt from scratch rather than appended to, so the TCP row
-        survives a rescan and a repeated scan cannot duplicate a BLE row.
+    def _rebuild_device_list(self, ble_devices: list) -> None:
+        """Redraw the device pane from both sources: the targets named on the
+        command line, then whatever the BLE scan found.
+
+        Always rebuilt from scratch rather than appended to, so the named rows
+        survive a rescan and a repeated scan cannot duplicate a BLE row.
         """
         listview = self.query_one("#device-list", ListView)
         listview.clear()
-        marks = {TRANSPORT_TCP: "◆", TRANSPORT_SERIAL: "▣"}
         for transport, address in self.explicit_targets:
             shown = address.rsplit("/", 1)[-1] if transport == TRANSPORT_SERIAL else address
+            mark = self.DEVICE_MARKS.get(transport, "•")
             listview.append(
                 ListItem(
-                    Label(f"{marks[transport]} {shown}  [dim]{transport.upper()}[/dim]"),
+                    Label(f"{mark} {shown}  [dim]{transport.upper()}[/dim]"),
                     name=f"{transport}:{address}",
                 )
             )
+        # A --ble target is already a row above, and the scan behind it finds the
+        # same node again - list it once, not twice.
+        named = {address for transport, address in self.explicit_targets if transport == TRANSPORT_BLE}
         for d in ble_devices:
+            if d.name in named:
+                continue
             listview.append(
                 ListItem(
-                    Label(f"● {d.name}  [dim]BLE[/dim]"),
+                    Label(f"{self.DEVICE_MARKS[TRANSPORT_BLE]} {d.name}  [dim]BLE[/dim]"),
                     name=f"{TRANSPORT_BLE}:{d.name}",
                 )
             )
