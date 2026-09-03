@@ -2029,6 +2029,74 @@ def test_exclude_shipped_defaults():
         check(f"{name} applies it", "if not is_excluded(name, index):" in text, True)
 
 
+# The rules.txt shown in README.md under "自動回覆規則", verbatim minus the
+# trailing comments. Kept here so the worked table beside it in the README is
+# checked rather than asserted - a documented example that quietly stops being
+# true is worse than no example.
+README_EXAMPLE = """\
+[!exclude]
+#0
+SignalTest
+
+[DM]
+ping=pong (私訊)
+
+[EDGE_ATS]
+ping=pong
+help=指令: ping
+
+[#0]
+status=ok
+
+[*]
+hello=hi
+"""
+
+
+def test_readme_worked_example():
+    print("the README's worked example answers what the README says it does")
+    with_rules(README_EXAMPLE)
+    app = _channel_app({0: "", 1: "SignalTest", 3: "EDGE_ATS"})
+
+    def answer(kind, index, text):
+        target = ("channel", index) if kind == "channel" else ("node", "!them")
+        return bot.find_reply(text, app._reply_sections(target, index))
+
+    # Every row of the table in README.md, in the same order.
+    rows = [
+        ("#0 廣播 hello", ("channel", 0, "hello"), None),
+        ("#0 廣播 status", ("channel", 0, "status"), "ok"),
+        ("SignalTest 廣播 hello", ("channel", 1, "hello"), None),
+        ("EDGE_ATS 廣播 hello", ("channel", 3, "hello"), "hi"),
+        ("EDGE_ATS 廣播 ping", ("channel", 3, "ping"), "pong"),
+        ("EDGE_ATS 廣播 help", ("channel", 3, "help"), "指令: ping"),
+        ("走 #0 的 DM hello", ("dm", 0, "hello"), "hi"),
+        ("走 #0 的 DM ping", ("dm", 0, "ping"), "pong (私訊)"),
+        ("走 EDGE_ATS 的 DM ping", ("dm", 3, "ping"), "pong (私訊)"),
+    ]
+    for label, (kind, index, text), expected in rows:
+        check(label, answer(kind, index, text), expected)
+
+    # The row most likely to be misread, called out in the README as well:
+    # excluding a channel silences the blanket rule there, not the channel.
+    check(
+        "excluding a channel does not silence its own rules",
+        answer("channel", 0, "status") is not None and answer("channel", 0, "hello") is None,
+        True,
+    )
+
+    print("and the README really does contain that example")
+    import pathlib as _pathlib
+
+    readme = (_pathlib.Path(bot.__file__).parent / "README.md").read_text(encoding="utf-8")
+    # Compared line by line, ignoring the trailing "# ..." comments the README
+    # adds for readability - those are prose, the rules are what must match.
+    for line in README_EXAMPLE.splitlines():
+        if not line.strip():
+            continue
+        check(f"README shows {line!r}", any(l.split("#")[0].strip() == line or l.startswith(line) for l in readme.splitlines()), True)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -2086,6 +2154,7 @@ if __name__ == "__main__":
         test_exclude_leaves_dms_alone()
         test_exclude_coverage_report()
         test_exclude_shipped_defaults()
+        test_readme_worked_example()
     finally:
         bot.RULES_FILE = original
 
