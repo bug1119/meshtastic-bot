@@ -7,7 +7,7 @@
 #     "textual",
 # ]
 # ///
-"""Tests for bot.py: mostly its pure helpers - the per-channel rules.txt
+"""Tests for bot_dual.py and bot_server.py: mostly their pure helpers - the per-channel rules.txt
 parser, the device-key / host-port parsing behind BLE-vs-TCP connections - plus
 one headless run of the App itself, for the unread bold that only shows up once
 real widgets are involved.
@@ -26,14 +26,24 @@ safe: the TUI only starts under __main__.
 from __future__ import annotations
 
 import asyncio
+import builtins
+import inspect
+import io
 import pathlib
+import subprocess
 import sys
 import tempfile
+import time
+import threading
 import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-import bot  # noqa: E402
+# bot_dual.py is the module under test: bot.py is kept frozen as the original
+# monitor, and bot_server.py is generated from bot_dual by stripping the UI.
+# Imported as `bot` so every existing check reads unchanged.
+import bot_dual as bot  # noqa: E402
+import bot_server  # noqa: E402
 import lora_params  # noqa: E402
 from meshtastic.protobuf import config_pb2  # noqa: E402
 
@@ -528,6 +538,7 @@ def test_should_auto_reply():
         my_id="!me",
         _replied_ids={},
         REPLIED_ID_LIMIT=bot.MeshtasticTUI.REPLIED_ID_LIMIT,
+        MARKUP=bot.MeshtasticTUI.MARKUP,
     )
     call = bot.MeshtasticTUI._should_auto_reply
 
@@ -598,6 +609,7 @@ def test_dm_replies():
     app = types.SimpleNamespace(
         my_id="!me", here=None, history={}, _replied_ids={},
         REPLIED_ID_LIMIT=bot.MeshtasticTUI.REPLIED_ID_LIMIT,
+        MARKUP=bot.MeshtasticTUI.MARKUP,
         # Tallied for the status bar every time a reply goes out.
         sent_auto_count=0,
         interface=types.SimpleNamespace(nodes={}, sendText=lambda t, **k: sent.append((t, k))),
@@ -1017,6 +1029,535 @@ def test_annotations_are_deferred():
     print(f"       ({checked} annotations checked across bot + lora_params)")
 
 
+def _text_packet(text, to_id, pkt_id, from_num=0xF2DCBABE, from_id="!them", channel=3):
+    """One TEXT_MESSAGE_APP packet shaped the way the library delivers them."""
+    return {
+        "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": text},
+        "from": from_num,
+        "fromId": from_id,
+        "toId": to_id,
+        "channel": channel,
+        "id": pkt_id,
+        "rxSnr": 6.5,
+        "rxRssi": -92,
+    }
+
+
+def test_packet_node_id():
+    print("packet endpoint ids survive an unsynced node database")
+    call = bot.packet_node_id
+
+    check(
+        "a resolved id is used as-is",
+        call({"fromId": "!f2dcbabe", "from": 0xF2DCBABE}, "fromId", "from"),
+        "!f2dcbabe",
+    )
+    # The case this exists for: the library sets the key to None when the node
+    # number is not in its database yet, which is the normal state for the first
+    # messages after connecting. A plain .get() with a default never fires,
+    # because the key is present - it just holds None.
+    check(
+        "None falls back to the node number",
+        call({"fromId": None, "from": 0xF2DCBABE}, "fromId", "from"),
+        "!f2dcbabe",
+    )
+    check(
+        "a missing key falls back too",
+        call({"from": 0x1D7E2212}, "fromId", "from"),
+        "!1d7e2212",
+    )
+    # Eight hex digits always, so a low node number is not silently shortened
+    # into something that no longer matches the id the node reports for itself.
+    check("padded to eight hex digits", call({"from": 0xABCDEF}, "fromId", "from"), "!00abcdef")
+    check("nothing to work from", call({}, "fromId", "from"), None)
+    check("a zero node number is not an id", call({"from": 0}, "fromId", "from"), None)
+    # toId goes through the same helper, and broadcast keeps its symbolic form
+    # rather than being rewritten as "!ffffffff".
+    check(
+        "broadcast toId is left alone",
+        call({"toId": bot.BROADCAST_ADDR, "to": 0xFFFFFFFF}, "toId", "to"),
+        bot.BROADCAST_ADDR,
+    )
+
+    print("parse_incoming shows a real id, never a placeholder")
+    unresolved = _text_packet("ping", bot.BROADCAST_ADDR, 1, from_num=0x1EF840CA, from_id=None)
+    info = bot.parse_incoming(unresolved, "!me")
+    check("from_id rebuilt from the node number", info["from_id"], "!1ef840ca")
+    check("target is the channel it arrived on", info["target"], ("channel", 3))
+    # And a packet with no usable sender at all still parses rather than raising.
+    bare = {"decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"}, "toId": bot.BROADCAST_ADDR}
+    check("no sender information at all", bot.parse_incoming(bare, "!me")["from_id"], "?")
+
+
+def test_format_plain():
+    print("plain rendering, for a stream that is not a RichLog")
+    info = {
+        "from_id": "!f2dcbabe",
+        "when": "12:34:56",
+        "transport": "LoRa",
+        "snr": 6.5,
+        "rssi": -92,
+        "text": "ping",
+    }
+    check(
+        "markup, for the TUI",
+        bot.format_incoming_line(info, "Bug2"),
+        "[dim]12:34:56[/dim] [bold]Bug2[/bold][dim]\\[!f2dcbabe][/dim](LoRa snr=6.5 rssi=-92): ping",
+    )
+    check(
+        "plain, for the server",
+        bot.format_incoming_line(info, "Bug2", markup=False),
+        "12:34:56 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping",
+    )
+    # No name resolved, so the id is not printed twice.
+    check(
+        "plain, unnamed sender",
+        bot.format_incoming_line(info, "!f2dcbabe", markup=False),
+        "12:34:56 !f2dcbabe(LoRa snr=6.5 rssi=-92): ping",
+    )
+
+
+def _fake_server(rules, out):
+    """A ServerBot wired to a stub interface, with `sent` collecting sendText."""
+    with_rules(rules)
+    sent = []
+    server = bot.ServerBot(out=out)
+    server.my_id = "!me"
+    channels = [
+        types.SimpleNamespace(index=0, settings=types.SimpleNamespace(name="")),
+        types.SimpleNamespace(index=3, settings=types.SimpleNamespace(name="EDGE_ATS")),
+    ]
+    server.interface = types.SimpleNamespace(
+        nodes={"!them": {"user": {"shortName": "Bug2"}}},
+        localNode=types.SimpleNamespace(channels=channels),
+        sendText=lambda text, **kw: sent.append((text, kw)),
+        getMyUser=lambda: {"id": "!me", "longName": "BUG1119", "shortName": "BUG1"},
+    )
+    return server, sent
+
+
+def test_server_bot_replies():
+    print("server mode answers the same rules as the UI")
+    out = io.StringIO()
+    server, sent = _fake_server("[DM]\nhi=dm-hello\n\n[EDGE_ATS]\nping=pong\n", out)
+
+    server.on_receive(_text_packet("ping", bot.BROADCAST_ADDR, 101), server.interface)
+    check("a channel rule replies to the channel", [kw for _, kw in sent], [{"channelIndex": 3}])
+    check("the reply text", sent[0][0].splitlines()[0], "BOT: pong")
+    check("counted as received", server.received_count, 1)
+    check("counted as an auto-reply", server.sent_auto_count, 1)
+
+    sent.clear()
+    server.on_receive(_text_packet("hi", "!me", 102), server.interface)
+    check("a DM rule replies as a DM", [kw for _, kw in sent], [{"destinationId": "!them"}])
+    check("the DM reply text", sent[0][0].splitlines()[0], "BOT: dm-hello")
+
+    # The gates are inherited, so this checks they are actually reached.
+    sent.clear()
+    server.on_receive(_text_packet("ping", bot.BROADCAST_ADDR, 101), server.interface)
+    check("the same packet id is not answered twice", sent, [])
+    server.on_receive(_text_packet("BOT: pong", bot.BROADCAST_ADDR, 103), server.interface)
+    check("a bot reply is never answered", sent, [])
+    server.on_receive(
+        _text_packet("ping", bot.BROADCAST_ADDR, 104, from_id="!me"), server.interface
+    )
+    check("our own echo is not answered", sent, [])
+
+    log = out.getvalue()
+    print("the log is plain text, not markup")
+    for tag in ("[bold]", "[dim]", "[/dim]", "[yellow]", "[/yellow]"):
+        check(f"no {tag}", tag in log, False)
+    check("records the incoming message", "Bug2[!them](LoRa snr=6.5 rssi=-92): ping" in log, True)
+    check("records the reply it sent", "-> auto-reply: BOT: pong" in log, True)
+    # The reply's own bracketed detail line must survive verbatim, since it is
+    # what was actually transmitted.
+    check("keeps the reply's detail brackets", "[12:" in log or "from=Bug2" in log, True)
+    check("one reply folded onto one line", "auto-reply: BOT: pong [" in log, True)
+
+
+def test_server_bot_config_sync():
+    print("server mode reports what it is working with on connect")
+    out = io.StringIO()
+    server, _ = _fake_server("[EDGE_ATS]\nping=pong\n\n[NOPE]\nx=y\n", out)
+    server.on_config_synced(server.interface)
+    log = out.getvalue()
+    check("names the node", "BUG1119 !me" in log, True)
+    check("lists the channels", "#3 EDGE_ATS" in log, True)
+    check("counts the rules", "[EDGE_ATS]=1" in log, True)
+    # A section matching no channel here can never fire; saying so beats leaving
+    # a typo'd channel name silently dead.
+    check("warns about an unmatched section", "NOPE" in log, True)
+
+
+def test_server_heartbeat_and_stop():
+    print("server heartbeat and shutdown")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    server.received_count = 7
+    server.sent_auto_count = 3
+    server.reconnect_total = 2
+    line = server._heartbeat_line()
+    for expected in ("已連線", "收訊 7", "自動回覆 3", "重連 2"):
+        check(f"heartbeat mentions {expected}", expected in line, True)
+    server.link_down = True
+    check("heartbeat says so when the link is down", "連線中斷" in server._heartbeat_line(), True)
+    # stop() has to be safe from a signal handler, so it only sets flags.
+    server.stop()
+    check("stop marks closing", server._closing, True)
+    check("stop releases the wait", server._stopped.is_set(), True)
+
+
+def test_bounded_history():
+    print("the server's reply history cannot grow without bound")
+    history = bot._BoundedHistory()
+    limit = bot._BoundedHistory.LIMIT
+    for i in range(limit + 20):
+        history.setdefault(("channel", 3), []).append(i)
+    check("bounded per target", len(history[("channel", 3)]), limit)
+    check("keeps the newest", history[("channel", 3)][-1], limit + 19)
+    check("drops the oldest", 0 in history[("channel", 3)], False)
+    # Separate targets do not share the bound.
+    history.setdefault(("node", "!x"), []).append("only")
+    check("a second target is independent", list(history[("node", "!x")]), ["only"])
+
+
+def test_resolve_server_target():
+    print("server mode device selection")
+    call = bot.resolve_server_target
+    # One named target is taken as the answer. This is what makes --daemon
+    # possible: no terminal is needed to pick.
+    check(
+        "a single --host",
+        call("192.168.0.247", None, None),
+        (bot.TRANSPORT_TCP, "192.168.0.247"),
+    )
+    check(
+        "a single --port",
+        call(None, "/dev/cu.usbmodem2101", None),
+        (bot.TRANSPORT_SERIAL, "/dev/cu.usbmodem2101"),
+    )
+    check(
+        "a single --ble",
+        call(None, None, "Meshtastic_1a2b"),
+        (bot.TRANSPORT_BLE, "Meshtastic_1a2b"),
+    )
+
+    # More than one candidate means asking. Both the scan and input are stubbed:
+    # the point under test is the choosing, not bluetooth.
+    scanned = [types.SimpleNamespace(name="Meshtastic_aabb")]
+    original_scan = bot.meshtastic.ble_interface.BLEInterface.scan
+    original_input = builtins.input
+    bot.meshtastic.ble_interface.BLEInterface.scan = staticmethod(lambda: scanned)
+    try:
+        answers = iter(["9", "not a number", "3"])
+        builtins.input = lambda _: next(answers)
+        got = call("192.168.0.247", "/dev/tty0", None)
+        check(
+            "rejects bad answers, then takes the third row",
+            got,
+            (bot.TRANSPORT_BLE, "Meshtastic_aabb"),
+        )
+
+        # Ctrl-D at the prompt is an answer too: give up rather than loop.
+        def raise_eof(_):
+            raise EOFError
+
+        builtins.input = raise_eof
+        check("EOF at the prompt gives up", call("h1", "/dev/tty0", None), None)
+
+        # Nothing named and nothing found - say so instead of prompting for a
+        # choice out of an empty list.
+        scanned.clear()
+        check("no devices at all", call(None, None, None), None)
+
+        # A failing scan must not take the process down with it.
+        def boom():
+            raise RuntimeError("bluetooth off")
+
+        bot.meshtastic.ble_interface.BLEInterface.scan = staticmethod(boom)
+        check("a failed scan still returns the named target", call(None, None, None), None)
+    finally:
+        bot.meshtastic.ble_interface.BLEInterface.scan = original_scan
+        builtins.input = original_input
+
+
+def test_server_shares_the_engine():
+    print("both front ends really do share one rules engine")
+    # Not a behavioural check but a structural one: if the server ever stops
+    # inheriting ReplyEngine, every rule test above would still pass while the
+    # two modes silently drifted apart.
+    for name in (
+        "_reply_sections",
+        "_channel_sections",
+        "_channel_name",
+        "_should_auto_reply",
+        "_maybe_auto_reply",
+        "_distance_to",
+        "_describe_peer",
+        "_reconnect_delay",
+    ):
+        # Compare the underlying functions: a classmethod fetched from two
+        # classes gives two bound objects even when the code behind them is one.
+        def impl(cls):
+            attr = getattr(cls, name)
+            return getattr(attr, "__func__", attr)
+
+        check(f"{name} is one implementation", impl(bot.ServerBot) is impl(bot.MeshtasticTUI), True)
+    check("the TUI renders markup", bot.MeshtasticTUI.MARKUP, True)
+    check("the server does not", bot.ServerBot.MARKUP, False)
+
+
+def test_detached_argv():
+    print("the background server is relaunched, not forked")
+    call = bot.detached_argv
+
+    argv = call((bot.TRANSPORT_SERIAL, "/dev/cu.usbmodem2101"), None, 600)
+    check("runs this script", argv[1].endswith("bot_dual.py"), True)
+    check("stays headless", "--server" in argv, True)
+    check("carries the chosen device", argv[argv.index("--port") + 1], "/dev/cu.usbmodem2101")
+    check("carries the heartbeat", argv[argv.index("--heartbeat") + 1], "600")
+    # The property that matters most: a child that daemonised again would spawn
+    # a child of its own, and so on without end.
+    check("never forwards --daemon", "--daemon" in argv, False)
+    # And nothing that would make it stop and prompt.
+    check("no --wifi", "--wifi" in argv, False)
+    check("--here omitted when unset", "--here" in argv, False)
+
+    check(
+        "tcp uses --host",
+        call((bot.TRANSPORT_TCP, "192.168.0.247"), None, 0)[3:5],
+        ["--host", "192.168.0.247"],
+    )
+    check(
+        "ble uses --ble",
+        call((bot.TRANSPORT_BLE, "Meshtastic_1a2b"), None, 0)[3:5],
+        ["--ble", "Meshtastic_1a2b"],
+    )
+    # --here has to survive, or a detached server silently loses the distances.
+    with_here = call((bot.TRANSPORT_TCP, "h"), (25.033, 121.5654), 300)
+    check("passes --here through", with_here[with_here.index("--here") + 1], "25.033,121.5654")
+    check(
+        "and it parses back",
+        bot.parse_latlon(with_here[with_here.index("--here") + 1]),
+        (25.033, 121.5654),
+    )
+
+    print("the child argv is one this parser accepts")
+    # Round-trip it: a flag renamed on one side and not the other would leave
+    # --daemon spawning a child that dies on startup, in the background, unseen.
+    argv = call((bot.TRANSPORT_SERIAL, "/dev/tty0"), (1.0, 2.0), 42)
+    proc = subprocess.run(
+        [sys.executable, argv[1], "--help"], capture_output=True, text=True, timeout=120
+    )
+    check("--help works", proc.returncode, 0)
+    for flag in ("--server", "--port", "--heartbeat", "--here"):
+        check(f"{flag} is a real option", flag in proc.stdout, True)
+
+
+def test_bot_server_is_generated_not_rewritten():
+    print("bot_server.py is bot_dual.py with the UI removed")
+    # Compared as source text, which is the only check that actually catches
+    # drift: two copies that merely behave alike today will not stay alike.
+    shared_functions = [
+        "load_rules",
+        "find_reply",
+        "parse_incoming",
+        "packet_node_id",
+        "node_label",
+        "format_incoming_line",
+        "build_reply_text",
+        "node_position",
+        "haversine_m",
+        "format_distance",
+        "format_elapsed",
+        "parse_latlon",
+        "_split_device_key",
+        "_split_host_port",
+        "open_interface",
+        "resolve_server_target",
+        "detached_argv",
+        "spawn_detached",
+    ]
+    drifted = []
+    for name in shared_functions:
+        if inspect.getsource(getattr(bot, name)) != inspect.getsource(
+            getattr(bot_server, name)
+        ):
+            drifted.append(name)
+    check("every shared function is identical", drifted, [])
+
+    drifted_classes = []
+    for name in ("ReplyEngine", "ServerBot", "_BoundedHistory"):
+        if inspect.getsource(getattr(bot, name)) != inspect.getsource(
+            getattr(bot_server, name)
+        ):
+            drifted_classes.append(name)
+    check("every shared class is identical", drifted_classes, [])
+
+    print("and the differences are the intended ones")
+    check("bot_server carries no UI class", hasattr(bot_server, "MeshtasticTUI"), False)
+    check("bot_dual does", hasattr(bot, "MeshtasticTUI"), True)
+    # The one behavioural difference: what the detached child is told.
+    check("bot_dual tells its child to stay headless", bot.HEADLESS_FLAGS, ["--server"])
+    check("bot_server needs no such flag", bot_server.HEADLESS_FLAGS, [])
+    check(
+        "so bot_server's child argv has no --server",
+        "--server" in bot_server.detached_argv((bot_server.TRANSPORT_TCP, "h"), None, 60),
+        False,
+    )
+    check(
+        "and it launches bot_server.py",
+        bot_server.detached_argv((bot_server.TRANSPORT_TCP, "h"), None, 60)[1].endswith(
+            "bot_server.py"
+        ),
+        True,
+    )
+    # Not needing a UI toolkit is the point of the file existing. Checked on the
+    # source, not sys.modules: this suite imports bot_dual, which does load it.
+    ui_imports = [
+        line
+        for line in inspect.getsource(bot_server).splitlines()
+        if line.startswith(("import textual", "from textual", "import lora_params"))
+    ]
+    check("bot_server imports no UI toolkit", ui_imports, [])
+
+
+def test_bot_server_replies():
+    print("bot_server answers on its own, not only through bot_dual")
+    path = pathlib.Path(tempfile.mkdtemp()) / "rules.txt"
+    path.write_text("[EDGE_ATS]\nping=pong\n", encoding="utf-8")
+    original = bot_server.RULES_FILE
+    bot_server.RULES_FILE = path
+    try:
+        out = io.StringIO()
+        sent = []
+        server = bot_server.ServerBot(out=out)
+        server.my_id = "!me"
+        channels = [
+            types.SimpleNamespace(index=3, settings=types.SimpleNamespace(name="EDGE_ATS"))
+        ]
+        server.interface = types.SimpleNamespace(
+            nodes={"!them": {"user": {"shortName": "Bug2"}}},
+            localNode=types.SimpleNamespace(channels=channels),
+            sendText=lambda text, **kw: sent.append((text, kw)),
+            getMyUser=lambda: {"id": "!me", "longName": "BUG1119"},
+        )
+        server.on_receive(
+            _text_packet("ping", bot_server.BROADCAST_ADDR, 501), server.interface
+        )
+        check("replies to the channel", [kw for _, kw in sent], [{"channelIndex": 3}])
+        check("with the rule's text", sent[0][0].splitlines()[0], "BOT: pong")
+        check("logging plain text", "[bold]" in out.getvalue(), False)
+        # An unresolved sender must render as a real id here too.
+        sent.clear()
+        server.on_receive(
+            _text_packet(
+                "ping", bot_server.BROADCAST_ADDR, 502, from_num=0x1EF840CA, from_id=None
+            ),
+            server.interface,
+        )
+        check("unresolved sender shows its node number", "!1ef840ca" in out.getvalue(), True)
+        check("and never the word None", "None" in out.getvalue(), False)
+    finally:
+        bot_server.RULES_FILE = original
+
+
+def test_config_sync_before_adopt():
+    print("config sync can arrive before run() has stored the interface")
+    # This is the real ordering, not a hypothetical: the library publishes
+    # connection.established from its own thread while open_interface() is still
+    # constructing, so on_config_synced ran with self.interface still None and
+    # _known_channel_sections raised AttributeError - killing the handler, and
+    # with it the rule-coverage warning, on every single startup.
+    out = io.StringIO()
+    server, _ = _fake_server("[EDGE_ATS]\nping=pong\n\n[TYPO]\nx=y\n", out)
+    interface = server.interface
+    server.interface = None  # exactly the state the race leaves behind
+
+    server.on_config_synced(interface)
+
+    check("adopts the interface that published", server.interface is interface, True)
+    check("still reports the node", "BUG1119" in out.getvalue(), True)
+    # The warning is what the crash used to eat.
+    check("still warns about the unmatched section", "TYPO" in out.getvalue(), True)
+    check("no traceback text in the log", "Traceback" in out.getvalue(), False)
+
+
+def test_shutdown_is_bounded():
+    print("shutdown does not wait forever on a hanging close()")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    server.CLOSE_TIMEOUT = 1  # keep the test quick; the shape is what matters
+
+    closing = threading.Event()
+
+    class HangingInterface:
+        """close() that never returns - measured behaviour of BLE teardown."""
+
+        def close(self):
+            closing.set()
+            threading.Event().wait()  # forever
+
+    started = time.monotonic()
+    server._shutdown(HangingInterface())
+    took = time.monotonic() - started
+
+    check("close() was actually attempted", closing.is_set(), True)
+    check("gave up rather than hanging", took < 5, True)
+    check("waited about the deadline", 0.9 <= took < 3, True)
+    check("said so in the log", "介面關閉逾時" in out.getvalue(), True)
+    check("marked itself closing", server._closing, True)
+
+    # A close that raises must not stop the shutdown either.
+    out2 = io.StringIO()
+    server2, _ = _fake_server("[*]\nping=pong\n", out2)
+
+    class BrokenInterface:
+        def close(self):
+            raise RuntimeError("already gone")
+
+    server2._shutdown(BrokenInterface())
+    check("a raising close is swallowed", "already gone" in out2.getvalue(), True)
+    check("and shutdown still completed", server2._closing, True)
+
+    # A well-behaved close returns at once and logs nothing extra.
+    out3 = io.StringIO()
+    server3, _ = _fake_server("[*]\nping=pong\n", out3)
+    closed = []
+
+    class GoodInterface:
+        def close(self):
+            closed.append(True)
+
+    started = time.monotonic()
+    server3._shutdown(GoodInterface())
+    check("a clean close is immediate", time.monotonic() - started < 1, True)
+    check("and it did close", closed, [True])
+    check("with no timeout message", "逾時" in out3.getvalue(), False)
+
+
+def test_stop_wakes_the_wait():
+    print("stop() releases the serve loop")
+    # Verified separately against a live signal: Event.set() from a same-thread
+    # signal handler does wake Event.wait(). This pins the contract stop()
+    # relies on, so a future rewrite that swaps the Event for a sleep fails here
+    # rather than in the field.
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    check("not stopped to begin with", server._stopped.is_set(), False)
+
+    def stopper():
+        time.sleep(0.2)
+        server.stop()
+
+    threading.Thread(target=stopper, daemon=True).start()
+    started = time.monotonic()
+    woke = server._stopped.wait(10)
+    check("the wait returned early", woke, True)
+    check("and quickly", time.monotonic() - started < 3, True)
+    check("closing is set", server._closing, True)
+
+
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -1049,6 +1590,20 @@ if __name__ == "__main__":
         test_distance()
         test_distance_to()
         test_reply_text()
+        test_packet_node_id()
+        test_format_plain()
+        test_server_bot_replies()
+        test_server_bot_config_sync()
+        test_server_heartbeat_and_stop()
+        test_bounded_history()
+        test_resolve_server_target()
+        test_server_shares_the_engine()
+        test_detached_argv()
+        test_bot_server_is_generated_not_rewritten()
+        test_bot_server_replies()
+        test_config_sync_before_adopt()
+        test_shutdown_is_bounded()
+        test_stop_wakes_the_wait()
     finally:
         bot.RULES_FILE = original
 
