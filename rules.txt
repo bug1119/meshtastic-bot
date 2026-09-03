@@ -52,7 +52,7 @@ MeshTW
 mdfk=ㄇㄉㄈㄎ
 Hi=Hello
 ping=pong
-test=Hello!
+test=TeSt
 help=指令: ping
 A=Alpha
 B=Bravo
