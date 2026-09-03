@@ -2,6 +2,8 @@
 
 一個三窗格的 Meshtastic 終端介面(TUI),可以透過 **BLE / WiFi(TCP)/ USB serial** 連上節點,瀏覽並收發各頻道與 DM 的訊息,並依 `rules.txt` 做關鍵字自動回覆。
 
+另外附一個**無 UI 的 server 模式**(`bot_server.py`),用同一套規則引擎,可以丟到背景當服務長期跑 —— 見[三個檔案該用哪一個](#三個檔案該用哪一個)。
+
 ```
 ┌─ 裝置 ────────────────┐┌─ 頻道 / Node ─────────┐┌─ 訊息 ──────────────────┐
 │◆ Meshtastic.local  TCP ││# (unnamed #0)          ││ 12:34 Bug2[!f2dc..]: ping │
@@ -77,6 +79,134 @@ python3 -m venv ~/.venvs/meshtastic-bot
 | `Tab` / `Shift+Tab` | 循環所有可聚焦元件,含本機狀態窗格 |
 | `R` | 重新掃描裝置 |
 | `Q` | 離開 |
+
+## 三個檔案該用哪一個
+
+| 檔案 | 是什麼 | 什麼時候用 |
+|---|---|---|
+| `bot.py` | 原本的三窗格 TUI | 想看畫面、手動收發訊息 |
+| `bot_dual.py` | TUI **加上** `--server` 無 UI 模式 | 想用同一支程式兩種都跑 |
+| `bot_server.py` | 只有 server,**完全沒有 UI** | 長期掛在背景當服務 |
+
+`bot.py` 不會被另外兩個影響,維持原狀。
+
+`bot_server.py` 是**由 `bot_dual.py` 產生的**,不要手改:
+
+```sh
+./make_bot_server.py     # 改完 bot_dual.py 就跑這個重新產生
+```
+
+三者共用同一套規則引擎(`ReplyEngine`),所以在 TUI 測過的規則在 server 下行為完全一樣。
+`test_rules.py` 會用 `inspect.getsource()` 逐一比對共用函式,手改 `bot_server.py` 會**讓測試失敗**,
+這是刻意的 —— 兩份程式各自長歪比一次改錯更難發現。
+
+`bot_server.py` 不需要 `textual`,所以要部署到只跑服務的機器時,少一個相依。
+
+## Server mode(無 UI,可背景執行)
+
+```sh
+./bot_server.py --port /dev/cu.usbmodem2101          # USB
+./bot_server.py --host 192.168.0.247                 # WiFi
+./bot_server.py --ble Bug2_1ca6                      # BLE,指定名稱
+./bot_server.py                                      # 不指定 → 列出裝置讓你選編號
+./bot_server.py --list                               # 只列出有哪些裝置,不連線
+./bot_server.py --ble Bug2_1ca6 --daemon --log ~/bot.log    # 丟到背景
+
+# bot_dual.py 是一樣的東西,多一個 --server
+./bot_dual.py --server --port /dev/cu.usbmodem2101
+```
+
+跑起來長這樣(實機輸出):
+
+```
+2026-09-03 20:23:31 連線 ble:Bug2_1ca6 ...
+2026-09-03 20:23:57 BLE 已連線,等待設定同步...
+2026-09-03 20:23:57 設定同步完成: BUG2 !f2dcbabe
+2026-09-03 20:23:57 頻道: #0, #1 SignalTest, #2 Emergency!, #3 EDGE_ATS, #4 CLSE
+2026-09-03 20:23:57 規則: [DM]=1, [EDGE_ATS]=4, [CLSE]=29
+2026-09-03 20:24:03 channel:1 20:24:01 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping
+2026-09-03 20:24:03   -> auto-reply: BOT: pong [20:24:01 from=Bug2 rx=LoRa snr=6.5 rssi=-92]
+2026-09-03 20:24:17 [心跳] 已連線 執行 0:00:45 收訊 22 自動回覆 1 重連 0
+```
+
+每個事件一行、附完整日期(log 是隔幾天才看的,只有時鐘看不出哪一天),而且每行都 flush,
+所以 `tail -f` 看得到即時內容。
+
+| 參數 | 說明 |
+|---|---|
+| `--list` | 列出現在連得到哪些節點(BLE 名稱 + USB serial 埠),然後結束,不連任何一台 |
+| `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒的掃描。`--daemon` 要能無人啟動就靠這個 |
+| `--daemon` | 選好裝置後丟到背景,輸出寫到 `--log`,並印出 pid |
+| `--log PATH` | `--daemon` 的輸出檔,**附加**不覆蓋。預設 `meshtastic-bot.log` |
+| `--heartbeat SECS` | 多久印一行「還活著」與計數。`0` 關閉,只印真正發生的事。預設 600 |
+
+### 先看有哪些裝置
+
+```
+$ ./bot_server.py --list
+掃描 BLE(約 10 秒)...
+BLE 節點 (2):
+  --ble Bug2_1ca6    F891A520-7FDB-A7FB-998C-04A6C606B42C
+  --ble bug_530c     E9FF9C79-E898-E0B8-867B-2015A1D74ECD
+
+USB serial (0):
+  (沒有接上的裝置)
+```
+
+輸出直接就是**要傳的參數**,所以那一行可以整段貼到命令列上。
+
+BLE 掃描是用 Meshtastic 的 service UUID 過濾的,所以列出來的都是真節點,不是房間裡所有藍牙裝置。
+**列不到通常不是壞掉** —— 已經連上手機 app 的節點通常就停止廣播了。
+
+USB 那份用的是函式庫自己的 `findPorts()`,會優先挑已知的 USB-serial vendor id。
+
+### 怎麼結束
+
+**SIGTERM 就好 —— 也就是普通的 `kill`,或前景時 Ctrl-C。**
+
+```sh
+# 前景:Ctrl-C
+
+# 背景:啟動時就印了 pid
+$ ./bot_server.py --ble Bug2_1ca6 --daemon --log ~/bot.log
+背景執行中 pid=98523, log: /Users/you/bot.log
+停止: kill 98523
+
+$ kill 98523
+```
+
+停止時 log 會留下:
+
+```
+2026-09-03 20:25:12 停止中...
+2026-09-03 20:25:17 介面關閉逾時 (5s),不再等待
+2026-09-03 20:25:17 已停止。[心跳] 已連線 執行 0:00:54 收訊 22 自動回覆 1 重連 0
+```
+
+那行「關閉逾時」是**正常的,不是錯誤**:macOS 上 BLE 拆線常常永遠不回來。實測過 ——
+停止事件會立刻喚醒主迴圈,但接著 `close()` 就卡死,結果整個行程要 `kill -9` 才停。
+所以現在給 `close()` 五秒,到了就自己走。**不需要 `kill -9`。**
+
+`--daemon` 是**重新啟動一個乾淨的行程**,不是 `fork()`。因為 meshtastic 在 import 時
+就起了一條 `publishing` 執行緒,而 `fork()` 只帶走呼叫它的那一條 —— fork 出來的子行程
+會連得上、然後永遠不處理任何封包。裝置是在 fork **之前**選好的,所以背景那份不需要終端機。
+
+### 掛成開機服務(launchd)
+
+```xml
+<!-- ~/Library/LaunchAgents/com.local.meshtastic-bot.plist -->
+<key>ProgramArguments</key>
+<array>
+  <string>/usr/bin/python3</string>
+  <string>/Users/you/meshtastic-bot/bot_server.py</string>
+  <string>--port</string><string>/dev/cu.usbmodem2101</string>
+</array>
+<key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>/Users/you/bot.log</string>
+```
+
+這種情況**不要**加 `--daemon`:launchd 要自己盯著行程,所以讓它跑在前景、
+由 `StandardOutPath` 收 log 就好。
 
 ## 最底下那一列固定狀態列
 
@@ -241,7 +371,7 @@ BOT: pong
 ./test_rules.py
 ```
 
-226 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與收發計數,以及自動回覆的文字組成。
+350 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。
 
 其中未讀粗體有一項是**唯一會真的把 App 跑起來**的測試(Textual 的 headless 模式,仍然不需要硬體)—— 因為「找到那一列並重畫」這件事只有真的 widget 在時才存在,假造的 self 測不到。
 
