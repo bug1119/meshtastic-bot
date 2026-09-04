@@ -148,7 +148,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 2026-09-03 20:23:57 設定同步完成: BUG2 !f2dcbabe
 2026-09-03 20:23:57 頻道: #0, #1 SignalTest, #2 Emergency!, #3 EDGE_ATS, #4 CLSE
 2026-09-03 20:23:57 規則: [DM]=1, [EDGE_ATS]=4, [CLSE]=29
-2026-09-03 20:24:03 channel:1 20:24:01 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping
+2026-09-03 20:24:03 channel:1(SignalTest) 20:24:01 Bug2[!f2dcbabe](LoRa snr=6.5 rssi=-92): ping
 2026-09-03 20:24:03   -> auto-reply: BOT: pong [20:24:01 from=Bug2 rx=LoRa snr=6.5 rssi=-92]
 2026-09-03 20:24:17 [心跳] 已連線 執行 0:00:45 封包 249 收訊 22 自動回覆 1 重連 0
 ```
