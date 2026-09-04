@@ -93,6 +93,21 @@ from __future__ import annotations
 import importlib
 import sys
 
+import warnings
+
+# urllib3 v2 prints a NotOpenSSLWarning on import when the interpreter is
+# linked against LibreSSL instead of OpenSSL, which macOS system Python is.
+# Nothing here makes an HTTPS request through urllib3 - it arrives as a
+# dependency of meshtastic - so the warning is noise on every start with
+# nothing to act on. Filtered by message rather than by category, so a
+# different urllib3 warning would still be seen.
+#
+# It has to sit above the dependency check rather than down with the other
+# imports. That check imports meshtastic.ble_interface, and that is the first
+# thing to pull urllib3 in, so a filter installed further down is installed
+# after the warning has already printed - which is exactly what it did.
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+
 # Check dependencies up front so a missing package fails fast with a plain
 # "pip install X" hint instead of a raw ImportError/traceback from somewhere
 # deep inside textual/meshtastic. meshtastic.ble_interface is checked
@@ -132,16 +147,7 @@ import subprocess
 import threading
 import time
 import unicodedata
-import warnings
 from pathlib import Path
-
-# urllib3 v2 prints a NotOpenSSLWarning on import when the interpreter is linked
-# against LibreSSL instead of OpenSSL, which macOS system Python is. Nothing
-# here makes an HTTPS request through urllib3 - it arrives as a dependency of
-# meshtastic - so the warning is noise on every start and there is nothing to
-# act on. Filtered by message rather than by category, so a different urllib3
-# warning would still be seen, and set before the import chain that triggers it.
-warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 from pubsub import pub
 from textual import work
@@ -736,6 +742,138 @@ def format_uptime(seconds: int | None) -> str:
     return f"{hours:02d}:{minutes:02d}"
 
 
+# One row per fact the node reports about itself. Groups are contiguous in pane
+# order, so a consumer can print one row per line (the pane) or fold each group
+# into one wide line (the server log) without either one reordering the fields.
+def local_status_rows(bot) -> list[tuple[str, str, str]]:
+    """The node's own configuration and state, as (group, label, value) rows.
+
+    Shared by the TUI's local-status pane and the server's startup block. It
+    hands back rows instead of writing them because the two want different
+    shapes - one row per line down a 24-column pane, against a handful of wide
+    log lines - and neither should be the one that owns the field list. While
+    this was pane code the server could not report any of it.
+
+    Values are plain text: the pane adds its own emphasis and the log has none
+    to add, so markup here would only have to be stripped again.
+
+    A metric the node does not report gets no row at all rather than a blank
+    one - a device without a battery has no battery row - which is what the
+    pane has always done.
+    """
+    interface = bot.interface
+    if interface is None or bot.my_id is None:
+        return []
+
+    lora = interface.localNode.localConfig.lora
+    device_cfg = interface.localNode.localConfig.device
+    position_cfg = interface.localNode.localConfig.position
+
+    region = config_pb2.Config.LoRaConfig.RegionCode.Name(lora.region)
+    preset = (
+        config_pb2.Config.LoRaConfig.ModemPreset.Name(lora.modem_preset)
+        if lora.use_preset
+        else "自訂"
+    )
+    role = config_pb2.Config.DeviceConfig.Role.Name(device_cfg.role)
+    gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
+
+    rows = [
+        ("節點", "Region", region),
+        ("節點", "韌體", bot.firmware_version or "查詢中..."),
+        ("節點", "Role", role),
+        ("無線電", "Preset", preset),
+        ("無線電", "Slot", str(lora.channel_num or "(Auto)")),
+    ]
+
+    # A preset config leaves stored bandwidth at 0 and override_frequency at
+    # 0.0, so both of these are reconstructed - see lora_params. A "~" marks a
+    # derived value so it is not mistaken for something the node reported.
+    freq = lora_params.frequency_mhz(lora)
+    if lora.override_frequency:
+        rows.append(("無線電", "頻率", f"{freq:.3f} MHz"))
+    elif freq is not None:
+        rows.append(("無線電", "頻率", f"~{freq:.3f} MHz"))
+    else:
+        rows.append(("無線電", "頻率", "無法推導"))
+
+    bw = lora_params.bandwidth_khz(lora)
+    if bw is None:
+        rows.append(("無線電", "Bandwidth", "無法推導"))
+    elif lora.use_preset:
+        rows.append(("無線電", "Bandwidth", f"~{bw:g} kHz"))
+    else:
+        rows.append(("無線電", "Bandwidth", f"{bw:g} kHz"))
+
+    rows.append(("無線電", "Tx Power", f"{lora.tx_power} dBm"))
+
+    node = (interface.nodes or {}).get(bot.my_id, {})
+    metrics = node.get("deviceMetrics", {})
+    rows.append(("裝置", "Uptime", format_uptime(metrics.get("uptimeSeconds"))))
+    battery = metrics.get("batteryLevel")
+    if battery is not None:
+        rows.append(("裝置", "電量", f"{battery}% {metrics.get('voltage', 0):.3f}V"))
+        rows.append(("裝置", "Ch.Util", f"{metrics.get('channelUtilization', 0):.1f}%"))
+    rows.append(("裝置", "OK to MQTT", "是" if lora.config_ok_to_mqtt else "否"))
+
+    if bot.last_signal:
+        snr = bot.last_signal["snr"]
+        rssi = bot.last_signal["rssi"]
+        rows.append(("收訊", "最近 SNR", str(snr) if snr is not None else "--"))
+        rows.append(("收訊", "最近 RSSI", str(rssi) if rssi is not None else "--"))
+    else:
+        rows.append(("收訊", "最近收訊", "--"))
+
+    position = node.get("position", {})
+    if gps_mode == "NOT_PRESENT":
+        gps_line = "無 GPS 模組"
+    elif gps_mode == "DISABLED":
+        gps_line = "已停用"
+    elif "latitudeI" in position:
+        gps_line = (
+            f"已定位 ({position['latitudeI'] / 1e7:.4f}, "
+            f"{position['longitudeI'] / 1e7:.4f})"
+        )
+    else:
+        gps_line = "已啟用,尚無定位"
+    rows.append(("定位", "GPS", gps_line))
+
+    # Last, so Region keeps the top of the pane.
+    transport = (bot.transport or "?").upper()
+    if bot.link_down:
+        # Everything above is the last known state of a node we can no longer
+        # hear, so say that outright rather than leaving figures that look live.
+        rows.append(("連線", "連線", f"{transport} 中斷,重連中"))
+    elif bot.peer:
+        rows.append(("連線", "連線", f"{transport} {bot.peer}"))
+    else:
+        rows.append(("連線", "連線", transport))
+
+    return rows
+
+
+def local_status_lines(bot) -> list[str]:
+    """The same rows folded into one line per group, for a log.
+
+    Sixteen timestamped lines is not a startup banner, it is a wall. One line
+    per group keeps every fact greppable while matching the shape of the
+    startup lines either side of it - `頻道:` and `規則:` are one category each
+    too.
+    """
+    grouped: dict[str, list[str]] = {}
+    for group, label, value in local_status_rows(bot):
+        grouped.setdefault(group, []).append(f"{label}={value}")
+    lines = []
+    for group, parts in grouped.items():
+        # A group holding one field named after itself would read
+        # "連線: 連線=BLE Bug2_1ca6", so the label goes and the value stays.
+        if len(parts) == 1 and parts[0].startswith(f"{group}="):
+            lines.append(f"{group}: {parts[0][len(group) + 1:]}")
+        else:
+            lines.append(f"{group}: {' '.join(parts)}")
+    return lines
+
+
 BOT_REPLY_PREFIX = "BOT: "
 
 
@@ -775,8 +913,9 @@ class ReplyEngine:
     Everything here works without a widget - deciding and sending replies,
     resolving the far end, pacing reconnects - so both front ends inherit it
     unchanged and a rule that works in one works in the other. Implementors
-    provide `interface`, `my_id`, `here`, `tcp_host`, `history`, `_replied_ids`
-    and `sent_auto_count`; the TUI has them as UI state, the server keeps its own.
+    provide `interface`, `my_id`, `here`, `tcp_host`, `history`, `_replied_ids`,
+    `sent_auto_count`, `firmware_version` and `last_signal`; the TUI has them as
+    UI state, the server keeps its own.
     """
 
     # Whether log lines this class produces are Rich markup. True for the TUI,
@@ -1489,92 +1628,26 @@ class MeshtasticTUI(ReplyEngine, App):
     def _render_local_status(self) -> None:
         log = self.query_one("#local-status-log", RichLog)
         log.clear()
-        if self.interface is None or self.my_id is None:
+        rows = local_status_rows(self)
+        if not rows:
             log.write("[dim]尚未連線[/dim]")
             return
-
-        lora = self.interface.localNode.localConfig.lora
-        device_cfg = self.interface.localNode.localConfig.device
-        position_cfg = self.interface.localNode.localConfig.position
-
-        region = config_pb2.Config.LoRaConfig.RegionCode.Name(lora.region)
-        preset = (
-            config_pb2.Config.LoRaConfig.ModemPreset.Name(lora.modem_preset)
-            if lora.use_preset
-            else "自訂"
-        )
-        role = config_pb2.Config.DeviceConfig.Role.Name(device_cfg.role)
-        gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
-
-        log.write(f"[bold]Region:[/bold] {region}")
-        log.write(f"[bold]韌體:[/bold] {self.firmware_version or '查詢中...'}")
-        log.write(f"[bold]Role:[/bold] {role}")
-        log.write(f"[bold]Preset:[/bold] {preset}")
-        log.write(f"[bold]Slot:[/bold] {lora.channel_num or '(Auto)'}")
-        # A preset config leaves stored bandwidth at 0 and override_frequency at
-        # 0.0, so both of these are reconstructed - see lora_params. A "~" marks
-        # a derived value so it is not mistaken for something the node reported.
-        freq = lora_params.frequency_mhz(lora)
-        if lora.override_frequency:
-            log.write(f"[bold]頻率:[/bold] {freq:.3f} MHz")
-        elif freq is not None:
-            log.write(f"[bold]頻率:[/bold] ~{freq:.3f} MHz")
-        else:
-            log.write("[bold]頻率:[/bold] 無法推導")
-        bw = lora_params.bandwidth_khz(lora)
-        if bw is None:
-            log.write("[bold]Bandwidth:[/bold] 無法推導")
-        elif lora.use_preset:
-            log.write(f"[bold]Bandwidth:[/bold] ~{bw:g} kHz")
-        else:
-            log.write(f"[bold]Bandwidth:[/bold] {bw:g} kHz")
-        log.write(f"[bold]Tx Power:[/bold] {lora.tx_power} dBm")
-
-        node = (self.interface.nodes or {}).get(self.my_id, {})
-        metrics = node.get("deviceMetrics", {})
-        log.write(f"[bold]Uptime:[/bold] {format_uptime(metrics.get('uptimeSeconds'))}")
-        battery = metrics.get("batteryLevel")
-        if battery is not None:
-            log.write(f"[bold]電量:[/bold] {battery}% {metrics.get('voltage', 0):.3f}V")
-            log.write(f"[bold]Ch.Util:[/bold] {metrics.get('channelUtilization', 0):.1f}%")
-        log.write(f"[bold]OK to MQTT:[/bold] {'是' if lora.config_ok_to_mqtt else '否'}")
-
-        if self.last_signal:
-            snr = self.last_signal["snr"]
-            rssi = self.last_signal["rssi"]
-            log.write(f"[bold]最近 SNR:[/bold] {snr if snr is not None else '--'}")
-            log.write(f"[bold]最近 RSSI:[/bold] {rssi if rssi is not None else '--'}")
-        else:
-            log.write("[bold]最近收訊:[/bold] --")
-
-        position = node.get("position", {})
-        if gps_mode == "NOT_PRESENT":
-            gps_line = "無 GPS 模組"
-        elif gps_mode == "DISABLED":
-            gps_line = "已停用"
-        elif "latitudeI" in position:
-            gps_line = f"已定位 ({position['latitudeI'] / 1e7:.4f}, {position['longitudeI'] / 1e7:.4f})"
-        else:
-            gps_line = "已啟用,尚無定位"
-        log.write(f"[bold]GPS:[/bold] {gps_line}")
-        # Last so Region keeps the top of the pane. The address is variable
-        # length - a long IP or a hostname fallback overflows the pane and wraps
-        # mid-value, so drop it to its own indented row instead of letting the
-        # terminal break it in an arbitrary place.
-        transport = (self.transport or "?").upper()
-        if self.link_down:
-            # The rest of this pane is the last known state of a node we can no
-            # longer hear, so say that outright rather than leaving figures on
-            # screen that look live.
-            log.write(f"[bold]連線:[/bold] [red]{transport} 中斷,重連中[/red]")
-        elif self.peer:
-            if display_width(f"連線: {transport} {self.peer}") <= STATUS_PANE_WIDTH:
-                log.write(f"[bold]連線:[/bold] {transport} {self.peer}")
+        for _group, label, value in rows:
+            if label != "連線":
+                log.write(f"[bold]{label}:[/bold] {value}")
+                continue
+            # The address is variable length, and a long IP or a hostname
+            # fallback overflows the pane and wraps mid-value, so it drops to
+            # its own indented row instead of breaking wherever the terminal
+            # decides. Here rather than in local_status_rows() because a width
+            # is a property of the pane, not of the node.
+            if self.link_down:
+                log.write(f"[bold]連線:[/bold] [red]{value}[/red]")
+            elif display_width(f"連線: {value}") <= STATUS_PANE_WIDTH:
+                log.write(f"[bold]連線:[/bold] {value}")
             else:
-                log.write(f"[bold]連線:[/bold] {transport}")
+                log.write(f"[bold]連線:[/bold] {(self.transport or '?').upper()}")
                 log.write(f"  {self.peer}")
-        else:
-            log.write(f"[bold]連線:[/bold] {transport}")
 
     # ---- pane 2: channels & nodes -----------------------------------------
 
@@ -2333,6 +2406,11 @@ class ServerBot(ReplyEngine):
         self.peer: str | None = None
         self.tcp_host: str | None = None
         self.my_id: str | None = None
+        # Read by local_status_rows(), which the TUI feeds from a worker and a
+        # packet hook; here the version arrives with the config download and
+        # the signal stays None until something is heard.
+        self.firmware_version: str | None = None
+        self.last_signal: dict | None = None
         self.history = _BoundedHistory()
         self._replied_ids: dict = {}
         self.sent_auto_count = 0
@@ -2432,6 +2510,21 @@ class ServerBot(ReplyEngine):
         self.my_id = my_user.get("id")
         name = my_user.get("longName") or my_user.get("shortName") or "?"
         self.log(f"設定同步完成: {name} {self.my_id}")
+        # The node hands over its DeviceMetadata during the config download, so
+        # this is already in hand - no admin round-trip, unlike the TUI, which
+        # has to ask for it and therefore asks on a worker thread.
+        metadata = getattr(interface, "metadata", None)
+        self.firmware_version = getattr(metadata, "firmware_version", None) or "未知"
+        # Contained, on the same reasoning as the MQTT callbacks: this is a
+        # banner. A field some firmware reports in a shape we did not expect
+        # must not cost the operator the whole server - and this runs on the
+        # library's own thread, where an exception loose here would take the
+        # rest of the connection setup with it.
+        try:
+            for line in local_status_lines(self):
+                self.log(line)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"本機狀態讀取失敗: {type(exc).__name__}: {exc}")
         channels = [
             f"#{ch.index}"
             + (f" {ch.settings.name}" if ch.settings.name else "")

@@ -1204,9 +1204,44 @@ def _fake_server(rules, out):
         types.SimpleNamespace(index=0, settings=types.SimpleNamespace(name="")),
         types.SimpleNamespace(index=3, settings=types.SimpleNamespace(name="EDGE_ATS")),
     ]
+    # Real protobuf messages rather than stand-ins: every field then exists
+    # with the firmware's own default, and lora_params runs its actual
+    # derivation instead of reading back whatever a namespace happened to hold.
+    cfg = bot.config_pb2.Config
+    lora = cfg.LoRaConfig(
+        region=cfg.LoRaConfig.RegionCode.Value("TW"),
+        modem_preset=cfg.LoRaConfig.ModemPreset.Value("MEDIUM_FAST"),
+        use_preset=True,
+        tx_power=30,
+        config_ok_to_mqtt=True,
+    )
+    server.transport = "ble"
+    server.peer = "Bug2_1ca6"
     server.interface = types.SimpleNamespace(
-        nodes={"!them": {"user": {"shortName": "Bug2"}}},
-        localNode=types.SimpleNamespace(channels=channels),
+        nodes={
+            "!them": {"user": {"shortName": "Bug2"}},
+            "!me": {
+                "deviceMetrics": {
+                    "uptimeSeconds": 9723,
+                    "batteryLevel": 94,
+                    "voltage": 4.012,
+                    "channelUtilization": 3.2,
+                }
+            },
+        },
+        localNode=types.SimpleNamespace(
+            channels=channels,
+            localConfig=types.SimpleNamespace(
+                lora=lora,
+                device=cfg.DeviceConfig(role=cfg.DeviceConfig.Role.Value("CLIENT")),
+                position=cfg.PositionConfig(
+                    gps_mode=cfg.PositionConfig.GpsMode.Value("NOT_PRESENT")
+                ),
+            ),
+        ),
+        # The node sends this during the config download, so the server has it
+        # without asking - see on_config_synced.
+        metadata=types.SimpleNamespace(firmware_version="2.7.11.4e40e6f"),
         sendText=lambda text, **kw: sent.append((text, kw)),
         getMyUser=lambda: {"id": "!me", "longName": "BUG1119", "shortName": "BUG1"},
     )
@@ -1492,10 +1527,13 @@ def test_bot_server_is_generated_not_rewritten():
     )
     # Not needing a UI toolkit is the point of the file existing. Checked on the
     # source, not sys.modules: this suite imports bot_dual, which does load it.
+    # lora_params is deliberately not in this list - it is a module in this
+    # repo rather than something to install, and the server derives the node's
+    # frequency and bandwidth through it now that the status block is shared.
     ui_imports = [
         line
         for line in inspect.getsource(bot_server).splitlines()
-        if line.startswith(("import textual", "from textual", "import lora_params"))
+        if line.startswith(("import textual", "from textual"))
     ]
     check("bot_server imports no UI toolkit", ui_imports, [])
 
@@ -2223,6 +2261,17 @@ def test_urllib3_warning_filtered():
             True,
         )
         # Before the import that triggers it, or the warning is already out.
+        # The first thing to reach urllib3 is the dependency check, not the
+        # `import meshtastic` further down - checking only against the latter
+        # is why this passed while the warning still printed on every start.
+        # Matched on the call rather than the dotted name, which also appears
+        # in the comment explaining the ordering.
+        check(
+            f"{name} filters before the dependency check imports meshtastic",
+            text.index("urllib3 v2 only supports OpenSSL")
+            < text.index("importlib.import_module(_module_name)"),
+            True,
+        )
         check(
             f"{name} filters before importing meshtastic",
             text.index("urllib3 v2 only supports OpenSSL") < text.index("\nimport meshtastic"),
@@ -2523,7 +2572,13 @@ def test_mqtt_is_off_without_the_flag():
     server.interface.localNode.moduleConfig = types.SimpleNamespace(mqtt=_mqtt_config())
     server.on_config_synced(server.interface)
     log = out.getvalue()
-    check("config sync says nothing about MQTT", "MQTT" in log, False)
+    bridge_lines = [
+        line for line in log.splitlines() if line.split(" ", 2)[2].startswith("MQTT")
+    ]
+    check("config sync says nothing about the bridge", bridge_lines, [])
+    # Not by staying quiet about the node's own setting, though: that field is
+    # in the status block whether or not anything is bridging.
+    check("the node's own ok-to-mqtt is still reported", "OK to MQTT=是" in log, True)
     # The heartbeat columns a running server is read by must not move.
     check("the heartbeat is unchanged", "MQTT" in server._heartbeat_line(), False)
     check("the rules report still happened", "[EDGE_ATS]=1" in log, True)
@@ -2795,6 +2850,137 @@ def test_mqtt_shutdown_runs_before_the_interface():
     check("nothing about MQTT", "MQTT" in out2.getvalue(), False)
 
 
+def test_local_status_rows():
+    print("the node's own status, as rows both front ends read")
+    server, _ = _fake_server("[*]\nping=pong\n", io.StringIO())
+    rows = bot.local_status_rows(server)
+    values = {label: value for _group, label, value in rows}
+
+    check("region as its name, not its number", values["Region"], "TW")
+    check("role", values["Role"], "CLIENT")
+    check("preset", values["Preset"], "MEDIUM_FAST")
+    check("an unset slot reads as automatic", values["Slot"], "(Auto)")
+    check("tx power carries its unit", values["Tx Power"], "30 dBm")
+    check("uptime formatted, not raw seconds", values["Uptime"], "02:42")
+    check("battery with its voltage", values["電量"], "94% 4.012V")
+    check("channel utilisation", values["Ch.Util"], "3.2%")
+    check("ok-to-mqtt as a word", values["OK to MQTT"], "是")
+    check("nothing heard yet", values["最近收訊"], "--")
+    check("a missing gps module is stated", values["GPS"], "無 GPS 模組")
+    check("the link, with the peer", values["連線"], "BLE Bug2_1ca6")
+    # The pane adds its own emphasis and the log has none to add, so a value
+    # carrying markup would have to be stripped by one of them.
+    check("no markup in any value", any("[/" in v for v in values.values()), False)
+    # Folding by group only preserves pane order while the groups are
+    # contiguous; interleaving them would silently reorder the pane.
+    groups = [group for group, _label, _value in rows]
+    check("groups are contiguous", groups, sorted(groups, key=groups.index))
+    # Not connected is not "all fields blank" - it is no fields.
+    server.interface = None
+    check("nothing to report before a link", bot.local_status_rows(server), [])
+
+
+def test_local_status_marks_derived_values():
+    print("a derived frequency is marked, a reported one is not")
+    server, _ = _fake_server("[*]\nping=pong\n", io.StringIO())
+    lora = server.interface.localNode.localConfig.lora
+
+    def freq():
+        return dict(
+            (label, value) for _g, label, value in bot.local_status_rows(server)
+        )["頻率"]
+
+    # Slot left to the firmware, which picks it from a hash of the channel
+    # name. lora_params refuses to reproduce that hash rather than print a
+    # confidently wrong number, and the row has to say so.
+    check("an automatic slot cannot be derived", freq(), "無法推導")
+
+    lora.channel_num = 20
+    check("a real slot derives, and the ~ says it was derived", freq()[0], "~")
+
+    lora.override_frequency = 923.5
+    check("a frequency the node reports gets no ~", freq(), "923.500 MHz")
+    check("bandwidth is derived from the preset",
+          dict((l, v) for _g, l, v in bot.local_status_rows(server))["Bandwidth"],
+          "~250 kHz")
+
+
+def test_local_status_lines_fold_by_group():
+    print("the server folds those rows into one line per group")
+    server, _ = _fake_server("[*]\nping=pong\n", io.StringIO())
+    lines = bot.local_status_lines(server)
+    check("one line per group", len(lines), 6)
+    check("the node line", lines[0], "節點: Region=TW 韌體=查詢中... Role=CLIENT")
+    check("every line names its group", all(":" in line for line in lines), True)
+    # A group holding a single field named after itself would otherwise read
+    # "連線: 連線=BLE Bug2_1ca6".
+    check("no doubled label", lines[-1], "連線: BLE Bug2_1ca6")
+
+
+def test_local_status_is_logged_at_startup():
+    print("server mode prints the local status when it connects")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    server.on_config_synced(server.interface)
+    log = out.getvalue()
+    for expected in (
+        "節點: Region=TW",
+        "無線電: Preset=MEDIUM_FAST",
+        "裝置: Uptime=02:42",
+        "定位: GPS=無 GPS 模組",
+        "連線: BLE Bug2_1ca6",
+    ):
+        check(f"logged {expected}", expected in log, True)
+    # The node hands its metadata over during the config download, so the
+    # version is there without an admin round-trip of our own.
+    check("firmware version came off the download", "韌體=2.7.11.4e40e6f" in log, True)
+    # The block sits between the node's name and its channels, where the rest
+    # of the startup lines are.
+    lines = [line.split(" ", 2)[2] for line in log.splitlines()]
+
+    def first(prefix):
+        return next(i for i, line in enumerate(lines) if line.startswith(prefix))
+
+    check("after the node name", first("節點:") > first("設定同步完成"), True)
+    check("and before the channels", first("節點:") < first("頻道:"), True)
+    check("the whole block is together", first("連線:") + 1, first("頻道:"))
+
+
+def test_local_status_cannot_stop_the_server():
+    print("a status field in an unexpected shape cannot stop startup")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    # Whatever surprises us - a firmware that omits a config block, a library
+    # that renames one. The banner is not worth the server.
+    server.interface.localNode.localConfig = None
+    server.on_config_synced(server.interface)
+    log = out.getvalue()
+    check("the node was still reported", "設定同步完成" in log, True)
+    check("the failure was named", "本機狀態讀取失敗" in log, True)
+    check("and startup carried on to the channels", "#3 EDGE_ATS" in log, True)
+    check("and to the rules", "[*]=1" in log, True)
+
+
+def test_local_status_is_in_both_files():
+    print("the pane and the server read one field list, not two")
+    for name in ("local_status_rows", "local_status_lines", "format_uptime"):
+        check(f"bot_server has {name}", hasattr(bot_server, name), True)
+        check(
+            f"{name} is identical",
+            inspect.getsource(getattr(bot, name))
+            == inspect.getsource(getattr(bot_server, name)),
+            True,
+        )
+    # lora_params and format_uptime used to be stripped out of bot_server as
+    # UI-only. They are shared now, and a generator that still dropped them
+    # would leave a NameError on the startup path.
+    check("bot_server can derive lora values", hasattr(bot_server, "lora_params"), True)
+    pane = inspect.getsource(bot.MeshtasticTUI._render_local_status)
+    check("the pane calls the shared function", "local_status_rows(self)" in pane, True)
+    check("the pane has no field list of its own", "config_pb2" in pane, False)
+    check("nor its own uptime formatting", "format_uptime" in pane, False)
+
+
 def test_mqtt_bridge_is_in_both_files():
     print("the bridge exists in bot_dual and in the generated bot_server")
     # bot_server.py is generated by stripping the UI. A feature that lands in
@@ -2908,6 +3094,12 @@ if __name__ == "__main__":
         test_mqtt_shutdown_is_bounded()
         test_mqtt_shutdown_runs_before_the_interface()
         test_mqtt_bridge_is_in_both_files()
+        test_local_status_rows()
+        test_local_status_marks_derived_values()
+        test_local_status_lines_fold_by_group()
+        test_local_status_is_logged_at_startup()
+        test_local_status_cannot_stop_the_server()
+        test_local_status_is_in_both_files()
     finally:
         bot.RULES_FILE = original
 

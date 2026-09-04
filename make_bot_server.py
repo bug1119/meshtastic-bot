@@ -54,7 +54,7 @@ def drop(name: str, kind: str = "def") -> str:
 
 print("removing:")
 print("  " + drop("MeshtasticTUI", "class"))
-for name in ("display_width", "format_uptime", "set_wifi"):
+for name in ("display_width", "set_wifi"):
     print("  " + drop(name))
 
 source = "".join(lines)
@@ -79,8 +79,9 @@ STATUS_PANE_WIDTH = 24
     "",
 )
 
-# No widgets, no width measuring, no LoRa tables: the status pane was the only
-# thing that needed any of them.
+# No widgets and no width measuring: those were the pane's alone. lora_params
+# and format_uptime used to go too, back when the pane was the only thing that
+# read the node's own status - local_status_rows() is shared now, so they stay.
 sub(
     """from textual import work
 from textual.app import App, ComposeResult
@@ -91,7 +92,6 @@ from textual.widgets import Input, Label, ListItem, ListView, RichLog
 """,
     "",
 )
-sub("\nimport lora_params\n", "")
 sub("import unicodedata\n", "")
 
 # Nobody should have to install a UI toolkit to run a headless server. Every
@@ -288,7 +288,6 @@ print(f"\nwrote {OUT.name} ({len(source.splitlines())} lines)")
 # Anything left behind would be a NameError the moment that path is taken.
 for banned in (
     "textual",
-    "lora_params",
     "MeshtasticTUI",
     "set_wifi",
     "display_width",
