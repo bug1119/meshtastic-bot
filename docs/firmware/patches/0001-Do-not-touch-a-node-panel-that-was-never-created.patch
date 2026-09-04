@@ -1,0 +1,55 @@
+From c5a9df03b2096646bf8e8786a8d614b3e32b3c23 Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Thu, 3 Sep 2026 01:39:08 +0800
+Subject: [PATCH] Do not touch a node panel that was never created
+
+updatePosition indexed nodes[nodeNum] and dereferenced the result straight
+away. nodes is an unordered_map, so operator[] inserts a null panel for a key
+it does not hold - and the next line writes through it.
+
+That happens in normal operation: the node list is bounded and untracked
+senders are logged as "not in db and no need to insert", yet their positions
+still reach here. On a busy mesh it panicked with StoreProhibited about once a
+minute, always immediately after a burst of POSITION_APP packets, taking the
+reboot count from 198 to 267 in one afternoon.
+
+Guarded at the top of the function rather than at the crashing line, because
+everything below assumes the panel exists - several later statements index
+nodes[] the same way.
+
+The same operator[]-then-dereference shape appears at roughly two dozen other
+call sites in this file. They are left alone here: this is the one that fires,
+and changing all of them is a separate, much larger piece of work.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ source/graphics/TFT/TFTView_320x240.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTView_320x240.cpp
+index 3005bac..e681316 100644
+--- a/source/graphics/TFT/TFTView_320x240.cpp
++++ b/source/graphics/TFT/TFTView_320x240.cpp
+@@ -4945,6 +4945,18 @@ void TFTView_320x240::updateNode(uint32_t nodeNum, uint8_t ch, const meshtastic_
+ 
+ void TFTView_320x240::updatePosition(uint32_t nodeNum, int32_t lat, int32_t lon, int32_t alt, uint32_t sats, uint32_t precision)
+ {
++    // A position can arrive from a node this view never built a panel for: the
++    // node list is bounded, and untracked senders are logged as "not in db and
++    // no need to insert". Everything below indexes nodes[] and dereferences the
++    // result, and nodes is an unordered_map - so operator[] would insert a null
++    // panel and the very next line would write through it. That is the
++    // StoreProhibited panic seen on a busy mesh, roughly once a minute, always
++    // right after a burst of POSITION_APP packets.
++    auto panelEntry = nodes.find(nodeNum);
++    if (panelEntry == nodes.end() || panelEntry->second == nullptr) {
++        return;
++    }
++
+     int32_t altU = abs(alt) < 10000 ? alt : 0;
+     char units[3] = {};
+     if (db.config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_METRIC) {
+-- 
+2.50.1 (Apple Git-155)
+

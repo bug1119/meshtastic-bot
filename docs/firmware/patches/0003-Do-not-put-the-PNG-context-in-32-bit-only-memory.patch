@@ -1,0 +1,60 @@
+From 96d055ad821122f2aec4290b2f3d6df2b27c0c83 Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Fri, 4 Sep 2026 17:26:22 +0800
+Subject: [PATCH] Do not put the PNG context in 32-bit-only memory
+
+Opening the map screen rebooted the device. Decoded:
+
+    0x4208e677 initPNGDecoder
+    0x4207bd45 TFTView_320x240::loadMap
+    0x42078071 TFTView_320x240::ui_event_MapButton
+    0x4204002e lv_event_send
+
+StoreProhibited inside initPNGDecoder, at the placement-new that constructs
+PNG() in the buffer it just allocated:
+
+    pngBuffer = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
+    ...
+    png = ::new (pngBuffer) PNG();
+
+MALLOC_CAP_32BIT does not mean "aligned to 32-bit words", which is what the
+comment above it says it was for. It means "only 32-bit accesses are legal in
+this region", and on ESP32-S3 it can return IRAM. The PNG constructor does
+byte-sized stores, and a byte store to such a region faults.
+
+MALLOC_CAP_8BIT asks for the byte-addressable internal SRAM that was actually
+wanted; allocations from it are word-aligned anyway.
+
+Upstream code, from bcb327f (CURLService, #353) - not something this branch
+introduced. Worth reporting.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ source/util/PNGdecoder.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/source/util/PNGdecoder.cpp b/source/util/PNGdecoder.cpp
+index 0fc438e..608c25b 100644
+--- a/source/util/PNGdecoder.cpp
++++ b/source/util/PNGdecoder.cpp
+@@ -17,8 +17,14 @@ void initPNGDecoder(void)
+ {
+     static void *pngBuffer = nullptr;
+     if (!pngBuffer) {
+-        // force allocation into zero-wait-state Internal SRAM (aligned to 32-bit words)
+-        pngBuffer = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
++        // Internal SRAM for the zero-wait-state access this decoder wants.
++        //
++        // Deliberately NOT MALLOC_CAP_32BIT: that does not mean "aligned to
++        // 32-bit words", it means "only 32-bit accesses are legal here", and on
++        // ESP32-S3 it can hand back IRAM. Constructing PNG() in place does
++        // byte-sized stores, which fault on such a region - StoreProhibited
++        // inside initPNGDecoder the moment the map screen is opened.
++        pngBuffer = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+ 
+         if (!pngBuffer) {
+             ILOG_ERROR("Failed to allocate PNG context in Internal SRAM!");
+-- 
+2.50.1 (Apple Git-155)
+
