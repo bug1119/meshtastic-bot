@@ -92,6 +92,21 @@ from __future__ import annotations
 import importlib
 import sys
 
+import warnings
+
+# urllib3 v2 prints a NotOpenSSLWarning on import when the interpreter is
+# linked against LibreSSL instead of OpenSSL, which macOS system Python is.
+# Nothing here makes an HTTPS request through urllib3 - it arrives as a
+# dependency of meshtastic - so the warning is noise on every start with
+# nothing to act on. Filtered by message rather than by category, so a
+# different urllib3 warning would still be seen.
+#
+# It has to sit above the dependency check rather than down with the other
+# imports. That check imports meshtastic.ble_interface, and that is the first
+# thing to pull urllib3 in, so a filter installed further down is installed
+# after the warning has already printed - which is exactly what it did.
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+
 # Check dependencies up front so a missing package fails fast with a plain
 # "pip install X" hint instead of a raw ImportError/traceback from somewhere
 # deep inside textual/meshtastic. meshtastic.ble_interface is checked
@@ -126,16 +141,7 @@ import math
 import threading
 import time
 import unicodedata
-import warnings
 from pathlib import Path
-
-# urllib3 v2 prints a NotOpenSSLWarning on import when the interpreter is linked
-# against LibreSSL instead of OpenSSL, which macOS system Python is. Nothing
-# here makes an HTTPS request through urllib3 - it arrives as a dependency of
-# meshtastic - so the warning is noise on every start and there is nothing to
-# act on. Filtered by message rather than by category, so a different urllib3
-# warning would still be seen, and set before the import chain that triggers it.
-warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 from pubsub import pub
 from textual import work
