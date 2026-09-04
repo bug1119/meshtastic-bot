@@ -157,6 +157,44 @@ python3 -m venv ~/.venvs/meshtastic-bot
 所以 `tail -f` 看得到即時內容。心跳那行的 `封包` 跟狀態列的同一個意思 ——
 包含 position / nodeinfo / telemetry,見[最底下那一列固定狀態列](#最底下那一列固定狀態列)。
 
+### 啟動時會印出本機狀態
+
+UI 版左邊那欄「本機狀態」的內容,server mode 也會印 —— 在節點名稱之後、頻道之前,一個分類一行(實機輸出):
+
+```
+2026-09-04 19:52:11 設定同步完成: BUG1119 !1d7e2212
+2026-09-04 19:52:11 節點: Region=TW 韌體=2.8.0.b2a7635 Role=CLIENT
+2026-09-04 19:52:11 無線電: Preset=MEDIUM_FAST Slot=1 頻率=~920.125 MHz Bandwidth=~250 kHz Tx Power=27 dBm
+2026-09-04 19:52:11 裝置: Uptime=00:16 電量=101% 4.293V Ch.Util=2.7% OK to MQTT=是
+2026-09-04 19:52:11 收訊: 最近收訊=--
+2026-09-04 19:52:11 定位: GPS=已啟用,尚無定位
+2026-09-04 19:52:11 連線: SERIAL /dev/cu.usbmodem2101
+2026-09-04 19:52:11 頻道: #0, #1 SignalTest, #3 EDGE_ATS
+```
+
+**欄位跟 UI 那欄完全一樣**,因為它們讀同一個 `local_status_rows()` —— 一份欄位清單,兩種排版。UI 有 24 欄寬要遷就(長位址會掉到自己的縮排行),log 沒有,所以寬度的處理留在 UI 那邊。
+
+分類是連續的,所以摺成一行不會改變 UI 上的順序:
+
+| 分類 | 內容 |
+|---|---|
+| `節點` | Region、韌體版本、Role |
+| `無線電` | Preset、Slot、頻率、Bandwidth、Tx Power |
+| `裝置` | Uptime、電量與電壓、Ch.Util、OK to MQTT |
+| `收訊` | 最近一次聽到的 SNR / RSSI |
+| `定位` | GPS 狀態 |
+| `連線` | 走哪條路、對面是誰 |
+
+幾個讀法上的細節:
+
+- **`~` 表示那個值是推導出來的**,不是節點報的。preset 設定不會存 bandwidth,`override_frequency` 也是 0,所以這兩個是從 region 與 preset 反推的(見 `lora_params.py`)。
+- **`頻率=無法推導`** 不是壞掉。Slot 留給韌體(`(Auto)`)時,它是用主頻道名稱的 hash 去挑 slot 的,而那個 hash 這邊刻意不重現 —— 印一個自信但錯誤的數字比誠實地說不知道更糟。
+- **`收訊` 在剛啟動時一定是 `--`**,因為那是「最近聽到誰」,而那時還沒聽到任何人。
+- **`OK to MQTT` 是節點自己的 LoRa 設定**(`config_ok_to_mqtt`),跟 [`--mqtt`](#mqtt-橋接--mqtt) 橋接有沒有開是兩件事。
+- **韌體版本不需要額外問**。節點在設定下載時就把 DeviceMetadata 一起送過來了,所以 server 直接就有;UI 版反而要主動 `getMetadata()`,那是個會卡住的 admin 往返,所以它丟到 worker thread 上做。
+
+這段是**包在 try 裡**的:它跑在函式庫的執行緒上,某個韌體用沒預期的形式回報某個欄位,不該讓整台 server 起不來。真的失敗就印一行 `本機狀態讀取失敗: ...`,啟動繼續往頻道和規則走。
+
 ### 先看有哪些裝置
 
 ```
