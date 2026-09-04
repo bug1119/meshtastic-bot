@@ -282,6 +282,49 @@ meshtastic --port /dev/cu.usbmodem2101 --set external_notification.enabled false
 
 ⚠️ **但那是設定,會被改回來。** 從裝置畫面或 app 把 external notification 開回去,舊韌體上迴圈就回來。韌體修過的版本不會。
 
+**修完之後的實機驗證**(刷 `2.8.0.a7fcde3.zh`,把 external notification 開回來才測 —— 關著的話這段程式碼根本不會跑):
+
+| | 修正前 | 修正後 |
+|---|---|---|
+| `esp32-hal-ledc` **錯誤**(`[E]`) | **1128**(佔 log 100%) | **0** |
+| ledc INFO(attach 成功) | 0 | 205 |
+| `[Router]` 正常記錄 | 0(被淹掉) | 338 |
+| 整份 log 的錯誤總數 | 1128 | **12** |
+| panic | 0 | 0 |
+
+120 秒抓取、1759 行。`ledcDetach()` 的 not-attached 警告 **0 次**,證實那支腳每次都真的被佔住 —— 診斷成立。
+
+剩下的 12 個錯誤都跟這個問題無關:10 次[`unhandled fromRadio packet variant: 14`](#device-ui-不處理-mqttclientproxymessage),外加 2 次沒見過的 `[DeviceUI] WTF!? how did we get here??`。
+
+⚠️ **量測時差點又搞錯一次。** 我的驗證腳本 grep 的是檔名 `esp32-hal-ledc` 而不是嚴重性標記,於是把 205 行**成功 attach 的 INFO 訊息**算成錯誤,印出「修正沒達到預期」。真正的差別在那一個字母:
+
+```
+[E][esp32-hal-ledc.c:213] ... Pin 6 is already attached ...   ← 修正前,紅色,拒絕
+[I][esp32-hal-ledc.c:295] ... LEDC attached to pin 6 ...       ← 修正後,綠色,成功
+```
+
+**數 log 要數嚴重性,不要數檔名。**
+
+**還在的行為**:那 205 次成功 attach 分佈在 120 秒裡,也就是每 ~580ms 重新 attach 一次 —— 鈴聲仍然幾乎一啟動就結束然後重播。修正把「每次失敗並噴錯」變成「每次成功」,但底層那個立刻結束的行為沒動(那是上游的事)。現在蜂鳴器應該真的會響。
+
+### 版本字串現在分得出兩份 build
+
+原本兩份 build 都自稱 `2.8.0.b2a7635`,因為長版本是 `{短版本}.{firmware repo 的 sha}`,而它們的差別來自 device-ui 的 symlink,在這個 repo 裡不留痕跡 —— `meshtastic --info` 分不出裝置上刷的是哪一份,只能看螢幕上中文有沒有變方框。
+
+`bin/readprops.py` 現在吃一個 `MESHTASTIC_BUILD_TAG`:
+
+```sh
+MESHTASTIC_BUILD_TAG=zh pio run -e heltec-v4-tft   # -> 2.8.0.a7fcde3.zh
+MESHTASTIC_BUILD_TAG=en pio run -e heltec-v4-tft   # -> 2.8.0.a7fcde3.en
+```
+
+`DeviceMetadata.firmware_version` 是 `char[18]`,只有 17 個可用字元。`2.8.0.` 加 7 碼 sha 已經 13 個,所以 tag 最多 3 個字元 —— **太長會明確報錯,不會被默默截斷**。
+
+⚠️ 那個檢查刻意放在 `try` **外面**。`readProps()` 的 sha 查詢包在一個裸的 `except:` 裡,會吞掉包含 `SystemExit` 在內的一切;第一版寫在裡面的結果是壞 tag 被靜默吞掉、版本退成 `2.8.0`,然後編出一個版本字串錯誤的韌體 —— 正是這個 tag 要防的事。
+
+實機確認:刷完之後 `--info` 回報 `2.8.0.a7fcde3.zh`。
+
+
 ### device-ui 不處理 `mqttClientProxyMessage`
 
 **症狀** 開了 MQTT client proxy 之後,每一筆被代送的訊息都噴一行:
@@ -424,7 +467,7 @@ git am /path/to/patches/*.patch
 ## 還沒解決的
 
 - **六個都沒有回饋上游。** 前四個是 `meshtastic/device-ui` 的問題,別的 TFT 使用者遲早會踩到,尤其 Bug 2(開地圖必炸)—— 而且[上游最新版仍未修](#要升級或重刷之前先看這個)。patch 檔是現成的發 PR 材料。
-- **蜂鳴器那個只用設定繞過,韌體沒改。** 從裝置畫面把 external notification 開回去,錯誤迴圈就回來。
+- **蜂鳴器那個韌體修好了,而且[實機驗證過](#鈴聲每次重播都重複-attach-同一支腳每-25ms-噴一對錯誤)** —— `[E]` 錯誤 1128 → 0。設定層的繞法仍然記著,因為它不用重刷。
 - **中文字型沒有機器外備份。** 352,135 行的工具產物只在本機的 `feat/cjk-only`,產生流程也沒有記錄 —— 這是目前最脆的一環,比任何一個 bug 都值得先處理。
 - **`updatePosition` 附近還有約兩打同樣的 `nodes[...]` 寫法** —— `operator[]` 對 `unordered_map` 會插入 null 再被解參考。目前會炸的那個已經擋掉,其餘沒動:一次改 24 處是另一件工程。
 - **長時間穩定性只觀測到 240 秒。** 需要跑數小時再對一次 `rebootCount` 才算真的確認。
