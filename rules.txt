@@ -190,7 +190,9 @@ RTFM=📖 read the f***ing manual / 自己去看說明書
 AKA=also known as / 又稱
 DIY=🔧 do it yourself / 自己動手
 FAQ=❓ frequently asked questions / 常見問題
-TGIF= Thank God It's Friday / 今天是星期五～
+TGIF=Thank God It's Friday / 今天是星期五～
+WHO=I'm SkyNet...
+IMF=This message will self-destruct in five seconds.. 5..4..3..2..1..
 
 # ---- 小寫版 ----
 lol=😂 laughing out loud / 大笑
@@ -293,4 +295,6 @@ rtfm=📖 read the f***ing manual / 自己去看說明書
 aka=also known as / 又稱
 diy=🔧 do it yourself / 自己動手
 faq=❓ frequently asked questions / 常見問題
-tgif= Thank God It's Friday / 今天是星期五～
+tgif=Thank God It's Friday / 今天是星期五～
+who=I'm SkyNet...
+imf=This message will self-destruct in five seconds.. 5..4..3..2..1..
