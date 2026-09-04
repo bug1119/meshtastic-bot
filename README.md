@@ -335,6 +335,12 @@ macOS 特有的兩件事,程式裡有處理:
 
 **預設關閉是刻意的。** 一個自己啟動的橋接,等於把一個你可能當成私有的 mesh 開始轉發到裝置上寫著的那台 broker —— 而沒改過的設定寫的就是公共那台。要不要把訊息送上網路是一個決定,不該由「bot 開起來了」代你做。
 
+![MQTT 決策路徑](docs/mqtt-decision.png)
+
+要不要加 `--mqtt`,取決於一件事:**節點自己連不連得上網路。** 連得上就不需要,連不上就非它不可 —— 而「連不上」還分成走藍牙(現在沒有)和板子沒有 WiFi 硬體(永遠沒有)兩種,見〈[換算到實際裝置](#換算到實際裝置)〉。
+
+原始檔在 [`docs/mqtt-decision.html`](docs/mqtt-decision.html)。
+
 ### 兩個條件,缺一不可
 
 1. **節點上** `mqtt.enabled` 和 `mqtt.proxy_to_client_enabled` 都要開 —— 這決定節點願不願意把 MQTT 交出來
@@ -378,6 +384,27 @@ else if (isConnectedDirectly()) { ... }
 ```
 
 所以 proxy 不是「多一條路」而是**換一條路**。有 WiFi 還開 proxy,唯一合理的用途是節點的網路連不到 broker、而跑這支程式的機器連得到。
+
+### 換算到實際裝置
+
+| 裝置 | 怎麼連 | `proxy_to_client_enabled` | `--mqtt` |
+|---|---|---|---|
+| **GAT562 30S**(nRF52840) | 藍牙 / USB | **必須開** | **必須加** |
+| Heltec V4(ESP32-S3) | 藍牙 | 必須開 | 必須加 |
+| Heltec V4 | WiFi(`--host`),或 USB 而 WiFi 開著 | **關著** | **不用加** |
+| Heltec V4 | WiFi 開著但節點連不到 broker | 開 | 加(刻意繞經這台機器) |
+
+**nRF52 這類裝置沒有選擇。** `HAS_WIFI 1` 只出現在 `src/platform/esp32/` 和 `src/platform/portduino/`,nRF52 沒有定義,所以 `HAS_NETWORKING` 是 0 —— 而 `MQTT::publish()` 的直連那支是包在 `#if HAS_NETWORKING` 裡的,在這塊板子上**根本沒被編進去**。proxy 沒開就是 `return false`,不存在第二條路。
+
+這跟 Heltec V4 不一樣:Heltec 是「走藍牙所以**現在**沒網路」(執行期的結果),nRF52 是「這塊板子**永遠**不可能有網路」(編譯期就決定)。
+
+**而 nRF52 會講。** 正因為它的 `HAS_NETWORKING` 是 0,`MQTT::isValidConfig()` 的 `#else` 分支**有**編進去,所以設定錯了會拿到 `LOG_ERROR` 加一則 ERROR 級的 ClientNotification,直接推給連著的 client:
+
+> `Invalid MQTT config: proxy_to_client_enabled must be enabled on nodes that do not have a network`
+
+這句診斷**ESP32 看不到、nRF52 看得到** —— 正好跟直覺相反,原因在後面的〈[為什麼韌體不會警告你](#為什麼韌體不會警告你)〉。
+
+（順帶一提,`MESHTASTIC_EXCLUDE_MQTT` 只掛在 `MESHTASTIC_MINIMIZE_BUILD` 底下,而那行預設是註解掉的,所以 nRF52 的標準 build **有**帶 MQTT 模組。跑第三方 fork 的話值得自己確認一次。)
 
 ### 手機 app 裡的 MQTT 設定,不是手機的設定
 

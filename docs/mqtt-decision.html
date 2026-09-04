@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>要不要開 --mqtt</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;600&family=Noto+Serif+TC:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;   /* white-smoke */
+      --color-ink:     #2d3142;   /* jet-black */
+      --color-muted:   #4f5d75;   /* blue-slate */
+      --color-accent:  #eb6c36;   /* atomic-tangerine */
+      --font-sans:     'Geist', 'Noto Sans TC', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif TC', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Flowchart · meshtastic-bot</p>
+    <h1>要不要開 <code>--mqtt</code></h1>
+
+    <svg viewBox="0 0 1000 744" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="mqtt-decision-title mqtt-decision-desc">
+      <title id="mqtt-decision-title">要不要開 --mqtt</title>
+      <desc id="mqtt-decision-desc">決策路徑圖:節點自己連得上網路時,它會直接連 MQTT broker,不需要 --mqtt;連不上時就只剩 client proxy 一條路,要在節點上開 proxy_to_client_enabled 並讓 bot 帶 --mqtt,兩者缺一則訊息會被丟進深度 16 的佇列而消失。</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- ============ ARROWS (drawn first, behind nodes) ============ -->
+
+      <!-- 1 → 2 : start into the first decision -->
+      <line x1="300" y1="96" x2="300" y2="152" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 2 → 3 : has its own network, go right -->
+      <line x1="480" y1="212" x2="656" y2="212" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 2 → 4 : no network, continue down -->
+      <line x1="300" y1="268" x2="300" y2="344" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- 4 → 5 : proxy on — the only working path, coral -->
+      <line x1="300" y1="460" x2="300" y2="556" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+
+      <!-- 4 → 6 : proxy off, messages go nowhere -->
+      <line x1="480" y1="404" x2="656" y2="404" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- ============ ARROW LABELS (masked, 8px clear of the stroke) ============ -->
+
+      <rect x="548" y="192" width="36" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="566" y="201" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle" letter-spacing="0.06em">連得上</text>
+
+      <rect x="310" y="294" width="44" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="332" y="303" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle" letter-spacing="0.06em">連不上</text>
+
+      <rect x="310" y="498" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="326" y="507" fill="#eb6c36" font-size="8" font-weight="600" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle" letter-spacing="0.06em">開了</text>
+
+      <rect x="548" y="384" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="568" y="393" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle" letter-spacing="0.06em">沒開</text>
+
+      <!-- ============ NODES ============ -->
+
+      <!-- 1. Start -->
+      <rect x="180" y="40" width="240" height="56" rx="20" fill="#f5f5f5"/>
+      <rect x="180" y="40" width="240" height="56" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="300" y="74" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">節點的訊息要上 MQTT</text>
+
+      <!-- 2. Decision — does the node have a network of its own -->
+      <polygon points="300,156 480,212 300,268 120,212" fill="#f5f5f5"/>
+      <polygon points="300,156 480,212 300,268 120,212" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="300" y="206" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">節點自己連得上網路?</text>
+      <text x="300" y="226" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" text-anchor="middle">HAS_NETWORKING · isConnectedToNetwork()</text>
+
+      <!-- 3. Outcome — the node connects to the broker itself -->
+      <rect x="660" y="168" width="280" height="88" rx="6" fill="#f5f5f5"/>
+      <rect x="660" y="168" width="280" height="88" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="668" y="176" width="44" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="690" y="185" fill="rgba(45,49,66,0.80)" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DIRECT</text>
+      <text x="800" y="216" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">節點自己連 broker</text>
+      <text x="800" y="236" fill="#4f5d75" font-size="10" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle">proxy 關 · 不用 --mqtt</text>
+
+      <!-- Editorial aside — the exclusivity trap on this branch -->
+      <text x="800" y="292" fill="#4f5d75" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif TC', serif" text-anchor="middle">開了 proxy 反而會斷掉這條路</text>
+
+      <!-- 4. Decision — is the proxy switch on -->
+      <polygon points="300,348 480,404 300,460 120,404" fill="#f5f5f5"/>
+      <polygon points="300,348 480,404 300,460 120,404" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="300" y="398" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">節點上的 proxy 開了嗎?</text>
+      <text x="300" y="418" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" text-anchor="middle">proxy_to_client_enabled</text>
+
+      <!-- 5. Outcome — FOCAL: the client carries it -->
+      <rect x="160" y="560" width="280" height="96" rx="6" fill="#f5f5f5"/>
+      <rect x="160" y="560" width="280" height="96" rx="6" fill="rgba(235,108,54,0.07)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="168" y="568" width="44" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="190" y="577" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PROXY</text>
+      <text x="300" y="608" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">由 client 代連 broker</text>
+      <text x="300" y="628" fill="#4f5d75" font-size="10" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle">節點 proxy 開 · bot 加 --mqtt</text>
+      <text x="300" y="646" fill="#eb6c36" font-size="10" font-weight="600" font-family="'Geist Mono', monospace" text-anchor="middle">bot_server.py --ble X --mqtt</text>
+
+      <!-- 6. Outcome — dead end, the silent one -->
+      <rect x="660" y="360" width="280" height="88" rx="6" fill="#f5f5f5"/>
+      <rect x="660" y="360" width="280" height="88" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="668" y="368" width="56" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
+      <text x="696" y="377" fill="rgba(45,49,66,0.70)" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DROPPED</text>
+      <text x="800" y="408" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans TC', sans-serif" text-anchor="middle">訊息安靜地不見</text>
+      <text x="800" y="428" fill="#4f5d75" font-size="10" font-family="'Geist Mono', 'Noto Sans TC', monospace" text-anchor="middle">深度 16 佇列,滿了丟最舊</text>
+
+      <!-- Editorial aside — why nothing tells you -->
+      <text x="800" y="484" fill="#4f5d75" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif TC', serif" text-anchor="middle">有 WiFi 硬體的板子連警告都看不到</text>
+
+      <!-- ============ LEGEND ============ -->
+      <line x1="40" y1="696" x2="960" y2="696" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="40" y="716" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="140" y="708" width="16" height="10" rx="5" fill="#ffffff" stroke="#2d3142" stroke-width="0.8"/>
+      <text x="164" y="716" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace">起點</text>
+
+      <polygon points="288,708 300,713 288,718 276,713" fill="#ffffff" stroke="#2d3142" stroke-width="0.8"/>
+      <text x="308" y="716" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace">判斷</text>
+
+      <rect x="428" y="708" width="16" height="10" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="0.8"/>
+      <text x="452" y="716" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace">結果</text>
+
+      <rect x="572" y="708" width="16" height="10" rx="2" fill="rgba(235,108,54,0.07)" stroke="#eb6c36" stroke-width="0.8"/>
+      <text x="596" y="716" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace">要加 --mqtt 才通</text>
+
+      <rect x="780" y="708" width="16" height="10" rx="2" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.20)" stroke-width="0.8" stroke-dasharray="4,3"/>
+      <text x="804" y="716" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans TC', monospace">訊息掉了,而且沒人說</text>
+    </svg>
+  </div>
+</body>
+</html>
