@@ -49,6 +49,8 @@ MediumFast
 MeshTW
 
 [*]
+# 雙方座標與距離。方括號那行本來就有 dist=,但沒有算出它的座標。
+gps=我 %my_pos% · 你 %their_pos% · %dist%
 mdfk=ㄇㄉㄈㄎ
 Hi=Hello
 ping=pong

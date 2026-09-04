@@ -696,6 +696,10 @@ def test_dm_replies():
     app._channel_sections = lambda i: bot.MeshtasticTUI._channel_sections(app, i)
     app._reply_sections = lambda t, c: bot.MeshtasticTUI._reply_sections(app, t, c)
     app._distance_to = lambda n: None
+    # Same reason as _distance_to: the reply carries both ends now, and
+    # this stub stands in for the pair of lookups that provide them.
+    app._my_position = lambda: None
+    app._position_of = lambda n: None
 
     bot.MeshtasticTUI._maybe_auto_reply(
         app, app.interface, ("node", "!them"), "hi", when="12:34:56",
@@ -3086,6 +3090,122 @@ def test_incoming_line_uses_the_channel_label():
     check("a DM is unchanged", "node:!them" in out2.getvalue(), True)
 
 
+def test_reply_variables():
+    print("a reply can carry the positions dist was computed from")
+    here, there = (25.0, 121.3304), (25.0113225, 121.4267888)
+    info = {"my_pos": here, "their_pos": there, "distance_m": 9800.0}
+    check(
+        "both ends and the distance",
+        bot.expand_reply_vars("我 %my_pos% · 你 %their_pos% · %dist%", info),
+        "我 25.0000,121.3304 · 你 25.0113,121.4268 · 9.8km",
+    )
+    check(
+        "the halves are addressable too",
+        bot.expand_reply_vars("%my_lat%/%my_lon% %their_lat%/%their_lon%", info),
+        "25.0000/121.3304 25.0113/121.4268",
+    )
+    # "--" rather than a hole: the bracket line drops a field it cannot fill,
+    # but inside a reply the operator wrote, a gap mid-sentence reads as a bug.
+    blank = {"my_pos": None, "their_pos": None, "distance_m": None}
+    check(
+        "unavailable values say so",
+        bot.expand_reply_vars("我 %my_pos% · 你 %their_pos% · %dist%", blank),
+        "我 -- · 你 -- · --",
+    )
+    check(
+        "one end missing is still useful",
+        bot.expand_reply_vars(
+            "%my_pos% / %their_pos%", {"my_pos": here, "their_pos": None}
+        ),
+        "25.0000,121.3304 / --",
+    )
+    # Left as written, so a typo shows up as itself and a stray percent sign in
+    # a reply survives.
+    check("an unknown name is left alone",
+          bot.expand_reply_vars("%bogus%", info), "%bogus%")
+    check("a bare percent is untouched",
+          bot.expand_reply_vars("100% sure", info), "100% sure")
+    check("no percent, no work", bot.expand_reply_vars("plain", info), "plain")
+
+
+def test_reply_variables_cannot_reach_into_the_program():
+    print("rules.txt cannot address anything not on the whitelist")
+    # A whitelist rather than a format string on purpose: str.format and
+    # format_map walk attributes, so "{a.__class__}" in a rules file would
+    # reach the program's own objects - and rules.txt is a file an operator
+    # edits casually, reloaded on every message.
+    src = inspect.getsource(bot.expand_reply_vars)
+    check("no format()", ".format(" in src, False)
+    check("no format_map()", "format_map" in src, False)
+    check("no eval", "eval(" in src, False)
+    info = {"my_pos": (1.0, 2.0), "their_pos": None, "distance_m": None}
+    for hostile in ("{0.__class__}", "{}", "{info}", "%__class__%", "%%my_pos%%"):
+        got = bot.expand_reply_vars(hostile, info)
+        check(f"{hostile!r} is not interpreted",
+              got == hostile or got == hostile.replace("%my_pos%", "1.0000,2.0000"),
+              True)
+    check("the whitelist is what it says",
+          sorted(bot.REPLY_VARS),
+          ["dist", "my_lat", "my_lon", "my_pos", "their_lat", "their_lon", "their_pos"])
+
+
+def test_gps_rule_end_to_end():
+    print("the shipped gps rule answers with both positions")
+    out = io.StringIO()
+    server, sent = _fake_server(bot.DEFAULT_RULES, out)
+    server.here = (25.0, 121.3304)
+    server.interface.nodes["!them"] = {
+        "user": {"shortName": "Bug2"},
+        "position": {
+            "latitudeI": int(25.0113225 * 1e7),
+            "longitudeI": int(121.4267888 * 1e7),
+        },
+    }
+    server.on_receive(_text_packet("gps", bot.BROADCAST_ADDR, 601), server.interface)
+    check("it replied", len(sent), 1)
+    body = sent[0][0].splitlines()[0]
+    check("our position", "25.0000,121.3304" in body, True)
+    check("their position", "25.0113,121.4268" in body, True)
+    check("the distance", "9.8km" in body, True)
+    check("still prefixed, so it never answers itself",
+          body.startswith(bot.BOT_REPLY_PREFIX), True)
+    # A reply is one LoRa payload; a rule that needs two is a rule that gets
+    # truncated somewhere out of sight.
+    check("fits in a text payload", len(sent[0][0].encode()) < 200, True)
+    check("shipped in the defaults", "gps=" in bot.DEFAULT_RULES, True)
+    check("documented in the same header",
+          "%their_pos%" in bot.DEFAULT_RULES, True)
+    check("one implementation in both files",
+          inspect.getsource(bot.expand_reply_vars)
+          == inspect.getsource(bot_server.expand_reply_vars),
+          True)
+
+
+def test_a_failed_send_is_reported_not_swallowed():
+    print("a send that fails says so, instead of looking like no match")
+    # on_receive runs on the library's publishing thread, so an exception here
+    # escapes into that thread and is swallowed - the reply does not happen and
+    # nothing says why, which is indistinguishable from the rules not matching.
+    # A BLE link whose notifications never subscribed fails exactly like this.
+    out = io.StringIO()
+    server, sent = _fake_server("[*]\nping=pong\n", out)
+
+    def refuses(text, **kw):
+        raise OSError("Encryption is insufficient.")
+
+    server.interface.sendText = refuses
+    server.on_receive(_text_packet("ping", bot.BROADCAST_ADDR, 701), server.interface)
+    log = out.getvalue()
+    check("the failure is in the log", "回覆送出失敗" in log, True)
+    check("with the reason", "Encryption is insufficient" in log, True)
+    check("and where it was going", "channel:" in log, True)
+    check("nothing was sent", sent, [])
+    # The counter is what a heartbeat reports, so a failed send must not inflate
+    # it - a server claiming replies it never made is worse than a quiet one.
+    check("not counted as a reply", server.sent_auto_count, 0)
+    check("no markup in the server's stream", "[red]" in log, False)
+
+
 def test_mqtt_bridge_is_in_both_files():
     print("the bridge exists in bot_dual and in the generated bot_server")
     # bot_server.py is generated by stripping the UI. A feature that lands in
@@ -3209,6 +3329,10 @@ if __name__ == "__main__":
         test_a_timed_out_close_does_not_hand_the_exit_to_atexit()
         test_channel_label_carries_the_name()
         test_incoming_line_uses_the_channel_label()
+        test_reply_variables()
+        test_reply_variables_cannot_reach_into_the_program()
+        test_gps_rule_end_to_end()
+        test_a_failed_send_is_reported_not_swallowed()
     finally:
         bot.RULES_FILE = original
 
