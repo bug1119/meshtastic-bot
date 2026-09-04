@@ -244,6 +244,10 @@ $ kill 98523
 | textual | 8.2.8(`bot_server.py` 不需要) |
 | 實測節點 | GAT562 (`Bug2_1ca6`) 走 BLE、Heltec V4 TFT 走 USB / WiFi |
 
+那台 Heltec V4 TFT 的韌體踩到四個上游 `device-ui` 的 bug(每 55 秒重開、開地圖必炸),
+成因、解 backtrace 的方法與修法整理在 **[`docs/firmware/`](docs/firmware/)**。跟這支 bot 無關,
+但同一台節點,查起來會用到。
+
 **BLE 只在 macOS 驗過。** Linux 上 bleak 走的是 BlueZ,行為不同(尤其配對與掃描),
 沒試過。USB serial 與 TCP 兩條路沒有平台相依的東西,但也沒在別的系統上跑過。
 
