@@ -2,7 +2,7 @@
 
 這台節點(`BUG1119` / `!1d7e2212`,Heltec V4 TFT)曾經**每 55 秒重開一次**,`rebootCount` 一個下午從 198 爬到 267。原因是 `meshtastic/device-ui` 裡的四個 bug —— **全部都是上游的**,不是本地改壞的。
 
-後來又找到兩個,沒有動程式碼:一個是蜂鳴器和 TFT 背光搶 LEDC timer(用設定繞過),一個是 device-ui 不認識 MQTT proxy 的封包(只是雜訊)。合計六個。
+後來又找到兩個,都不在 device-ui:一個是鈴聲每次重播都重複 attach 蜂鳴器那支腳,把 log 洗到滿(在 `meshtastic-firmware` 修掉了);一個是 device-ui 不認識 MQTT proxy 的封包,只是雜訊(沒修)。合計六個。
 
 這份文件記錄:每個 bug 的症狀、解出來的 backtrace、真正的成因、修法,以及**怎麼自己解 backtrace**(這是整件事裡最值得帶走的一招)。
 
@@ -208,11 +208,11 @@ if (currentSize > c_maxFileSize - c_maxLen) {
 
 ---
 
-## 另外兩個:找到了,但沒修
+## 另外兩個
 
-這兩個不在上面的四個裡,因為它們**沒有動到程式碼** —— 一個用設定繞過,一個只是雜訊。都沒有回饋上游。
+這兩個不在上面的四個裡,因為它們不在 device-ui 裡:一個在 `meshtastic-firmware`(已修),一個是 device-ui 的 log 雜訊(沒修)。兩個都沒有回饋上游。
 
-### 蜂鳴器的 PWM 和 TFT 背光搶同一組 LEDC timer
+### 鈴聲每次重播都重複 attach 同一支腳,每 25ms 噴一對錯誤
 
 **症狀** 裝置看起來像壞掉但**其實沒有重開**。serial 上每 ~70ms 噴一對錯誤,而且不會停:
 
@@ -223,36 +223,64 @@ if (currentSize > c_maxFileSize - c_maxLen) {
 
 實測 12 分鐘的抓取裡,**1128 行有 1128 行是這個** —— 也就是 100%。`[Router]`、MQTT 那些真正有用的記錄全被沖掉,所以第一眼會以為裝置死了。
 
-**成因** `variants/esp32s3/heltec_v4/platformio.ini` 同時給了:
+**成因** —— 我第一次的判斷是錯的,而錯的方式很典型:我照著錯誤訊息的字面讀。
 
-```ini
--D LGFX_PIN_BL=21          # TFT 背光,用 LEDC 調亮度
--D PIN_BUZZER=6            # 蜂鳴器,用 LEDC 發音
+第二行寫「No free timers available」,所以我推論是 TFT 背光(`LGFX_PIN_BL=21`)先把 LEDC timer 佔走、蜂鳴器(`PIN_BUZZER=6`)拿不到。**那不是原因。** 讀了核心的實作才看清楚(`esp32-hal-ledc.c:211`):
+
+```c
+ledc_channel_handle_t *bus = perimanGetPinBus(pin, ESP32_BUS_TYPE_LEDC);
+if (bus != NULL) {
+    log_e("Pin %u is already attached to LEDC (channel %u, resolution %u)", ...);
+    return false;                      // ← 對「已經 attach 的腳」直接拒絕
+}
 ```
 
-ESP32-S3 的 LEDC low-speed timer 數量有限,背光先佔走,蜂鳴器再要就拿不到。而節點上:
+錯誤第一行自己就說了 **pin 6 已經 attach 成功、在 channel 1** —— 蜂鳴器**拿到了** channel。「No free timers」是 wrapper 在 per-pin 拒絕之後印的次要訊息,跟背光無關。
 
+真正的缺陷在鈴聲函式庫(`NonBlockingRTTTL`):
+
+```c
+void toneSetup(uint8_t pin) {
+  ledcAttach(pin, 1000, LEDC_RESOLUTION);   // 無條件 attach,freq=1000 resolution=10
+}
 ```
-external_notification.enabled       = True
-external_notification.use_pwm       = True
-external_notification.output_buzzer = 6
-external_notification.alert_message_buzzer = True
-external_notification.nag_timeout   = 15
+
+`toneSetup()` 由 `begin()` 呼叫,而 `begin()` 每次重播都會呼叫它。這支腳在那之前**一定已經被佔住** —— `buzz.cpp` 的開機音效用 `tone()` 用過它,之後每次重播都是我們自己。所以每次 `begin()` 都固定噴那一對錯誤。
+
+而 `ExternalNotificationModule::runOnce()` 的這一段:
+
+```cpp
+if (rtttl::isPlaying()) { rtttl::play(); }
+else if (isNagging && !Throttle::deadlinePassed(nagCycleCutoff)) {
+    rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+}
+delay = EXT_NOTIFICATION_FAST_THREAD_MS;   // 25
 ```
 
-每則訊息都要響、nag 15 秒。這片 mesh 有 114 個節點在線,訊息不斷,所以 nag 幾乎不會結束 → 永久重試 → 永久洗 log。
+歌曲沒在播的時候,這條分支就以 **25ms** 的間隔一直跑。所以一對錯誤變成一秒好幾對,而 nag 是每則訊息 15 秒 —— 這片 mesh 有 114 個節點在線,nag 幾乎不會結束。
 
-**這是 TFT build 才有的衝突**:OLED 版沒有背光 PWM,timer 就夠用。
+**修法**(`src/modules/ExternalNotificationModule.cpp`):重播之前先放掉那支腳。
 
-**繞過(設定,不是修)**
+```cpp
+} else if (isNagging && !Throttle::deadlinePassed(nagCycleCutoff)) {
+    ledcDetach(config.device.buzzer_gpio);
+    rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+}
+```
+
+`ledcDetach()` 對「沒有 attach 的腳」也會印一行,所以在完全沒人用過那支腳的情況下,開機時會多一行 —— 用一行換掉幾千行。
+
+**附帶效果:蜂鳴器現在真的會響。** 之前 attach 被拒絕,音調其實根本沒送到腳上。如果你不想聽到聲音,關掉 external notification(下面那條指令)而不是靠這個 bug。
+
+**設定層的繞法**(不想重刷韌體就用這個):
 
 ```sh
 meshtastic --port /dev/cu.usbmodem2101 --set external_notification.enabled false
 ```
 
-實測:`esp32-hal-ledc` 錯誤從 100% 降到 **0**,`[Router]` 記錄在 100 秒內回來 76 行,MQTT 橋接不受影響。裝置會重開一次才生效。
+實測:`esp32-hal-ledc` 錯誤從佔滿 100% 的 log 降到 **0**,`[Router]` 記錄在 100 秒內回來 76 行,MQTT 橋接不受影響。裝置會重開一次才生效。
 
-⚠️ **這是設定,所以會被改回來。** 從裝置畫面或 app 把 external notification 開回去,迴圈就回來。真正的修法要動韌體:讓兩者共用同一個 timer(相同 freq/resolution 就能共用,錯誤訊息自己講了),或在拿不到 timer 時安靜地放棄而不是每 70ms 重試。
+⚠️ **但那是設定,會被改回來。** 從裝置畫面或 app 把 external notification 開回去,舊韌體上迴圈就回來。韌體修過的版本不會。
 
 ### device-ui 不處理 `mqttClientProxyMessage`
 
