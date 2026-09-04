@@ -2638,12 +2638,18 @@ class ServerBot(ReplyEngine):
         except Exception as exc:  # noqa: BLE001
             self.log(f"關閉介面時出錯,忽略: {exc}")
 
-    def _shutdown(self, interface) -> None:
-        """Close the interface, but not at any price.
+    def _shutdown(self, interface) -> bool:
+        """Close the interface, but not at any price. True if it really closed.
 
         On a side thread with a deadline, because close() is the call that was
         observed hanging. The thread is a daemon, so a close that never finishes
         cannot keep the process alive either.
+
+        The return value matters because close() is also where meshtastic
+        unregisters the atexit handler it installed for client.disconnect. A
+        close that never finished never got there, so a normal exit would still
+        run that handler and hang - the deadline would have bounded the waiting
+        and nothing else. The caller uses this to leave without atexit.
         """
         self._closing = True
         # Before the interface, so the relay stops handing it work while it is
@@ -2658,6 +2664,8 @@ class ServerBot(ReplyEngine):
         closer.join(self.CLOSE_TIMEOUT)
         if closer.is_alive():
             self.log(f"介面關閉逾時 ({self.CLOSE_TIMEOUT}s),不再等待")
+            return False
+        return True
 
     def run(self, transport: str, address: str) -> int:
         """Connect and serve until stopped. Returns a process exit code."""
@@ -2667,6 +2675,28 @@ class ServerBot(ReplyEngine):
 
         if transport == TRANSPORT_TCP:
             self.tcp_host = address
+        # Handlers before the connect, not after it. A BLE connect takes about
+        # half a minute, and until these are installed a Ctrl-C in that window
+        # is a plain KeyboardInterrupt inside the library - which registers
+        # client.disconnect with atexit (ble_interface.py) and only unregisters
+        # it in close(). Interpreter shutdown then calls that handler, it
+        # dispatches onto an asyncio loop that is going away, and the process
+        # hangs until SIGKILL. That is the whole of the "sometimes": the
+        # handler only exists once the client object does.
+        #
+        # Nothing is built yet here, so leaving hard is the correct response -
+        # and os._exit is the point, because it skips the atexit handler that
+        # does the hanging.
+        def _abort_before_connect(*_):
+            self.log("連線建立中被中斷,直接離開")
+            sys.stdout.flush()
+            if self._out:
+                self._out.flush()
+            os._exit(130)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, _abort_before_connect)
+
         self.log(f"連線 {transport}:{address} ...")
         try:
             interface = open_interface(transport, address)
@@ -2676,6 +2706,8 @@ class ServerBot(ReplyEngine):
         self.connected_key = f"{transport}:{address}"
         self._adopt(interface, transport)
 
+        # There is state worth closing now, so swap the hard abort for the
+        # graceful path.
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, self.stop)
         # The library drives everything from its own reader and publishing
@@ -2688,8 +2720,15 @@ class ServerBot(ReplyEngine):
             self.log(self._heartbeat_line())
 
         self.log("停止中...")
-        self._shutdown(interface)
+        closed = self._shutdown(interface)
         self.log(f"已停止。{self._heartbeat_line()}")
+        if not closed:
+            # The last line is out; leave before atexit can run the disconnect
+            # that the timed-out close() never unregistered.
+            sys.stdout.flush()
+            if self._out:
+                self._out.flush()
+            os._exit(0)
         return 0
 
 
