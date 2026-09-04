@@ -335,6 +335,83 @@ macOS 特有的兩件事,程式裡有處理:
 
 **預設關閉是刻意的。** 一個自己啟動的橋接,等於把一個你可能當成私有的 mesh 開始轉發到裝置上寫著的那台 broker —— 而沒改過的設定寫的就是公共那台。要不要把訊息送上網路是一個決定,不該由「bot 開起來了」代你做。
 
+### 兩個條件,缺一不可
+
+1. **節點上** `mqtt.enabled` 和 `mqtt.proxy_to_client_enabled` 都要開 —— 這決定節點願不願意把 MQTT 交出來
+2. **這支程式**要帶 `--mqtt` —— 這決定有沒有人接
+
+只做第一件,節點把訊息交出來但沒人接;只做第二件,橋接啟動不了。兩種都是訊息安靜地不見。
+
+差別是這支程式**會講**是哪一個沒到位,這正是韌體不做的事:
+
+```
+MQTT: 節點的 mqtt.enabled 是關的,不啟動橋接
+MQTT: 節點的 proxy_to_client_enabled 是關的,不啟動橋接
+```
+
+### 藍牙、WiFi、USB 都可以,但意義不同
+
+橋接是搭在**「client 連線」**上的,不管那條連線是什麼 —— 它就是對手上那個 interface 物件呼叫 `sendMqttClientProxyMessage()`,`BLEInterface` / `TCPInterface` / `SerialInterface` 一視同仁。程式裡沒有任何連線方式的限制,唯一一條檢查是 `--mqtt` 要跟 `--server` 一起用。
+
+```sh
+./bot_server.py --ble Bug2_1ca6 --mqtt                    # 藍牙
+./bot_server.py --port /dev/cu.usbmodem1101 --mqtt        # USB serial
+./bot_server.py --host 192.168.1.50 --mqtt                # WiFi / TCP
+```
+
+但三種情境下這個參數的必要性不一樣:
+
+| 連線方式 | 節點自己有網路嗎 | `--mqtt` 的角色 |
+|---|---|---|
+| **藍牙** | **沒有** —— ESP32 只在 WiFi 不可用時才開 BLE | **必要**,唯一出路 |
+| **USB serial** | 看 WiFi 有沒有開;關著就沒有 | WiFi 關著時**必要** |
+| **WiFi / TCP** | **一定有**(不然連不到它) | **多繞一圈**,節點本來就能自己送 |
+
+最後一列要特別小心:你能用 `--host` 連上它,就代表它有網路、本來就會自己連 broker。這時候把 `proxy_to_client_enabled` 打開,反而讓**節點停止自己連** —— `MQTT::publish()` 裡 proxy 那支直接 `return`,底下的 `else if (isConnectedDirectly())` 永遠不會跑到:
+
+```c
+if (moduleConfig.mqtt.proxy_to_client_enabled) {
+    service->sendMqttMessageToClientProxy(msg);
+    return;                        // ← 互斥,不會落到直連
+}
+else if (isConnectedDirectly()) { ... }
+```
+
+所以 proxy 不是「多一條路」而是**換一條路**。有 WiFi 還開 proxy,唯一合理的用途是節點的網路連不到 broker、而跑這支程式的機器連得到。
+
+### 手機 app 裡的 MQTT 設定,不是手機的設定
+
+這點很容易誤解:手機 app 的 MQTT 畫面是在編輯**節點上的** `moduleConfig.mqtt`,手機自己沒有 broker 設定。所以「手機 app 設好了 MQTT」等於「節點的 MQTT 設定填好了」,跟誰來連 broker 是兩回事。
+
+手機 app 唯一多做的事,是它**內建了 client proxy 的那一半**。所以節點只要開了 proxy、手機連著,就會通;把手機換成這支程式,就得靠 `--mqtt` 補上同一半。
+
+### 為什麼韌體不會警告你
+
+節點沒有網路、proxy 又關著的時候,MQTT **連嘗試都不會嘗試**(`src/mqtt/MQTT.cpp`):
+
+```c
+bool wantsLink()
+{
+    return hasChannelorMapReport &&
+           (moduleConfig.mqtt.proxy_to_client_enabled || isConnectedToNetwork());
+}
+```
+
+封包則落到 `else` 那支,進一個深度 16 的佇列,滿了就丟最舊的:
+
+```
+LOG_INFO("MQTT not connected, queue packet");
+LOG_WARN("MQTT queue is full, discard oldest");
+```
+
+韌體其實**有**一句話正是為這個情況寫的:
+
+> `Invalid MQTT config: proxy_to_client_enabled must be enabled on nodes that do not have a network`
+
+**但有 WiFi 硬體的板子看不到它。** 它在 `#if HAS_NETWORKING` 的 `#else` 分支裡,而 `HAS_NETWORKING` 是 `HAS_WIFI || HAS_ETHERNET`(`src/configuration.h`)—— **編譯期**的板子能力,不是執行期「現在有沒有連上」。Heltec V4 有 WiFi 硬體,所以那句錯誤根本沒被編進去;走的是另一支,它只在 `isConnectedToNetwork()` 為真時去測 broker 通不通,而走 BLE 時這個是假,於是**什麼都不做,設定照存,零錯誤零警告**。
+
+也就是說:那句診斷只給沒有 WiFi 硬體的板子看,而 ESP32 全系列都有。設定看起來完全正常、訊息就是不會出去,也沒有任何一行 log 說為什麼 —— 這是設定 MQTT 時最花時間的一個坑。
+
 ### broker 從節點讀,不寫在這裡
 
 address / username / password / root / TLS 全部在**連上之後從節點讀**(`localNode.moduleConfig.mqtt`),所以在裝置上改完、重連一次就生效,程式裡不用跟著改。只有欄位是空的才退回韌體自己的預設值(`src/mesh/Default.h`):`mqtt.meshtastic.org`、`meshdev` / `large4cats`、root `msh`。
