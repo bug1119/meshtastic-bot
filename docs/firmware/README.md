@@ -1,6 +1,8 @@
-# Heltec V4 TFT 韌體:四個上游 device-ui bug 與修法
+# Heltec V4 TFT 韌體:上游 bug 與修法
 
 這台節點(`BUG1119` / `!1d7e2212`,Heltec V4 TFT)曾經**每 55 秒重開一次**,`rebootCount` 一個下午從 198 爬到 267。原因是 `meshtastic/device-ui` 裡的四個 bug —— **全部都是上游的**,不是本地改壞的。
+
+後來又找到兩個,沒有動程式碼:一個是蜂鳴器和 TFT 背光搶 LEDC timer(用設定繞過),一個是 device-ui 不認識 MQTT proxy 的封包(只是雜訊)。合計六個。
 
 這份文件記錄:每個 bug 的症狀、解出來的 backtrace、真正的成因、修法,以及**怎麼自己解 backtrace**(這是整件事裡最值得帶走的一招)。
 
@@ -206,6 +208,95 @@ if (currentSize > c_maxFileSize - c_maxLen) {
 
 ---
 
+## 另外兩個:找到了,但沒修
+
+這兩個不在上面的四個裡,因為它們**沒有動到程式碼** —— 一個用設定繞過,一個只是雜訊。都沒有回饋上游。
+
+### 蜂鳴器的 PWM 和 TFT 背光搶同一組 LEDC timer
+
+**症狀** 裝置看起來像壞掉但**其實沒有重開**。serial 上每 ~70ms 噴一對錯誤,而且不會停:
+
+```
+[E][esp32-hal-ledc.c:213] ledcAttachChannel(): Pin 6 is already attached to LEDC (channel 1, resolution 10)
+[E][esp32-hal-ledc.c:328] ledcAttach(): No free timers available for freq=1000, resolution=10
+```
+
+實測 12 分鐘的抓取裡,**1128 行有 1128 行是這個** —— 也就是 100%。`[Router]`、MQTT 那些真正有用的記錄全被沖掉,所以第一眼會以為裝置死了。
+
+**成因** `variants/esp32s3/heltec_v4/platformio.ini` 同時給了:
+
+```ini
+-D LGFX_PIN_BL=21          # TFT 背光,用 LEDC 調亮度
+-D PIN_BUZZER=6            # 蜂鳴器,用 LEDC 發音
+```
+
+ESP32-S3 的 LEDC low-speed timer 數量有限,背光先佔走,蜂鳴器再要就拿不到。而節點上:
+
+```
+external_notification.enabled       = True
+external_notification.use_pwm       = True
+external_notification.output_buzzer = 6
+external_notification.alert_message_buzzer = True
+external_notification.nag_timeout   = 15
+```
+
+每則訊息都要響、nag 15 秒。這片 mesh 有 114 個節點在線,訊息不斷,所以 nag 幾乎不會結束 → 永久重試 → 永久洗 log。
+
+**這是 TFT build 才有的衝突**:OLED 版沒有背光 PWM,timer 就夠用。
+
+**繞過(設定,不是修)**
+
+```sh
+meshtastic --port /dev/cu.usbmodem2101 --set external_notification.enabled false
+```
+
+實測:`esp32-hal-ledc` 錯誤從 100% 降到 **0**,`[Router]` 記錄在 100 秒內回來 76 行,MQTT 橋接不受影響。裝置會重開一次才生效。
+
+⚠️ **這是設定,所以會被改回來。** 從裝置畫面或 app 把 external notification 開回去,迴圈就回來。真正的修法要動韌體:讓兩者共用同一個 timer(相同 freq/resolution 就能共用,錯誤訊息自己講了),或在拿不到 timer 時安靜地放棄而不是每 70ms 重試。
+
+### device-ui 不處理 `mqttClientProxyMessage`
+
+**症狀** 開了 MQTT client proxy 之後,每一筆被代送的訊息都噴一行:
+
+```
+ERROR | [DeviceUI] unhandled fromRadio packet variant: 14
+```
+
+**成因** `FromRadio` 的欄位 14 就是 `mqttClientProxyMessage`(用 `mesh_pb2.FromRadio.DESCRIPTOR.fields_by_number` 查得到)。device-ui 跟著 radio 的 fromRadio 流走,遇到它不認識的 variant 就以 `LOG_ERROR` 記一筆。
+
+**不會崩,只是雜訊** —— 但頻率跟 MQTT 上行一樣,在忙的 mesh 上就是持續的假錯誤。它也讓真正的錯誤更難被看到。
+
+**修法** device-ui 對這個 variant 應該安靜地忽略(它本來就不是給 UI 的),而不是記成錯誤。沒有改。
+
+---
+
+## 要升級或重刷之前,先看這個
+
+**patch 不能套在已經編好的韌體上。** 它們是 device-ui 的 source patch,一定要重編。
+
+**刷任何官方版都會把 Bug 1 和 Bug 2 帶回來。** 這不是「舊版才有」的問題 —— 查過上游最新的 `9c97e42`(比這裡的基底多 23 個 commit):
+
+| | 上游 `9c97e42` 的狀態 |
+|---|---|
+| `PNGdecoder.cpp` 的 `MALLOC_CAP_32BIT` | **還在** —— 開地圖仍會 reboot |
+| `addOrUpdateMap` 的 null 容器 | **還在** —— 仍會每 55 秒 StoreProhibited |
+
+中文字型當然也會一起消失。
+
+**好消息:五個 patch 全部乾淨套用在上游最新版上**(逐一 `git apply --check` 驗過),所以要跟上游就是:
+
+```sh
+git clone https://github.com/meshtastic/device-ui.git && cd device-ui
+git am /path/to/patches/*.patch
+```
+
+然後照〈[怎麼重現這個 build](#怎麼重現這個-build)〉重編。
+
+⚠️ **中文字型是這裡最脆的一環。** 那個 commit 是 352,135 行工具產物,只存在本機的 `feat/cjk-only` 分支,**沒有機器外備份,產生它的流程也沒有記錄下來**。五個修正有 patch 備份,字型沒有。要重建就得重跑一次字型產生,而怎麼跑目前只在當時的記憶裡。
+
+
+---
+
 ## 修完的量測結果
 
 | | 修正前 | 修正後 |
@@ -304,7 +395,9 @@ git am /path/to/patches/*.patch
 
 ## 還沒解決的
 
-- **這四個修正沒有回饋上游。** 全都是 `meshtastic/device-ui` 的問題,別的 TFT 使用者遲早會踩到,尤其 Bug 2(開地圖必炸)。
+- **六個都沒有回饋上游。** 前四個是 `meshtastic/device-ui` 的問題,別的 TFT 使用者遲早會踩到,尤其 Bug 2(開地圖必炸)—— 而且[上游最新版仍未修](#要升級或重刷之前先看這個)。patch 檔是現成的發 PR 材料。
+- **蜂鳴器那個只用設定繞過,韌體沒改。** 從裝置畫面把 external notification 開回去,錯誤迴圈就回來。
+- **中文字型沒有機器外備份。** 352,135 行的工具產物只在本機的 `feat/cjk-only`,產生流程也沒有記錄 —— 這是目前最脆的一環,比任何一個 bug 都值得先處理。
 - **`updatePosition` 附近還有約兩打同樣的 `nodes[...]` 寫法** —— `operator[]` 對 `unordered_map` 會插入 null 再被解參考。目前會炸的那個已經擋掉,其餘沒動:一次改 24 處是另一件工程。
 - **長時間穩定性只觀測到 240 秒。** 需要跑數小時再對一次 `rebootCount` 才算真的確認。
 
