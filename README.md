@@ -706,7 +706,7 @@ BOT: pong
 
 ## 已知限制
 
-- **MQTT 橋接還沒在實機節點上跑過整段。** broker 那半邊是對真的 `mqtt.meshtastic.org` 驗過的(TLS 8883、節點的帳密、CONNACK、訂閱,並真的收到下行封包交給 `sendMqttClientProxyMessage`);但「節點 → 這支程式 → broker」的上行,以及下行真的被節點解開,尚未在硬體上確認
+- **MQTT 橋接的上行還沒整段驗證。** 兩端各自都驗過了:broker 那半邊對真的 `mqtt.meshtastic.org` 跑過(TLS 8883、節點的帳密、CONNACK、訂閱,並收到真實下行封包交給 `sendMqttClientProxyMessage`);節點那半邊也在實機 serial 上看到了 —— `Send mqtt msg on topic 'msh/TW/2/e/MediumFast/!1d7e2212' to proxy client`,而且那個 topic 正是從節點自己 publish 的內容學來的。**還沒確認的是中間那一段**:交出來的封包真的被送上 broker,以及下行真的被節點解開
 - **`--wifi` 的實際寫入尚未在硬體上驗證過**(開發時裝置斷電了)。第一次使用請留意重開機行為
 - 韌體一次只接受**一條** TCP 連線,新連線會強制踢掉舊的 —— bot 連上時手機 app 會被踢掉,反之亦然
 - 關閉連線時 meshtastic 套件自己的 heartbeat thread 可能噴一個 `BrokenPipeError` traceback。那是套件內部的競態,資料不受影響
