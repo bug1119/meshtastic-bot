@@ -286,6 +286,22 @@ WiFi 開著,藍牙**永遠不會啟動**,而且 ESP32 會直接釋放 BT 記憶�
 
 ---
 
+## Patch 檔
+
+五個修正的完整 patch(含 commit message 裡的推理)在 **[`patches/`](patches/)**,`git format-patch` 產出,共 20KB。
+
+全部驗證過能**乾淨套用在官方原版 `e1de01e` 上**,而且彼此獨立 —— 可以只挑要的:
+
+```sh
+git clone https://github.com/meshtastic/device-ui.git && cd device-ui
+git checkout e1de01e
+git am /path/to/patches/*.patch
+```
+
+中文字型那個 commit **沒有做成 patch** —— 它是 352,135 行由工具產生的字符資料,是產物不是原始碼。它跟這五個修正也完全獨立(只動 `generated/`,修正只動 `source/`)。
+
+---
+
 ## 還沒解決的
 
 - **這四個修正沒有回饋上游。** 全都是 `meshtastic/device-ui` 的問題,別的 TFT 使用者遲早會踩到,尤其 Bug 2(開地圖必炸)。

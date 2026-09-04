@@ -1,0 +1,59 @@
+From 83e416ed9ad2c869d78d262a42e97563e6409091 Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Fri, 4 Sep 2026 17:46:23 +0800
+Subject: [PATCH] Apply the log quota at startup, not only when the current
+ file fills
+
+LogRotate::init trimmed the log only inside
+
+    if (currentSize > c_maxFileSize - c_maxLen)
+
+so the quota was enforced when the *current* file was nearly full, and not
+otherwise. After lowering c_maxSize from 100kB to 16kB the device reported
+
+    LogRotate: found 16 log files using 60564 bytes (369%).
+    Logging to /messages/log_000016.log
+
+- the new limit was plainly in effect, since 60564/16384 is 369%, but nothing
+was removed. The current file had just been created, so currentSize was small
+and the condition was false. The log would have come down eventually, once
+traffic filled that file and write() rotated, but every boot until then still
+restored all 788 messages and paid the full 41 seconds.
+
+Trimming unconditionally at init makes a lowered quota take effect on the next
+boot instead of the next rotation. The loop and its exit condition are the ones
+already used below and in write(); only the guard around them is gone.
+
+Upstream code. Worth reporting along with the other two.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ source/util/LogRotate.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/source/util/LogRotate.cpp b/source/util/LogRotate.cpp
+index e4203aa..55fd778 100644
+--- a/source/util/LogRotate.cpp
++++ b/source/util/LogRotate.cpp
+@@ -23,6 +23,17 @@ void LogRotate::init(void)
+         currentLogRead = minLogNum;
+         currentLogWrite = maxLogNum;
+         ILOG_INFO("LogRotate: found %d log files using %d bytes (%d%%).", numFiles, totalSize, (totalSize * 100) / c_maxSize);
++
++        // Enforce the quota on every start, not only when the current file
++        // happens to be nearly full. A log that grew under a larger quota - or
++        // one whose quota was lowered since the last boot - otherwise sits over
++        // it until enough traffic arrives to force a rotation, and every boot in
++        // between pays the full restore cost. Observed at 369% of quota after
++        // the limit was reduced, with no trimming until traffic filled the
++        // freshly-created current file.
++        while ((numFiles > c_maxFiles || totalSize >= c_maxSize) && removeLog())
++            ;
++
+         if (currentSize > c_maxFileSize - c_maxLen) {
+             ILOG_DEBUG("currentSize(%d) > c_maxFileSize(%d) - c_maxLen(%d)", currentSize, c_maxFileSize, c_maxLen);
+             ILOG_DEBUG("numFiles(%d) > c_maxFiles(%d) || totalSize(%d) >= c_maxSize(%d)", numFiles, c_maxFiles, totalSize,
+-- 
+2.50.1 (Apple Git-155)
+

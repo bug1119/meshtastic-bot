@@ -1,0 +1,68 @@
+From 61555ea3a2b663554271d8bb39bf125b9d8af86d Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Fri, 4 Sep 2026 17:07:42 +0800
+Subject: [PATCH] Do not add a map marker before the map panel exists
+
+Decoded from the panic on the device, which had been rebooting roughly once a
+minute:
+
+    0x4201e3e3 lv_obj_class_create_obj
+    0x420436ff lv_image_create
+    0x4207b421 TFTView_320x240::addOrUpdateMap
+    0x4207ebdd TFTView_320x240::updatePosition
+    0x4213b465 ViewController::packetReceived
+    0x42088582 ViewController::receive
+
+lv_image_create(objects.raw_map_panel) with a null parent. The map screen is
+built lazily, so both map and objects.raw_map_panel stay null until it has been
+opened once - while position packets arrive from the mesh regardless. LVGL
+dereferences a parent without checking it, hence StoreProhibited.
+
+The function already tests "if (map)" twice below, so the possibility was known;
+those tests simply run after the object creation that crashes. Guarding at the
+top instead, on both the map and its panel.
+
+Markers for nodes heard before the map is first opened are skipped rather than
+created, and reappear when that node next broadcasts a position. That is the
+trade this makes, and it is a better one than panicking every minute.
+
+Supersedes the guard I added in the previous commit: that one protected the node
+panel lookup in updatePosition, which is a real instance of the same
+operator[]-then-dereference shape but is not what was firing. The backtrace here
+was decoded rather than inferred.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ source/graphics/TFT/TFTView_320x240.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTView_320x240.cpp
+index e681316..cd61817 100644
+--- a/source/graphics/TFT/TFTView_320x240.cpp
++++ b/source/graphics/TFT/TFTView_320x240.cpp
+@@ -2755,6 +2755,21 @@ void TFTView_320x240::updateLocationMap(uint32_t num)
+  */
+ void TFTView_320x240::addOrUpdateMap(uint32_t nodeNum, int32_t lat, int32_t lon)
+ {
++    // Nothing to put a marker on yet. The map screen is built lazily - map and
++    // objects.raw_map_panel are both null until it has been opened once - while
++    // position packets keep arriving from the mesh regardless. Everything below
++    // parents an LVGL object to raw_map_panel, and LVGL dereferences a parent
++    // without checking it, so lv_image_create panicked with StoreProhibited
++    // roughly once a minute on a busy mesh.
++    //
++    // The "if (map)" checks further down show the case was already known; they
++    // simply run after the object creation that crashes. Markers for nodes heard
++    // before the map is first opened are skipped, and reappear when that node
++    // next broadcasts its position.
++    if (!map || !objects.raw_map_panel) {
++        return;
++    }
++
+     auto it = nodeObjects.find(nodeNum);
+     if (it == nodeObjects.end()) {
+         uint32_t bgColor, fgColor;
+-- 
+2.50.1 (Apple Git-155)
+

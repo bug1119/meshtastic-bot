@@ -1,0 +1,71 @@
+From 13fe76b674cc627ab4577f8c41dd3602526c10fe Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Fri, 4 Sep 2026 17:32:32 +0800
+Subject: [PATCH] Cap the message log at 16kB, not 100kB
+
+LogRotate defaults to 100kB across 25 files. Measured on a device that had
+filled most of it: 58331 bytes held 788 messages, so entries average 74 bytes
+and the default allows roughly 1400.
+
+That is too many for two separate reasons, both observed on hardware.
+
+Restoring runs one message per UI tick, from ViewController::runOnce, so 788
+messages took 38.7 seconds of every single boot - and while the device was
+crash-looping every 55 seconds it spent most of its life in that loop.
+
+Worse, the restore creates an LVGL object per message, and at 788 it ran the
+LVGL heap out. newMessageContainer then returned null and newMessage called
+lv_obj_create on the null parent:
+
+    0x4201e3e3 lv_obj_class_create_obj
+    0x4201e4a1 lv_obj_create
+    0x42087335 TFTView_320x240::newMessage
+    0x42089bd1 TFTView_320x240::restoreMessage
+    0x420880e6 ViewController::restoreTextMessages
+
+That also explains why the device got worse over time rather than breaking
+suddenly: the log grows across reboots and never shrinks on its own, so it
+crept up on the limit.
+
+16kB over 8 files is about 220 messages - roughly 11 seconds to restore, and
+well clear of where it broke. Set at the call site rather than in LogRotate's
+defaults, since it is a policy choice by the caller. maxFileSize stays several
+times sizeof(LogMessage), which init() depends on when deciding to rotate.
+
+Both init() and write() enforce the quota, so an existing oversized log trims
+itself down rather than needing to be cleared by hand.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ source/graphics/common/ViewController.cpp | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/source/graphics/common/ViewController.cpp b/source/graphics/common/ViewController.cpp
+index 451aa19..d7d216d 100644
+--- a/source/graphics/common/ViewController.cpp
++++ b/source/graphics/common/ViewController.cpp
+@@ -21,7 +21,19 @@ constexpr const char *logDir = "/messages";
+  *
+  */
+ ViewController::ViewController()
+-    : view(nullptr), log(persistentFS, logDir, sizeof(LogMessage)), client(nullptr), sendId(1), myNodeNum(0), setupDone(false),
++    // Message log quota, overriding LogRotate's 100kB/25-file default. Measured
++    // on a device that had filled it: 58331 bytes held 788 messages, so entries
++    // average 74 bytes and the default allows roughly 1400.
++    //
++    // That is too many for two reasons. Restoring is one message per UI tick, so
++    // 788 took 38.7 seconds of every boot. And the restore creates an LVGL
++    // object per message; at 788 it exhausted the LVGL heap, newMessageContainer
++    // returned null, and lv_obj_create panicked on the null parent.
++    //
++    // 16kB / 8 files is about 220 messages - roughly 11 seconds to restore and
++    // well clear of where it broke. maxFileSize stays several times sizeof
++    // (LogMessage), which init() relies on when it decides to rotate.
++    : view(nullptr), log(persistentFS, logDir, sizeof(LogMessage), 16384, 8, 2048), client(nullptr), sendId(1), myNodeNum(0), setupDone(false),
+       configCompleted(false), messagesRestored(false), requestConfigRequired(true)
+ {
+ }
+-- 
+2.50.1 (Apple Git-155)
+
