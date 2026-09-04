@@ -125,6 +125,17 @@ DEFAULT_RULES = """\
 #                       whitespace is ignored. So A=Alpha answers "A" but not
 #                       "a" and not "AAA". The reply text is taken literally,
 #                       so do not quote it.
+#   %variable%          replaced in the reply text. Only these names, and only
+#                       in a reply - a name not on the list is left as it was
+#                       written, so a stray percent sign is harmless:
+#                         %my_pos%     this station, "lat,lon"
+#                         %their_pos%  the sender, "lat,lon"
+#                         %my_lat% %my_lon% %their_lat% %their_lon%
+#                         %dist%       distance between the two
+#                       A value that cannot be determined reads "--". Our end
+#                       is --here if it was given, otherwise our own GPS fix;
+#                       the other end is whatever position that node last
+#                       broadcast. See the gps rule under [*].
 #
 # The first matching rule wins, and a channel's own rules are checked before
 # [*]. Blank lines and lines starting with # are ignored.
@@ -153,6 +164,9 @@ ping=pong (private)
 [EDGE_ATS]
 ping=pong
 help=指令: ping
+# Both ends and the distance between them. The bracket line already
+# carries dist=, but not the coordinates it was computed from.
+gps=我 %my_pos% · 你 %their_pos% · %dist%
 """
 
 BROADCAST_ADDR = "^all"
@@ -777,6 +791,52 @@ def channel_label(interface, index: int) -> str:
     return str(index)
 
 
+# Values a reply may interpolate, and nothing else. A whitelist rather than a
+# format string: str.format and format_map walk attributes, so "{a.__class__}"
+# in a rules file would reach into the program's own objects, and rules.txt is
+# a file an operator edits casually. %name% cannot address anything that is not
+# on this list.
+REPLY_VARS = ("my_lat", "my_lon", "my_pos", "their_lat", "their_lon", "their_pos", "dist")
+
+# What an unavailable value reads as. The bracket line omits a field it cannot
+# fill, because there it is one of several and the payload is tight; inside a
+# reply the operator wrote, a hole mid-sentence reads as a bug, so it says so
+# instead - and "--" is what the node list and the status pane already use.
+REPLY_VAR_MISSING = "--"
+
+
+def expand_reply_vars(reply: str, info: dict) -> str:
+    """Substitute %my_pos% and friends. Unknown names are left alone.
+
+    Left alone rather than blanked, so a reply that happens to contain a
+    percent sign survives, and a typo shows up as itself instead of vanishing.
+    """
+    if "%" not in reply:
+        return reply
+
+    def coord(value):
+        return f"{value:.4f}" if value is not None else REPLY_VAR_MISSING
+
+    def pair(pos):
+        if pos is None:
+            return REPLY_VAR_MISSING
+        return f"{pos[0]:.4f},{pos[1]:.4f}"
+
+    mine, theirs = info.get("my_pos"), info.get("their_pos")
+    values = {
+        "my_lat": coord(mine[0] if mine else None),
+        "my_lon": coord(mine[1] if mine else None),
+        "my_pos": pair(mine),
+        "their_lat": coord(theirs[0] if theirs else None),
+        "their_lon": coord(theirs[1] if theirs else None),
+        "their_pos": pair(theirs),
+        "dist": format_distance(info.get("distance_m")),
+    }
+    for name in REPLY_VARS:
+        reply = reply.replace(f"%{name}%", values[name])
+    return reply
+
+
 BOT_REPLY_PREFIX = "BOT: "
 
 
@@ -795,7 +855,11 @@ def build_reply_text(reply: str, info: dict) -> str:
 
     The "BOT: " prefix and the bracketed detail line also keep the bot from
     answering itself: matching is exact, so a reply can never equal a keyword.
+
+    The reply text passes through expand_reply_vars() first, so a rule can ask
+    for the positions this already used to compute dist - see REPLY_VARS.
     """
+    reply = expand_reply_vars(reply, info)
     who = info.get("from_name") or info["from_id"]
     # "rx" rather than "via": every field here describes the message being
     # answered, not the reply, and rx reads as reception - matching rxSnr and
@@ -859,6 +923,20 @@ class ReplyEngine:
                 return getattr(interface, "hostname", None) or self.tcp_host
             return host if port == DEFAULT_TCP_PORT else f"{host}:{port}"
         return getattr(getattr(interface, "client", None), "address", None)
+
+    def _my_position(self) -> tuple[float, float] | None:
+        """This station's position: --here if given, else our own fix."""
+        if self.here:
+            return self.here
+        if self.interface is None:
+            return None
+        return node_position((self.interface.nodes or {}).get(self.my_id, {}))
+
+    def _position_of(self, node_id: str | None) -> tuple[float, float] | None:
+        """A node's last broadcast position, or None if it has not sent one."""
+        if not node_id or self.interface is None:
+            return None
+        return node_position((self.interface.nodes or {}).get(node_id, {}))
 
     def _distance_to(self, node_id: str | None) -> float | None:
         """Distance from this station to `node_id`, or None if either end lacks
@@ -1018,12 +1096,32 @@ class ReplyEngine:
             "from_id": from_id,
             "from_name": node_label(interface.nodes or {}, from_id),
             "distance_m": self._distance_to(from_id),
+            # Both ends, for a rule that wants to say where they are rather
+            # than only how far apart. Same sources dist uses: --here or our
+            # own fix for this end, the sender's broadcast for the other.
+            "my_pos": self._my_position(),
+            "their_pos": self._position_of(from_id),
         }
         full_reply = build_reply_text(reply, info_like)
-        if kind == "channel":
-            interface.sendText(full_reply, channelIndex=key)
-        else:
-            interface.sendText(full_reply, destinationId=key)
+        # Reported rather than raised. on_receive runs on the library's
+        # publishing thread, so an exception here escapes into that thread and
+        # is swallowed - the reply simply does not happen and nothing says so,
+        # which is indistinguishable from the rules not matching. A BLE write
+        # can fail on its own (a link whose notifications never subscribed, a
+        # node that went away mid-exchange) and that has to look like a
+        # failure, not like silence.
+        try:
+            if kind == "channel":
+                interface.sendText(full_reply, channelIndex=key)
+            else:
+                interface.sendText(full_reply, destinationId=key)
+        except Exception as exc:  # noqa: BLE001
+            where = f"channel:{key}" if kind == "channel" else f"node:{key}"
+            note = f"  -> 回覆送出失敗 ({where}): {type(exc).__name__}: {exc}"
+            # Returned rather than logged here, matching how the success line
+            # travels: the caller owns the log, and the TUI needs markup where
+            # the server must not have it.
+            return f"[red]{note}[/red]" if self.MARKUP else note
         self.sent_auto_count += 1
 
         # The sent text carries literal brackets and a newline. For the TUI the
