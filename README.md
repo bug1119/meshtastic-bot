@@ -74,6 +74,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 | `--daemon` | — | ✅ | ✅ | 選好裝置後丟到背景 |
 | `--log PATH` | — | ✅ | ✅ | `--daemon` 的輸出檔 |
 | `--heartbeat SECS` | — | ✅ | ✅ | 多久印一行「還活著」 |
+| `--mqtt` | — | ✅ | ✅ | 代節點連 MQTT broker(要跟 `--server` 一起) |
 | `--wifi on\|off` | ✅ | ✅ | — | 開關節點的 WiFi 後結束 |
 
 `bot.py` 沒有 `--ble`,是因為它本來就會掃 BLE 並列在裝置窗格裡讓你點。
@@ -107,11 +108,12 @@ python3 -m venv ~/.venvs/meshtastic-bot
 ./bot_dual.py --server --port /dev/cu.usbmodem2101    # 無 UI,USB
 ./bot_dual.py --server --host 192.168.0.247           # 無 UI,WiFi
 ./bot_dual.py --server --ble Bug2_1ca6 --daemon --log ~/bot.log   # 無 UI,背景
+./bot_dual.py --server --ble Bug2_1ca6 --mqtt         # 無 UI,並代節點上 MQTT
 ./bot_dual.py --list                                  # 只列出裝置
 ```
 
 多出來的參數除了 `--server` 之外,都跟 `bot_server.py` 相同(見下)。
-`--daemon` 必須跟 `--server` 一起用,單獨給會被擋掉。
+`--daemon` 與 `--mqtt` 都必須跟 `--server` 一起用,單獨給會被擋掉。
 
 ### bot_server.py — 只有 server,沒有 UI
 
@@ -124,6 +126,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 ./bot_server.py --ble Bug2_1ca6 --daemon --log ~/bot.log         # 丟到背景
 ./bot_server.py --port /dev/cu.usbmodem2101 --heartbeat 0        # 關掉心跳
 ./bot_server.py --host 192.168.0.247 --here 25.0339,121.5645     # 回覆帶 dist=
+./bot_server.py --ble Bug2_1ca6 --mqtt                           # 代節點連 MQTT broker
 ```
 
 | 參數 | 說明 |
@@ -133,6 +136,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 | `--daemon` | 選好裝置後丟到背景,輸出寫到 `--log`,並印出 pid |
 | `--log PATH` | `--daemon` 的輸出檔,**附加**不覆蓋。預設 `meshtastic-bot.log` |
 | `--heartbeat SECS` | 多久印一行「還活著」與計數。`0` 關閉,只印真正發生的事。預設 600 |
+| `--mqtt` | 代節點連它設定裡的 MQTT broker:上行送出去、下行收回來。預設關閉,見 [MQTT 橋接](#mqtt-橋接--mqtt) |
 
 一個裝置都不指定時,它會掃一遍、列出編號讓你選,選完就開始服務。
 
@@ -317,6 +321,74 @@ macOS 特有的兩件事,程式裡有處理:
 所以在加上這段之前:**連線一斷,bot 的畫面還一直寫著「已連線」、狀態列一個字都不說,而且從此再也收不到任何封包。** 之後別台傳過來的訊息全部看不到,而且沒有任何提示 —— 這就是「好像會掉訊息」的真正原因,不是漏掉一兩則,是斷線之後全丟。
 
 **能救回多少**:重連本身不會把斷線期間的訊息變出來。韌體的 `toPhoneQueue` 有限的緩衝會在重連後送出一部分,超出的就是真的沒了。這個修正保證的是「不會無聲無息地永久停擺」。
+
+## MQTT 橋接:`--mqtt`
+
+節點自己上不了 MQTT broker 的時候,由這支程式代它上。只能跟 `--server` 一起用:
+
+```sh
+./bot_server.py --ble Bug2_1ca6 --mqtt
+./bot_dual.py --server --ble Bug2_1ca6 --mqtt --daemon --log ~/bot.log
+```
+
+**為什麼需要**:ESP32 的韌體只在 WiFi 不可用時才開藍牙(`src/platform/esp32/main-esp32.cpp`),所以用 BLE 連的節點**必然沒有自己的網路** —— 它上 MQTT 的唯一路徑是 `mqtt.proxy_to_client_enabled`:節點把每一則 MQTT 交給當下連著的 client,由那個 client 去連 broker。手機 app 有做這件事,所以把手機換成這支程式之後,節點的 MQTT 就整段掉在地上,而且沒有任何訊息說它掉了。
+
+**預設關閉是刻意的。** 一個自己啟動的橋接,等於把一個你可能當成私有的 mesh 開始轉發到裝置上寫著的那台 broker —— 而沒改過的設定寫的就是公共那台。要不要把訊息送上網路是一個決定,不該由「bot 開起來了」代你做。
+
+### broker 從節點讀,不寫在這裡
+
+address / username / password / root / TLS 全部在**連上之後從節點讀**(`localNode.moduleConfig.mqtt`),所以在裝置上改完、重連一次就生效,程式裡不用跟著改。只有欄位是空的才退回韌體自己的預設值(`src/mesh/Default.h`):`mqtt.meshtastic.org`、`meshdev` / `large4cats`、root `msh`。
+
+`address` 空白時**連帶不採用**存著的帳密 —— 這是韌體 `PubSubConfig` 的行為:給某台 broker 的帳密,對另一台來說是錯的帳密。
+
+port 沒有設定項,跟韌體一樣由 TLS 決定:`tls_enabled` 開就是 **8883**,關就是 **1883**。要連別的 port 就把 address 寫成 `host:port`。
+
+TLS **會驗證憑證**,跟韌體的 `setInsecure()` 不同 —— ESP32 沒有 CA bundle 可以比對,這台機器有。用自簽憑證的私有 broker 會在這裡被拒絕,並且在 log 上說出來,而不是安靜地放過去。
+
+### 下行訂閱哪些 topic
+
+proxy 模式下**韌體不會告訴 client 要訂什麼** —— `MQTT::sendSubscriptions()` 只在它自己開 socket 的那條路上跑。所以訂閱清單是這邊決定的,兩個來源:
+
+- **有名字、而且 `downlink_enabled` 開著的頻道**:直接組出 `<root>/2/e/<頻道名>/+`
+- **沒名字的主頻道**:韌體會拿**調變預設的顯示名稱**(`MediumFast`、`LongFast`……)當它的 topic 名字,而那個值不在讀得到的設定裡 —— 所以是從節點自己 publish 的 topic **學**來的。與其在這邊再抄一份韌體的預設表,不如讓節點自己講
+
+再加上 `<root>/2/e/PKI/+`,私訊走那個假頻道進來。
+
+**沒有訂 `<root>/2/map/`**:那上面是 MapReport,而節點對 client 交回去的東西一律當 ServiceEnvelope 解(`onReceiveProto`),解不開只會在節點上留一行錯誤。map 是只上不下的。
+
+`downlink_enabled` 關著的頻道不訂 —— 節點收到也會丟掉,訂了只是白花 BLE 頻寬。所以**一個 downlink 都沒開的節點訂閱數會是 0**,那是對的,不是壞了。
+
+### log 只記狀態變化,量看心跳
+
+橋接**不會**一則訊息印一行。這個 mesh 一分鐘幾百個封包,一則一行的話 log 就沒得看了。所以只有狀態變化留一行,量放在心跳:
+
+```
+2026-09-04 21:10:33 MQTT 橋接啟動: mqtts://mqtt.meshtastic.org:8883 root=msh/TW 下行 topic 3 個
+2026-09-04 21:10:35 MQTT 已連線 mqtt.meshtastic.org:8883,訂閱 3 個下行 topic
+2026-09-04 21:20:33 [心跳] 已連線 執行 0:10:03 封包 4821 收訊 12 自動回覆 3 重連 0 MQTT 已連線 上行 271 下行 188
+```
+
+broker 斷線也是一行,而且**一次斷線只講一次**,不是每次重試都講 —— broker 掛掉通常掛好幾個小時,重試間隔在程式裡是固定的,真正需要知道的「現在還是斷的」在心跳那行。重連間隔跟連線斷線用**同一張表**:1 → 2 → 5 → 10 → 30 秒,之後固定 30 秒。
+
+### broker 掛掉不會把 bot 拖下去
+
+橋接是側路,壞了只壞它自己:
+
+- 兩個方向的 callback 都包起來,**例外不會逸出** —— 上行跑在 meshtastic 的 publishing thread 上(就是把每個封包交給 `on_receive` 的那條),下行跑在 paho 的網路 thread 上。任何一條被例外殺掉,壞的都不是 MQTT 而是別的東西
+- 同一種錯誤只印一行,之後只累加心跳的 `錯誤` 計數
+- 連 broker 是在**自己的 thread** 上做的,不是在設定同步那條路上,所以連不到的 broker 不會讓 bot 停下來不回訊息
+- 節點的 `mqtt.enabled` 或 `mqtt.proxy_to_client_enabled` 關著,就印一行說是哪一個然後不啟動 —— 那是裝置設定,要改的地方在裝置上
+- 關閉時 broker 的 disconnect 跟 `interface.close()` 一樣有上限(3 秒),因為 socket 一樣會卡
+
+### 需要 paho-mqtt
+
+`--mqtt` 需要 [paho-mqtt](https://pypi.org/project/paho-mqtt/)。走 shebang 交給 uv 的話已經宣告在檔頭,不用管。
+
+它**刻意不在啟動時的必要套件檢查裡** —— 沒有要用橋接的機器,不該因為一個不會被 import 的套件被擋著不能啟動。改成給了 `--mqtt` 才檢查,而且**在連線之前**就檢查完:BLE 連上要半分鐘,如果又是 `--daemon`,半分鐘之後才噴的錯誤沒人看得到。
+
+### ⚠️ 這會把訊息送上網路
+
+沒改過的設定指向**公共 broker**,而公共頻道的 PSK 是公開的。所以公共頻道上的訊息,橋接開起來之後就會出現在網路上任何人都看得到的地方 —— 這本來就是 Meshtastic MQTT gateway 的作用,但值得在打上 `--mqtt` 之前想一次。不想要就不要加這個參數,或者在裝置上關掉那些頻道的 `uplink_enabled`。
 
 ## 未讀:頻道/node 列表的粗體
 
@@ -549,12 +621,12 @@ BOT: pong
 ./test_rules.py
 ```
 
-498 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那三個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。
+600 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那幾個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。MQTT 橋接也在裡面:broker 設定從節點讀出來、上行 publish 與下行回灌、沒給 `--mqtt` 時完全不動、paho 的例外不會逸出、重連沿用同一張退避表,以及 disconnect 卡住時的有界關閉 —— paho 是假的,不碰網路。
 
 另外有 `test_params_live.py`,**需要硬體**:它把三支程式的每一個參數都跑一遍
 (`--help`、每一種該被擋下來的參數組合、連不上的目標要乾淨失敗、`--list`、
 真的連上節點、`--daemon` 背景啟動後用 `SIGTERM` 停掉),並在連線期間取樣記憶體。
-`--wifi` 只測參數檢查,不會真的去改節點設定。
+`--wifi` 只測參數檢查,不會真的去改節點設定;`--mqtt` 同理,真的連 broker 那一項要另外給 `--mqtt-live` 才跑,因為那會把這個 mesh 轉發到公共 broker 上。
 
 ```sh
 ./test_params_live.py            # 需要一台在廣播的 BLE 節點
@@ -569,6 +641,7 @@ BOT: pong
 
 ## 已知限制
 
+- **MQTT 橋接還沒在實機節點上跑過整段。** broker 那半邊是對真的 `mqtt.meshtastic.org` 驗過的(TLS 8883、節點的帳密、CONNACK、訂閱,並真的收到下行封包交給 `sendMqttClientProxyMessage`);但「節點 → 這支程式 → broker」的上行,以及下行真的被節點解開,尚未在硬體上確認
 - **`--wifi` 的實際寫入尚未在硬體上驗證過**(開發時裝置斷電了)。第一次使用請留意重開機行為
 - 韌體一次只接受**一條** TCP 連線,新連線會強制踢掉舊的 —— bot 連上時手機 app 會被踢掉,反之亦然
 - 關閉連線時 meshtastic 套件自己的 heartbeat thread 可能噴一個 `BrokenPipeError` traceback。那是套件內部的競態,資料不受影響

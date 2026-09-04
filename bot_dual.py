@@ -3,6 +3,7 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #     "meshtastic",
+#     "paho-mqtt",
 #     "pypubsub",
 #     "textual",
 # ]
@@ -123,6 +124,7 @@ import argparse
 import atexit
 import datetime
 import collections
+import functools
 import math
 import os
 import signal
@@ -244,6 +246,39 @@ HEADLESS_FLAGS = ["--server"]
 # time and force-closes the previous one, so connecting here kicks off a
 # phone/desktop app already talking to the same node over WiFi.
 DEFAULT_TCP_PORT = 4403
+
+# paho-mqtt is wanted only by --mqtt, so it is deliberately absent from
+# _REQUIRED_MODULES above: a machine that installed the packages by hand and
+# never asks for the bridge should not be refused a start over one it will not
+# import. It is in the uv header all the same, so the normal route has it.
+MQTT_MODULE = ("paho.mqtt.client", "paho-mqtt")
+
+# The client proxy's topic layout, mirrored from the firmware's cryptTopic
+# (src/mqtt/MQTT.h): "<root>/2/e/<channel>/<node>" carries the encrypted mesh
+# packets, "<root>/2/map/" the map reports. Only the first has downlink traffic
+# worth having - the node feeds everything a client hands back into
+# onReceiveProto(), which decodes a ServiceEnvelope, and a MapReport is not
+# one, so subscribing to the map topic would only earn it decode errors.
+MQTT_ENVELOPE_PATH = "/2/e/"
+
+# Direct messages are gatewayed under this pseudo-channel rather than any of
+# the node's own, so it has to be subscribed to explicitly - waiting to see the
+# node publish on it means having missed the DM that would have taught us.
+MQTT_PKI_CHANNEL = "PKI"
+
+# Substituted for whatever the node left blank, because the firmware
+# substitutes exactly these (default_mqtt_* in src/mesh/Default.h). An
+# untouched MQTT config has to mean the same thing here as it does there.
+MQTT_DEFAULT_ADDRESS = "mqtt.meshtastic.org"
+MQTT_DEFAULT_USERNAME = "meshdev"
+MQTT_DEFAULT_PASSWORD = "large4cats"
+MQTT_DEFAULT_ROOT = "msh"
+
+# The device has no port setting: the firmware picks one from tls_enabled alone
+# (PubSubConfig in src/mqtt/MQTT.cpp). A "host:port" address still overrides,
+# which is the only way to name a broker on some other port.
+MQTT_PORT = 1883
+MQTT_TLS_PORT = 8883
 
 
 def load_rules() -> dict[str, dict[str, str]]:
@@ -438,16 +473,75 @@ def format_distance(metres: float | None) -> str:
     return f"{metres / 1000:.1f}km"
 
 
-def _split_host_port(address: str) -> tuple[str, int]:
+def _split_host_port(address: str, default_port: int = DEFAULT_TCP_PORT) -> tuple[str, int]:
     """Split "host:port" into its parts, defaulting to Meshtastic's TCP port.
 
     Only splits a trailing ":<digits>", and only when the remainder has no
     colon of its own, so a bare IPv6 literal passes through untouched.
+
+    `default_port` exists for the MQTT broker, whose default is 1883 or 8883
+    depending on TLS. Copying this three-line split rather than parameterising
+    it would mean two places to get that IPv6 case wrong.
     """
     host, sep, port = address.rpartition(":")
     if sep and port.isdigit() and ":" not in host and host:
         return host, int(port)
-    return address, DEFAULT_TCP_PORT
+    return address, default_port
+
+
+def mqtt_connect_failed(reason_code) -> bool:
+    """Whether a paho connect callback is reporting a refusal.
+
+    Deliberately not `if reason_code:`. paho's v2 callbacks hand over a
+    ReasonCode object, which defines no __bool__ and is therefore truthy even
+    for Success - so the obvious test reads every successful connect as a
+    rejection. Measured against the real broker, where it logged
+    "broker 拒絕連線: Success" and then relayed nothing.
+
+    An int still works, which is what the v1 callbacks and the tests' stubs
+    pass; 0 means accepted there.
+    """
+    is_failure = getattr(reason_code, "is_failure", None)
+    if is_failure is not None:
+        return bool(is_failure)
+    return bool(reason_code)
+
+
+def mqtt_broker_settings(mqtt_config) -> dict:
+    """Where to reach the broker, read off the connected node.
+
+    Read from the device rather than written down here because the operator
+    changes it on the device - address, credentials, root topic and TLS are all
+    node settings, and a bridge with its own copy would keep publishing to
+    yesterday's broker.
+
+    Blank fields fall back to what the firmware falls back to. Note that a
+    blank *address* discards the stored username and password as well, which is
+    what PubSubConfig does: credentials meant for a broker the operator did not
+    name are credentials for the wrong broker.
+    """
+    address = (mqtt_config.address or "").strip()
+    if address:
+        username = mqtt_config.username or ""
+        password = mqtt_config.password or ""
+    else:
+        address = MQTT_DEFAULT_ADDRESS
+        username = MQTT_DEFAULT_USERNAME
+        password = MQTT_DEFAULT_PASSWORD
+    tls = bool(mqtt_config.tls_enabled)
+    host, port = _split_host_port(address, MQTT_TLS_PORT if tls else MQTT_PORT)
+    # Trailing slashes are stripped because the firmware pastes the root
+    # straight onto a path that already starts with one ("msh/TW" + "/2/e/"),
+    # so a root of "msh/TW/" there would give "msh/TW//2/e/" here.
+    root = (mqtt_config.root or MQTT_DEFAULT_ROOT).strip().strip("/")
+    return {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "tls": tls,
+        "root": root or MQTT_DEFAULT_ROOT,
+    }
 
 
 def excluded_channels() -> set[str]:
@@ -1791,6 +1885,425 @@ class _BoundedHistory(dict):
         return self[key]
 
 
+def _isolated(method):
+    """Wrap a bridge callback so an exception cannot escape the thread that called it.
+
+    Neither direction runs on a thread of our own: the uplink arrives on
+    meshtastic's publishing thread, the downlink on paho's network thread. An
+    exception loose in either kills a thread the bot needs for work that has
+    nothing to do with MQTT - lose the publishing thread and the bot stops
+    answering messages at all. MQTT is a side channel and has to fail like one.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._note_error(method.__name__, exc)
+        return None
+
+    return wrapper
+
+
+class MqttProxy:
+    """The broker half of Meshtastic's MQTT client proxy.
+
+    A node with mqtt.proxy_to_client_enabled never contacts a broker itself: it
+    hands every publish to whichever client is attached and expects that client
+    to own the connection. Over BLE that is the only arrangement there is -
+    ESP32 firmware starts Bluetooth only when WiFi is unavailable
+    (src/platform/esp32/main-esp32.cpp), so a BLE-attached node has no network
+    by construction and its MQTT traffic goes nowhere unless something on this
+    side carries it. The phone apps do carry it; nothing here did, so the
+    node's uplink was quietly dropped on the floor.
+
+    Opt-in, behind --mqtt. Starting by default would take a mesh the operator
+    may well consider private and begin republishing it to whatever broker the
+    device names - which for an untouched config is the public one.
+
+    Holds the bot rather than an interface, because a link reconnect replaces
+    the interface object and a downlink has to reach the current one.
+    """
+
+    # How long to give the broker disconnect before leaving without it, for the
+    # reason ServerBot.CLOSE_TIMEOUT exists: a teardown that can block is a
+    # process that needs SIGKILL. Shorter than the interface's, this being the
+    # least important of the things a shutdown is waiting on.
+    STOP_TIMEOUT = 3
+
+    # Mirrors the firmware's own choices. It publishes through Arduino's
+    # PubSubClient, which only does QoS 0, and subscribes at QoS 1
+    # (MQTT::sendSubscriptions).
+    PUBLISH_QOS = 0
+    SUBSCRIBE_QOS = 1
+
+    # Distinct failure lines to keep before going quiet. A broker rejecting
+    # every publish would otherwise write the same line hundreds of times a
+    # minute; the heartbeat's error count is what shows it is still happening.
+    ERROR_LINE_LIMIT = 20
+
+    def __init__(self, bot, client_factory=None) -> None:
+        self._bot = bot
+        # Injected so the tests can drive both directions without a broker.
+        # Left None it is paho, imported on first use rather than at module
+        # import: a bot started without --mqtt must not need the package.
+        self._client_factory = client_factory
+        self._client = None
+        self._settings: dict | None = None
+        self._wanted: set = set()
+        # Guards _wanted and the connected flag together. Topics are added from
+        # meshtastic's publishing thread as the node reveals them, while paho's
+        # thread walks the set to re-subscribe on connect - without this, one
+        # can be iterating it while the other adds, and the loser of that race
+        # is a subscription that quietly never happens.
+        self._lock = threading.Lock()
+        self._downlink_wanted = False
+        self._stopped = threading.Event()
+        self.connected = False
+        self.up_count = 0
+        self.down_count = 0
+        self.error_count = 0
+        self._reported_errors: set = set()
+        # Whether the current outage has already been reported. One line per
+        # state change means one line for the outage, not one per retry.
+        self._reported_down = False
+
+    # ---- lifecycle --------------------------------------------------------
+
+    def start(self) -> None:
+        """Connect to the broker the node names, and start relaying.
+
+        Called from on_config_synced, the first moment both halves are known:
+        moduleConfig.mqtt arrives with the config download and so does the
+        channel list the downlink topics are built from. A link reconnect syncs
+        again, so this has to be safe to call repeatedly - the later calls only
+        refresh the subscriptions, since the channels may have been edited while
+        the link was down.
+        """
+        interface = self._bot.interface
+        config = interface.localNode.moduleConfig.mqtt
+        self._settings = mqtt_broker_settings(config)
+
+        if self._client is not None:
+            self._refresh_wanted_topics()
+            return
+
+        if not config.enabled:
+            self._bot.log("MQTT: 節點的 mqtt.enabled 是關的,不啟動橋接")
+            return
+        # Without this the node keeps its MQTT traffic to itself and there is
+        # nothing to relay. Worth saying plainly: --mqtt was asked for, and the
+        # fix is a device setting rather than anything on this side.
+        if not config.proxy_to_client_enabled:
+            self._bot.log(
+                "MQTT: 節點的 mqtt.proxy_to_client_enabled 是關的,不啟動橋接"
+                "(節點不會把 MQTT 交給 client)"
+            )
+            return
+
+        self._refresh_wanted_topics()
+        try:
+            self._client = self._build_client(self._settings)
+        except Exception as exc:  # noqa: BLE001
+            # A broker that cannot even be set up must not stop the bot: it
+            # keeps answering messages, just without the bridge.
+            self._bot.log(f"MQTT 橋接啟動失敗,略過: {exc}")
+            self._client = None
+            return
+
+        pub.subscribe(self.on_proxy_message, "meshtastic.mqttclientproxymessage")
+        scheme = "mqtts" if self._settings["tls"] else "mqtt"
+        self._bot.log(
+            f"MQTT 橋接啟動: {scheme}://{self._settings['host']}:{self._settings['port']}"
+            f" root={self._settings['root']} 下行 topic {len(self._wanted)} 個"
+        )
+        threading.Thread(target=self._supervise, daemon=True).start()
+
+    def stop(self) -> None:
+        """Disconnect from the broker, but not at any price.
+
+        On a side thread with a deadline, exactly as ServerBot._shutdown treats
+        interface.close(): a stop that can hang is a process that needs
+        SIGKILL, and the bridge is the least important thing being torn down.
+        """
+        if self._client is None:
+            return
+        self._stopped.set()
+        try:
+            pub.unsubscribe(self.on_proxy_message, "meshtastic.mqttclientproxymessage")
+        except Exception:  # noqa: BLE001
+            # Unsubscribing is only tidiness by this point - the relay already
+            # refuses work because _stopped is set.
+            pass
+        stopper = threading.Thread(target=self._disconnect_quietly, daemon=True)
+        stopper.start()
+        stopper.join(self.STOP_TIMEOUT)
+        if stopper.is_alive():
+            self._bot.log(f"MQTT 中斷逾時 ({self.STOP_TIMEOUT}s),不再等待")
+
+    def _disconnect_quietly(self) -> None:
+        try:
+            self._client.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            self._bot.log(f"MQTT 中斷時出錯,忽略: {exc}")
+
+    def heartbeat_fragment(self) -> str:
+        """The MQTT counters, for the heartbeat line.
+
+        Volume belongs here and nowhere else. This mesh moves hundreds of
+        packets a minute and most of them get gatewayed, so a log line per
+        relayed message would bury every line worth reading; one periodic count
+        says the same thing and leaves the log readable.
+        """
+        text = (
+            f" MQTT {'已連線' if self.connected else '未連線'}"
+            f" 上行 {self.up_count} 下行 {self.down_count}"
+        )
+        if self.error_count:
+            text += f" 錯誤 {self.error_count}"
+        return text
+
+    # ---- broker connection ------------------------------------------------
+
+    def _build_client(self, settings: dict):
+        """A paho client aimed at `settings`, wired up but not yet connected.
+
+        Connecting is left to _supervise, on a thread of its own: this runs on
+        meshtastic's publishing thread, where a blocking connect to an
+        unreachable broker would stop the bot answering messages because MQTT
+        is down - the one thing a side channel must never do.
+
+        The client id is the node's own, as the firmware uses when it connects
+        directly (connectPubSub): brokers key their per-node state on it, and
+        two clients sharing an id take turns evicting each other.
+        """
+        client = self._new_client(settings)
+        if settings["tls"]:
+            # Default verification, unlike the firmware's setInsecure(): an
+            # ESP32 has no CA bundle to check against and this machine does, so
+            # there is no reason to accept any certificate offered. A private
+            # broker with a self-signed certificate is refused here and says so
+            # in the log rather than failing silently.
+            client.tls_set()
+        if settings["username"]:
+            client.username_pw_set(settings["username"], settings["password"])
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        return client
+
+    def _new_client(self, settings: dict):
+        if self._client_factory is not None:
+            return self._client_factory(settings)
+        paho = importlib.import_module(MQTT_MODULE[0])
+        # reconnect_on_failure off because _supervise owns the retries, using
+        # the same backoff table the link reconnect uses. Leaving paho's own
+        # retry on as well would put two schedules on one socket.
+        return paho.Client(
+            callback_api_version=paho.CallbackAPIVersion.VERSION2,
+            client_id=self._bot.my_id or "",
+            reconnect_on_failure=False,
+        )
+
+    def _supervise(self) -> None:
+        """Keep the broker connection up for as long as the bot is, pacing the
+        attempts with ReplyEngine's table - the same table the link reconnect
+        uses, and for the same reason: quick enough that a blip recovers at
+        once, then a steady poll rather than hammering a broker that is off.
+
+        loop_forever() returns instead of reconnecting, because the client was
+        built with reconnect_on_failure off, so this loop sees every drop.
+        """
+        attempt = 0
+        while not self._stopped.is_set():
+            attempt += 1
+            if self._stopped.wait(ReplyEngine._reconnect_delay(attempt)):
+                return
+            try:
+                self._client.connect(
+                    self._settings["host"], self._settings["port"], keepalive=60
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._note_outage(f"連不上 broker: {exc}")
+                continue
+            # A connect that worked starts the table over, so the next outage
+            # retries quickly instead of inheriting the last one's 30 seconds.
+            attempt = 0
+            try:
+                self._client.loop_forever()
+            except Exception as exc:  # noqa: BLE001
+                self._note_outage(f"broker 連線出錯: {exc}")
+
+    def _note_outage(self, detail: str) -> None:
+        """Report an outage once, not once per retry.
+
+        A broker that is down stays down for hours, and the retry pacing is
+        already known from the code. The heartbeat is what says it is still
+        down, so repeating the line here would only push the useful lines off
+        the screen.
+        """
+        self.connected = False
+        if self._reported_down:
+            return
+        self._reported_down = True
+        self._bot.log(f"MQTT {detail},持續重連中(不影響自動回覆)")
+
+    # ---- subscriptions ----------------------------------------------------
+
+    def _refresh_wanted_topics(self) -> None:
+        """Work out which broker topics this node has downlink use for.
+
+        The firmware cannot tell us. MQTT::sendSubscriptions() only runs on the
+        path where it opened the socket itself, so in proxy mode it never sends
+        a subscription list and the choice is the client's to make.
+
+        Two sources, because neither covers all of it. A channel with a name
+        gives its topic away directly. The usually-unnamed primary does not -
+        the firmware substitutes the modem preset's display name for the empty
+        one ("MediumFast", "LongFast", ...), a value the config we can read does
+        not carry - so that one is learned from the topics the node publishes
+        on, which spell it out. Mirroring the firmware's preset table here would
+        be one more copy of a firmware table to keep in step, and this repo
+        already carries one of those.
+
+        PKI comes in as soon as any channel takes downlink, matching the
+        firmware's own filter: direct messages arrive under that pseudo-channel
+        and no channel name reveals it.
+        """
+        self._downlink_wanted = False
+        for channel in self._bot.interface.localNode.channels or []:
+            if not channel.settings or not channel.settings.downlink_enabled:
+                continue
+            self._downlink_wanted = True
+            if channel.settings.name:
+                self._want(self._channel_topic(channel.settings.name))
+        if self._downlink_wanted:
+            self._want(self._channel_topic(MQTT_PKI_CHANNEL))
+
+    def _channel_topic(self, channel_id: str) -> str:
+        """The broker topic carrying downlink for one channel.
+
+        The node publishes to "<root>/2/e/<channel>/<node>"; the same channel's
+        downlink is that with the publishing node wildcarded.
+        """
+        return f"{self._settings['root']}{MQTT_ENVELOPE_PATH}{channel_id}/+"
+
+    def _want(self, topic: str) -> None:
+        """Add `topic` to the subscription set, sending it now if connected."""
+        with self._lock:
+            if topic in self._wanted:
+                return
+            self._wanted.add(topic)
+            # Under the same lock as the flag it reads: a topic added in the
+            # instant between "not connected yet" and on_connect's sweep would
+            # otherwise be subscribed by neither.
+            if self.connected:
+                self._client.subscribe(topic, qos=self.SUBSCRIBE_QOS)
+
+    def _learn_from_uplink(self, topic: str) -> None:
+        """Subscribe to the channel a published topic names.
+
+        This is what covers the unnamed primary - see _refresh_wanted_topics.
+        Nothing is learned until some channel wants downlink at all: the node
+        discards an envelope whose channel has downlink_enabled off
+        (onReceiveProto filters on exactly that flag), so subscribing to one
+        would spend link bandwidth to have it thrown away.
+        """
+        if not self._downlink_wanted:
+            return
+        prefix = f"{self._settings['root']}{MQTT_ENVELOPE_PATH}"
+        if not topic.startswith(prefix):
+            return
+        channel_id = topic[len(prefix) :].split("/")[0]
+        if channel_id:
+            self._want(f"{prefix}{channel_id}/+")
+
+    # ---- relay ------------------------------------------------------------
+
+    @_isolated
+    def on_proxy_message(self, proxymessage, interface) -> None:
+        """Radio -> broker. Subscribed to meshtastic.mqttclientproxymessage,
+        which the library publishes and then does nothing else with.
+
+        The payload is a oneof: protobuf-encoded envelopes arrive as `data`,
+        the JSON variant as `text`. Reading the wrong arm of a union gives
+        whichever bytes happen to alias it, so it is selected explicitly.
+        """
+        if self._client is None or self._stopped.is_set():
+            return
+        if proxymessage.WhichOneof("payload_variant") == "text":
+            payload = proxymessage.text.encode("utf-8")
+        else:
+            payload = proxymessage.data
+        self._client.publish(
+            proxymessage.topic,
+            payload,
+            qos=self.PUBLISH_QOS,
+            retain=bool(proxymessage.retained),
+        )
+        self.up_count += 1
+        self._learn_from_uplink(proxymessage.topic)
+
+    @_isolated
+    def _on_message(self, client, userdata, message) -> None:
+        """Broker -> radio. The node decodes and filters it from here
+        (onReceiveProto), so nothing is inspected on the way through."""
+        interface = self._bot.interface
+        if interface is None or self._stopped.is_set():
+            return
+        interface.sendMqttClientProxyMessage(message.topic, message.payload)
+        self.down_count += 1
+
+    @_isolated
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        # A refusal is where a wrong username lands, and it deserves a line
+        # of its own: the alternative is a bridge that looks up and moves
+        # nothing. See mqtt_connect_failed for why this is not `if reason_code`.
+        if mqtt_connect_failed(reason_code):
+            self.connected = False
+            self._note_error("connect", f"broker 拒絕連線: {reason_code}")
+            return
+        self._reported_down = False
+        with self._lock:
+            self.connected = True
+            # A clean session starts with no subscriptions at all, so the whole
+            # set is re-sent on every connect rather than left to the broker.
+            for topic in sorted(self._wanted):
+                client.subscribe(topic, qos=self.SUBSCRIBE_QOS)
+        self._bot.log(
+            f"MQTT 已連線 {self._settings['host']}:{self._settings['port']}"
+            f",訂閱 {len(self._wanted)} 個下行 topic"
+        )
+
+    @_isolated
+    def _on_disconnect(
+        self, client, userdata, flags=None, reason_code=None, properties=None
+    ) -> None:
+        if self._stopped.is_set():
+            return
+        self._note_outage(f"連線中斷 ({reason_code})")
+
+    # ---- errors -----------------------------------------------------------
+
+    def _note_error(self, where: str, exc) -> None:
+        """Count every failure, log each distinct one once.
+
+        The count is what the heartbeat reports; the line is what tells you
+        which failure it is. Repeating the line for a fault that recurs per
+        message would drown the log - the same reason relayed messages are
+        counted rather than logged.
+        """
+        self.error_count += 1
+        signature = f"{where}: {exc}"
+        if signature in self._reported_errors:
+            return
+        if len(self._reported_errors) >= self.ERROR_LINE_LIMIT:
+            return
+        self._reported_errors.add(signature)
+        self._bot.log(f"MQTT {signature}(不影響自動回覆)")
+
+
 class ServerBot(ReplyEngine):
     """Headless auto-reply server: the same rules engine with no UI.
 
@@ -1807,6 +2320,7 @@ class ServerBot(ReplyEngine):
         self,
         here: tuple[float, float] | None = None,
         heartbeat: int = 600,
+        mqtt: bool = False,
         out=None,
     ) -> None:
         self.here = here
@@ -1835,6 +2349,10 @@ class ServerBot(ReplyEngine):
         self.reconnect_attempt = 0
         self.reconnect_total = 0
         self._stopped = threading.Event()
+        # None unless --mqtt was given, and checked for None at every use
+        # rather than swapped for a do-nothing stand-in: "is the bridge on" is
+        # a thing the heartbeat and the shutdown both have to ask.
+        self.mqtt = MqttProxy(self) if mqtt else None
 
     # ---- output -----------------------------------------------------------
 
@@ -1956,6 +2474,15 @@ class ServerBot(ReplyEngine):
                 + ", ".join(unknown)
             )
 
+        # Last, and inside its own guard: everything above is what the bot is
+        # actually for, and a bridge that cannot start must not cost the
+        # startup report that tells you the rules loaded.
+        if self.mqtt is not None:
+            try:
+                self.mqtt.start()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"MQTT 橋接啟動失敗,略過: {exc}")
+
     def on_receive(self, packet, interface) -> None:
         # Before the text filter, for the reason the TUI does the same.
         self.packet_count += 1
@@ -1987,13 +2514,18 @@ class ServerBot(ReplyEngine):
 
     def _heartbeat_line(self) -> str:
         state = "連線中斷" if self.link_down else "已連線"
-        return (
+        line = (
             f"[心跳] {state} 執行 {format_elapsed(time.monotonic() - self.started_at)}"
             f" 封包 {self.packet_count}"
             f" 收訊 {self.received_count}"
             f" 自動回覆 {self.sent_auto_count}"
             f" 重連 {self.reconnect_total}"
         )
+        # Appended rather than interleaved so the columns a running server is
+        # read by stay where they were when --mqtt is off.
+        if self.mqtt is not None:
+            line += self.mqtt.heartbeat_fragment()
+        return line
 
     # How long to give the interface to close before leaving without it. BLE
     # teardown on macOS can block indefinitely; measured against a real node,
@@ -2021,6 +2553,11 @@ class ServerBot(ReplyEngine):
         cannot keep the process alive either.
         """
         self._closing = True
+        # Before the interface, so the relay stops handing it work while it is
+        # being torn down - and bounded in its own right, since a broker socket
+        # can hang exactly like a BLE one.
+        if self.mqtt is not None:
+            self.mqtt.stop()
         closer = threading.Thread(
             target=self._close_quietly, args=(interface,), daemon=True
         )
@@ -2151,13 +2688,19 @@ def resolve_server_target(
         print("請輸入清單上的編號。", file=sys.stderr)
 
 
-def detached_argv(target: tuple[str, str], here, heartbeat: int) -> list[str]:
+def detached_argv(
+    target: tuple[str, str], here, heartbeat: int, mqtt: bool = False
+) -> list[str]:
     """The command line for the background copy of ourselves.
 
     The device is passed explicitly because the parent has already chosen it -
     the child must never reach the interactive picker, since it has no terminal.
     --daemon is deliberately *not* forwarded: a child that daemonised again
     would spawn another child, and so on.
+
+    --mqtt is forwarded, because the child is the process that actually serves:
+    dropping it would leave --daemon --mqtt starting a server with no bridge
+    and nothing anywhere saying why.
     """
     transport, address = target
     flag = {
@@ -2176,6 +2719,8 @@ def detached_argv(target: tuple[str, str], here, heartbeat: int) -> list[str]:
     ]
     if here:
         argv += ["--here", f"{here[0]},{here[1]}"]
+    if mqtt:
+        argv.append("--mqtt")
     return argv
 
 
@@ -2275,6 +2820,16 @@ def main() -> None:
         "(default: %(default)s)",
     )
     parser.add_argument(
+        "--mqtt",
+        action="store_true",
+        help="bridge the node's MQTT to its broker over this connection. A "
+        "node reached over BLE has no network of its own, so its "
+        "proxy_to_client MQTT traffic goes nowhere unless a client carries it. "
+        "Off by default: a private mesh must not start republishing itself to "
+        "a public broker because the bot was started. Broker address, "
+        "credentials, root topic and TLS are read from the node.",
+    )
+    parser.add_argument(
         "--wifi",
         choices=("on", "off"),
         help="turn the node's WiFi on or off, then exit without starting the UI. "
@@ -2299,6 +2854,21 @@ def main() -> None:
     if args.daemon and not args.server:
         parser.error("--daemon 只能跟 --server 一起用")
 
+    if args.mqtt and not args.server:
+        parser.error("--mqtt 只能跟 --server 一起用")
+
+    # Checked here rather than left to fail at config sync, which on BLE is
+    # half a minute away and in the background by then. MQTT_MODULE explains
+    # why this is not simply in _REQUIRED_MODULES.
+    if args.mqtt:
+        try:
+            importlib.import_module(MQTT_MODULE[0])
+        except ImportError:
+            parser.error(
+                f"--mqtt 需要 {MQTT_MODULE[1]}:pip install {MQTT_MODULE[1]}"
+                f"(或用 ./{os.path.basename(__file__)} 讓 uv 自己備環境)"
+            )
+
     if args.server:
         target = resolve_server_target(args.host, args.port, args.ble)
         if target is None:
@@ -2307,10 +2877,15 @@ def main() -> None:
         if args.daemon:
             sys.exit(
                 spawn_detached(
-                    detached_argv(target, args.here, args.heartbeat), Path(args.log)
+                    detached_argv(target, args.here, args.heartbeat, args.mqtt),
+                    Path(args.log),
                 )
             )
-        sys.exit(ServerBot(here=args.here, heartbeat=args.heartbeat).run(transport, address))
+        sys.exit(
+            ServerBot(here=args.here, heartbeat=args.heartbeat, mqtt=args.mqtt).run(
+                transport, address
+            )
+        )
 
     MeshtasticTUI(
         tcp_host=args.host,

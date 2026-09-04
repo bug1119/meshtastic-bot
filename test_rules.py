@@ -3,6 +3,7 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #     "meshtastic",
+#     "paho-mqtt",
 #     "pypubsub",
 #     "textual",
 # ]
@@ -47,7 +48,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bot_dual as bot  # noqa: E402
 import bot_server  # noqa: E402
 import lora_params  # noqa: E402
-from meshtastic.protobuf import config_pb2  # noqa: E402
+from meshtastic.protobuf import config_pb2, mesh_pb2  # noqa: E402
+from pubsub import pub  # noqa: E402
 
 _failures: list[str] = []
 
@@ -2231,6 +2233,609 @@ def test_urllib3_warning_filtered():
         check(f"{name} does not silence urllib3 wholesale", 'module="urllib3"' in text, False)
 
 
+class _StubBrokerClient:
+    """Stands in for paho, recording what the bridge asked the broker to do.
+
+    Only the handful of calls MqttProxy makes, so a signature it gets wrong
+    fails here rather than against a live broker.
+    """
+
+    def __init__(self):
+        self.published = []
+        self.subscribed = []
+        self.connects = []
+        self.tls = False
+        self.credentials = None
+        self.disconnected = False
+        self.on_connect = None
+        self.on_disconnect = None
+        self.on_message = None
+
+    def tls_set(self, *args, **kwargs):
+        self.tls = True
+
+    def username_pw_set(self, username, password=None):
+        self.credentials = (username, password)
+
+    def subscribe(self, topic, qos=0):
+        self.subscribed.append((topic, qos))
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.published.append((topic, payload, qos, retain))
+
+    def connect(self, host, port, keepalive=60):
+        self.connects.append((host, port, keepalive))
+
+    def loop_forever(self):
+        threading.Event().wait()  # a connected client sits here until it drops
+
+    def disconnect(self):
+        self.disconnected = True
+
+
+class _QuietMqttProxy(bot.MqttProxy):
+    """MqttProxy with the reconnect thread neutered.
+
+    start() otherwise leaves a thread reaching for a broker for the rest of the
+    suite. The pacing that thread exists for is checked directly, in
+    test_mqtt_reconnect_pacing.
+    """
+
+    supervised = False
+
+    def _supervise(self):
+        self.supervised = True
+
+
+def _mqtt_config(**over):
+    """The MQTT module config as the node reports it - the real values read off
+    the hardware, so a default that drifts shows up as a changed expectation."""
+    fields = dict(
+        enabled=True,
+        proxy_to_client_enabled=True,
+        address="mqtt.meshtastic.org",
+        username="meshdev",
+        password="large4cats",
+        root="msh/TW",
+        tls_enabled=True,
+    )
+    fields.update(over)
+    return types.SimpleNamespace(**fields)
+
+
+def _mqtt_channel(index, name, downlink=True):
+    return types.SimpleNamespace(
+        index=index,
+        settings=types.SimpleNamespace(name=name, downlink_enabled=downlink),
+    )
+
+
+def _mqtt_bot(config=None, channels=None, out=None):
+    """A stand-in for the bot the bridge hangs off.
+
+    MqttProxy only ever touches .interface, .my_id and .log, which is the point
+    of it holding the bot rather than the interface: the interface object is
+    replaced on every link reconnect.
+    """
+    out = out if out is not None else io.StringIO()
+    to_radio = []
+    interface = types.SimpleNamespace(
+        localNode=types.SimpleNamespace(
+            moduleConfig=types.SimpleNamespace(mqtt=config or _mqtt_config()),
+            channels=channels if channels is not None else [_mqtt_channel(3, "EDGE_ATS")],
+        ),
+        sendMqttClientProxyMessage=lambda topic, data: to_radio.append((topic, data)),
+    )
+    holder = types.SimpleNamespace(
+        interface=interface,
+        my_id="!f2dcbabe",
+        log=lambda text: print(text, file=out),
+    )
+    return holder, to_radio, out
+
+
+def _started_proxy(config=None, channels=None, out=None):
+    """A bridge already started against a stub broker, plus everything to
+    inspect afterwards."""
+    holder, to_radio, out = _mqtt_bot(config, channels, out)
+    stub = _StubBrokerClient()
+    proxy = _QuietMqttProxy(holder, client_factory=lambda settings: stub)
+    proxy.start()
+    return proxy, stub, holder, to_radio, out
+
+
+def _proxy_message(topic, data=None, text=None, retained=False):
+    """A real MqttClientProxyMessage, not a namespace: the payload is a oneof
+    and WhichOneof is what the bridge selects on."""
+    message = mesh_pb2.MqttClientProxyMessage()
+    message.topic = topic
+    if text is None:
+        message.data = data if data is not None else b""
+    else:
+        message.text = text
+    message.retained = retained
+    return message
+
+
+def test_mqtt_broker_settings():
+    print("the broker is read off the node, not written down here")
+    # The operator changes these on the device. A bridge with its own copy would
+    # keep publishing to yesterday's broker, so this reads the node's config -
+    # these are the values the real node reports today.
+    settings = bot.mqtt_broker_settings(_mqtt_config())
+    check("host from the node", settings["host"], "mqtt.meshtastic.org")
+    check("tls means 8883", settings["port"], bot.MQTT_TLS_PORT)
+    check("credentials from the node", settings["username"], "meshdev")
+    check("root from the node", settings["root"], "msh/TW")
+    check("tls flag from the node", settings["tls"], True)
+
+    print("without tls it is the plain port")
+    plain = bot.mqtt_broker_settings(_mqtt_config(tls_enabled=False))
+    check("port", plain["port"], bot.MQTT_PORT)
+
+    print("an address may name its own port")
+    # The device has no port setting at all, so "host:port" in the address is
+    # the only way to reach a broker that is not on 1883/8883.
+    named = bot.mqtt_broker_settings(_mqtt_config(address="broker.lan:1884"))
+    check("host", named["host"], "broker.lan")
+    check("port wins over the tls default", named["port"], 1884)
+
+    print("blank fields fall back to what the firmware falls back to")
+    blank = bot.mqtt_broker_settings(
+        _mqtt_config(address="", username="", password="", root="")
+    )
+    check("address", blank["host"], bot.MQTT_DEFAULT_ADDRESS)
+    check("root", blank["root"], bot.MQTT_DEFAULT_ROOT)
+    # A blank address discards the stored credentials as well, which is what
+    # PubSubConfig does: credentials for a broker the operator did not name are
+    # credentials for the wrong broker.
+    kept = bot.mqtt_broker_settings(_mqtt_config(address="", username="me", password="pw"))
+    check("username is not carried onto the default broker", kept["username"], bot.MQTT_DEFAULT_USERNAME)
+    check("nor the password", kept["password"], bot.MQTT_DEFAULT_PASSWORD)
+    # But a named broker keeps a deliberately empty username - an open broker
+    # is a real configuration.
+    anon = bot.mqtt_broker_settings(_mqtt_config(address="broker.lan", username="", password=""))
+    check("a named broker may have no credentials", anon["username"], "")
+
+    print("a trailing slash on the root does not double up")
+    # The firmware pastes the root onto a path that already starts with one, so
+    # "msh/TW/" there would give "msh/TW//2/e/" here.
+    slashed = bot.mqtt_broker_settings(_mqtt_config(root="msh/TW/"))
+    check("root", slashed["root"], "msh/TW")
+
+
+def test_mqtt_uplink_reaches_the_broker():
+    print("a proxy message from the radio is published to the broker")
+    proxy, stub, holder, _, out = _started_proxy()
+
+    print("the connection is set up from the node's settings")
+    check("tls was switched on", stub.tls, True)
+    check("the node's credentials were used", stub.credentials, ("meshdev", "large4cats"))
+    check("callbacks are wired", stub.on_message is not None, True)
+    check("the reconnect thread was started", proxy.supervised, True)
+
+    # Nothing may be sent before the broker accepts us: paho refuses a
+    # subscribe with no connection, so the set is sent from on_connect.
+    check("nothing subscribed before connect", stub.subscribed, [])
+    proxy._on_connect(stub, None, {}, 0, None)
+    check(
+        "the channel and PKI topics are subscribed on connect",
+        sorted(topic for topic, _ in stub.subscribed),
+        ["msh/TW/2/e/EDGE_ATS/+", "msh/TW/2/e/PKI/+"],
+    )
+    check("at the firmware's QoS", {qos for _, qos in stub.subscribed}, {1})
+
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/EDGE_ATS/!f2dcbabe", data=b"\x01\x02"), holder.interface
+    )
+    check(
+        "published verbatim",
+        stub.published,
+        [("msh/TW/2/e/EDGE_ATS/!f2dcbabe", b"\x01\x02", 0, False)],
+    )
+    check("counted, not logged", proxy.up_count, 1)
+
+    print("the retained flag and the text variant survive")
+    # The payload is a oneof: reading the wrong arm of a union gives whichever
+    # bytes happen to alias it, which for a text message is its own characters
+    # read as a length.
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/map/", text="hello", retained=True), holder.interface
+    )
+    check("text is sent as bytes", stub.published[-1][1], b"hello")
+    check("retained is passed through", stub.published[-1][3], True)
+
+    print("the primary channel's topic is learned from what the node publishes")
+    # The firmware names the unnamed primary after the modem preset, a value the
+    # config does not carry - so it is taken from the topic the node used.
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/MediumFast/!f2dcbabe", data=b"x"), holder.interface
+    )
+    check(
+        "subscribed to it as it appears",
+        ("msh/TW/2/e/MediumFast/+", 1) in stub.subscribed,
+        True,
+    )
+    # Once is enough - the node publishes on it constantly.
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/MediumFast/!f2dcbabe", data=b"y"), holder.interface
+    )
+    check(
+        "and not again for every packet",
+        [t for t, _ in stub.subscribed].count("msh/TW/2/e/MediumFast/+"),
+        1,
+    )
+
+    print("nothing is learned when no channel wants downlink")
+    # The node discards an envelope whose channel has downlink_enabled off, so
+    # subscribing to one only spends link bandwidth.
+    quiet, quiet_stub, quiet_holder, _, _ = _started_proxy(
+        channels=[_mqtt_channel(3, "EDGE_ATS", downlink=False)]
+    )
+    quiet._on_connect(quiet_stub, None, {}, 0, None)
+    quiet.on_proxy_message(
+        _proxy_message("msh/TW/2/e/MediumFast/!f2dcbabe", data=b"x"), quiet_holder.interface
+    )
+    check("no subscriptions at all", quiet_stub.subscribed, [])
+    check("but the uplink still goes out", len(quiet_stub.published), 1)
+
+    print("one line per state change, and none per message")
+    log = out.getvalue()
+    check("said it started", "MQTT 橋接啟動" in log, True)
+    check("said it connected", "MQTT 已連線" in log, True)
+    # Four messages went through above. A line each would bury the log on a mesh
+    # moving hundreds of packets a minute.
+    check("no line per message", log.count("\n"), 2)
+    check("the volume is in the heartbeat instead", "上行 4" in proxy.heartbeat_fragment(), True)
+
+
+def test_mqtt_downlink_reaches_the_radio():
+    print("a broker message is handed back to the node")
+    proxy, stub, holder, to_radio, _ = _started_proxy()
+    proxy._on_connect(stub, None, {}, 0, None)
+
+    proxy._on_message(
+        stub, None, types.SimpleNamespace(topic="msh/TW/2/e/EDGE_ATS/!other", payload=b"\x08\x01")
+    )
+    # Handed over untouched: the node decodes and filters it itself
+    # (onReceiveProto), so there is nothing useful to inspect on the way.
+    check("forwarded verbatim", to_radio, [("msh/TW/2/e/EDGE_ATS/!other", b"\x08\x01")])
+    check("counted", proxy.down_count, 1)
+
+    print("a downlink arriving after the link went away is dropped, not raised")
+    # The bridge outlives any one interface: a reconnect replaces the object,
+    # and between the two there is none.
+    holder.interface = None
+    proxy._on_message(stub, None, types.SimpleNamespace(topic="t", payload=b"z"))
+    check("nothing forwarded", len(to_radio), 1)
+    check("and it was not counted as an error", proxy.error_count, 0)
+
+
+def test_mqtt_is_off_without_the_flag():
+    print("no --mqtt, no bridge - and nothing else changes")
+    # A bridge that started itself would take a mesh the operator may consider
+    # private and begin republishing it to whatever broker the device names,
+    # which for an untouched config is the public one.
+    out = io.StringIO()
+    server, _ = _fake_server("[EDGE_ATS]\nping=pong\n", out)
+    check("no bridge object at all", server.mqtt, None)
+
+    server.interface.localNode.moduleConfig = types.SimpleNamespace(mqtt=_mqtt_config())
+    server.on_config_synced(server.interface)
+    log = out.getvalue()
+    check("config sync says nothing about MQTT", "MQTT" in log, False)
+    # The heartbeat columns a running server is read by must not move.
+    check("the heartbeat is unchanged", "MQTT" in server._heartbeat_line(), False)
+    check("the rules report still happened", "[EDGE_ATS]=1" in log, True)
+
+    print("with --mqtt the same sync starts it")
+    out2 = io.StringIO()
+    server2, _ = _fake_server("[EDGE_ATS]\nping=pong\n", out2)
+    server2.interface.localNode.moduleConfig = types.SimpleNamespace(mqtt=_mqtt_config())
+    server2.interface.localNode.channels = [_mqtt_channel(3, "EDGE_ATS")]
+    stub = _StubBrokerClient()
+    server2.mqtt = _QuietMqttProxy(server2, client_factory=lambda settings: stub)
+    server2.on_config_synced(server2.interface)
+    # The whole line, not just its prefix: a start that failed logs
+    # "MQTT 橋接啟動失敗", which a substring test would happily accept.
+    check("the bridge started", "MQTT 橋接啟動: mqtts://" in out2.getvalue(), True)
+    check("and the heartbeat now carries it", "MQTT" in server2._heartbeat_line(), True)
+
+    print("--mqtt is forwarded to the background copy")
+    # The child is the process that actually serves. Dropping the flag would
+    # leave --daemon --mqtt running a server with no bridge and nothing saying so.
+    argv = bot.detached_argv((bot.TRANSPORT_BLE, "Bug2_1ca6"), None, 600, True)
+    check("child gets --mqtt", "--mqtt" in argv, True)
+    check(
+        "and does not when it was not asked for",
+        "--mqtt" in bot.detached_argv((bot.TRANSPORT_BLE, "Bug2_1ca6"), None, 600),
+        False,
+    )
+
+
+def test_mqtt_respects_the_device_settings():
+    print("the device can refuse the bridge, and says why")
+    # Both of these are device settings, so the fix is on the device - worth a
+    # plain line, since --mqtt was asked for and nothing would be relayed.
+    proxy, _, _, _, out = _started_proxy(_mqtt_config(enabled=False))
+    check("no client was built", proxy._client, None)
+    check("mqtt.enabled is named", "mqtt.enabled" in out.getvalue(), True)
+
+    proxy, _, _, _, out = _started_proxy(_mqtt_config(proxy_to_client_enabled=False))
+    check("no client was built", proxy._client, None)
+    check("proxy_to_client_enabled is named", "proxy_to_client_enabled" in out.getvalue(), True)
+
+    print("and a bridge that never started relays nothing rather than raising")
+    holder, to_radio, _ = _mqtt_bot()
+    proxy.on_proxy_message(_proxy_message("t", data=b"x"), holder.interface)
+    check("nothing published, nothing raised", proxy.up_count, 0)
+    check("and no error recorded either", proxy.error_count, 0)
+
+
+def test_mqtt_failures_stay_inside_the_bridge():
+    print("a broker that fails must not take the bot with it")
+    proxy, stub, holder, to_radio, out = _started_proxy()
+    proxy._on_connect(stub, None, {}, 0, None)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("broker gone")
+
+    # The uplink runs on meshtastic's publishing thread - the thread that hands
+    # every received packet to on_receive. An exception loose there would stop
+    # the bot answering messages at all.
+    stub.publish = explode
+    proxy.on_proxy_message(_proxy_message("t", data=b"x"), holder.interface)
+    check("the exception did not escape", True, True)
+    check("it was counted", proxy.error_count, 1)
+    check("and named once", "broker gone" in out.getvalue(), True)
+
+    print("the same failure repeating does not repeat the log line")
+    before = out.getvalue().count("broker gone")
+    for _ in range(50):
+        proxy.on_proxy_message(_proxy_message("t", data=b"x"), holder.interface)
+    check("still one line", out.getvalue().count("broker gone"), before)
+    check("but every failure is counted", proxy.error_count, 51)
+    check("and the heartbeat shows it", "錯誤 51" in proxy.heartbeat_fragment(), True)
+
+    print("a radio that fails on the way back is contained too")
+    # This one runs on paho's network thread, which the downlink needs.
+    holder.interface = types.SimpleNamespace(sendMqttClientProxyMessage=explode)
+    proxy._on_message(stub, None, types.SimpleNamespace(topic="t", payload=b"z"))
+    check("not raised", True, True)
+    check("not counted as delivered", proxy.down_count, 0)
+
+    print("a refused connect is reported, not read as success")
+    # paho's v2 callbacks hand over a ReasonCode object, which has no __bool__
+    # and is therefore truthy even for Success. Measured against the real
+    # broker: `if reason_code:` logged "broker 拒絕連線: Success" and then
+    # relayed nothing at all.
+    check(
+        "a Success-like reason code is not a failure",
+        bot.mqtt_connect_failed(types.SimpleNamespace(is_failure=False)),
+        False,
+    )
+    check(
+        "a failing one is",
+        bot.mqtt_connect_failed(types.SimpleNamespace(is_failure=True)),
+        True,
+    )
+    check("a plain 0 is still accepted", bot.mqtt_connect_failed(0), False)
+    out3 = io.StringIO()
+    refused, refused_stub, _, _, out3 = _started_proxy(out=out3)
+    refused._on_connect(refused_stub, None, {}, types.SimpleNamespace(is_failure=True), None)
+    check("not marked connected", refused.connected, False)
+    check("nothing subscribed", refused_stub.subscribed, [])
+    check("said so", "拒絕連線" in out3.getvalue(), True)
+
+
+def test_mqtt_uplink_survives_pubsub_delivery():
+    print("the guarded handler is still one pubsub will deliver to")
+    # The uplink is reached through pub.sendMessage, and pypubsub inspects a
+    # listener's signature before accepting it. A wrapper that hid the argument
+    # names would be rejected at subscribe time - which is the whole feature
+    # failing, on a code path no direct call exercises.
+    proxy, stub, holder, _, _ = _started_proxy()
+    proxy._on_connect(stub, None, {}, 0, None)
+    try:
+        pub.sendMessage(
+            "meshtastic.mqttclientproxymessage",
+            proxymessage=_proxy_message("msh/TW/2/e/EDGE_ATS/!x", data=b"via-pubsub"),
+            interface=holder.interface,
+        )
+        check("the message arrived", [p[1] for p in stub.published], [b"via-pubsub"])
+    finally:
+        proxy.stop()
+    check("stop unsubscribes", proxy._stopped.is_set(), True)
+    pub.sendMessage(
+        "meshtastic.mqttclientproxymessage",
+        proxymessage=_proxy_message("msh/TW/2/e/EDGE_ATS/!x", data=b"after-stop"),
+        interface=holder.interface,
+    )
+    check("and nothing arrives afterwards", len(stub.published), 1)
+
+
+class _RecordingEvent:
+    """Stands in for the stop event, so _supervise's pacing can be read off
+    instead of waited out."""
+
+    def __init__(self, stop_after):
+        self.waits = []
+        self._stop_after = stop_after
+
+    def is_set(self):
+        return len(self.waits) >= self._stop_after
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return self.is_set()
+
+    def set(self):
+        self._stop_after = 0
+
+
+def test_mqtt_reconnect_pacing():
+    print("the broker reconnect uses the same backoff table as the link")
+    proxy, stub, holder, _, out = _started_proxy()
+
+    def refuse(*args, **kwargs):
+        raise OSError("connection refused")
+
+    stub.connect = refuse
+    proxy._stopped = _RecordingEvent(stop_after=6)
+    # The real one: _QuietMqttProxy replaces _supervise so start() cannot leave
+    # a thread behind, and this is the test that method exists for.
+    bot.MqttProxy._supervise(proxy)
+    check(
+        "1, 2, 5, 10, then 30 a time",
+        proxy._stopped.waits,
+        [1, 2, 5, 10, 30, 30],
+    )
+    check(
+        "which is ReplyEngine's table",
+        proxy._stopped.waits[:5],
+        list(bot.ReplyEngine.RECONNECT_DELAYS),
+    )
+    # An outage is one log line, not one per retry: a broker that is down stays
+    # down for hours, and the heartbeat is what says it still is.
+    check("reported once", out.getvalue().count("連不上 broker"), 1)
+    check("and not marked connected", proxy.connected, False)
+
+    print("a connect that worked starts the table over")
+    # Otherwise the next outage would inherit the last one's 30 seconds, and a
+    # momentary blip would take half a minute to recover from.
+    proxy2, stub2, _, _, _ = _started_proxy()
+    attempts = []
+
+    def once_then_refuse(host, port, keepalive=60):
+        attempts.append(host)
+        if len(attempts) > 1:
+            raise OSError("connection refused")
+
+    stub2.connect = once_then_refuse
+    stub2.loop_forever = lambda: None  # a drop, right after connecting
+    proxy2._stopped = _RecordingEvent(stop_after=3)
+    bot.MqttProxy._supervise(proxy2)
+    check("waited 1s, connected, then 1s again", proxy2._stopped.waits, [1, 1, 2])
+
+
+def test_mqtt_shutdown_is_bounded():
+    print("the broker disconnect gets a deadline, like the interface close")
+    # Same reason ServerBot.CLOSE_TIMEOUT exists: a teardown that can block is a
+    # process that needs SIGKILL, and this is the least important thing a
+    # shutdown waits on.
+    proxy, stub, _, _, out = _started_proxy()
+    proxy.STOP_TIMEOUT = 1  # keep the test quick; the shape is what matters
+    hanging = threading.Event()
+
+    def never_returns():
+        hanging.set()
+        threading.Event().wait()
+
+    stub.disconnect = never_returns
+    started = time.monotonic()
+    proxy.stop()
+    took = time.monotonic() - started
+    check("disconnect was attempted", hanging.is_set(), True)
+    check("gave up rather than hanging", took < 5, True)
+    check("waited about the deadline", 0.9 <= took < 3, True)
+    check("said so", "MQTT 中斷逾時" in out.getvalue(), True)
+
+    print("a disconnect that raises is swallowed")
+    proxy2, stub2, _, _, out2 = _started_proxy()
+
+    def raising():
+        raise RuntimeError("socket already gone")
+
+    stub2.disconnect = raising
+    proxy2.stop()
+    check("logged and ignored", "socket already gone" in out2.getvalue(), True)
+
+    print("a clean disconnect is immediate and says nothing extra")
+    proxy3, stub3, _, _, out3 = _started_proxy()
+    started = time.monotonic()
+    proxy3.stop()
+    check("immediate", time.monotonic() - started < 1, True)
+    check("it did disconnect", stub3.disconnected, True)
+    check("no timeout message", "逾時" in out3.getvalue(), False)
+
+    print("and a bridge that never connected has nothing to stop")
+    proxy4, _, _, _, out4 = _started_proxy(_mqtt_config(enabled=False))
+    proxy4.stop()
+    check("no timeout message", "逾時" in out4.getvalue(), False)
+
+
+def test_mqtt_shutdown_runs_before_the_interface():
+    print("stopping the server stops the bridge, before closing the link")
+    # The relay must not still be handing the interface work while it is being
+    # torn down - and it needs its own deadline, since a broker socket can hang
+    # exactly like a BLE one.
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    order = []
+    server.mqtt = types.SimpleNamespace(stop=lambda: order.append("mqtt"))
+
+    class Interface:
+        def close(self):
+            order.append("interface")
+
+    server._shutdown(Interface())
+    check("bridge first, link second", order, ["mqtt", "interface"])
+
+    print("and a server with no bridge shuts down exactly as before")
+    out2 = io.StringIO()
+    server2, _ = _fake_server("[*]\nping=pong\n", out2)
+    closed = []
+
+    class Interface2:
+        def close(self):
+            closed.append(True)
+
+    server2._shutdown(Interface2())
+    check("the link still closed", closed, [True])
+    check("nothing about MQTT", "MQTT" in out2.getvalue(), False)
+
+
+def test_mqtt_bridge_is_in_both_files():
+    print("the bridge exists in bot_dual and in the generated bot_server")
+    # bot_server.py is generated by stripping the UI. A feature that lands in
+    # bot_dual and not in the file people actually deploy is invisible until
+    # someone tries to use it there.
+    check("bot_dual has the bridge", hasattr(bot, "MqttProxy"), True)
+    check("bot_server has it too", hasattr(bot_server, "MqttProxy"), True)
+    check(
+        "and it is one implementation",
+        inspect.getsource(bot.MqttProxy) == inspect.getsource(bot_server.MqttProxy),
+        True,
+    )
+    for name in ("mqtt_broker_settings", "mqtt_connect_failed", "_isolated"):
+        check(
+            f"{name} is identical",
+            inspect.getsource(getattr(bot, name))
+            == inspect.getsource(getattr(bot_server, name)),
+            True,
+        )
+
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(bot.__file__).parent
+    for name in ("bot_dual.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        # The uv header is what makes ./bot_server.py work without a pip
+        # install, and the generator edits that header, so it is the one place
+        # a new dependency can silently be dropped.
+        check(f"{name} declares paho-mqtt", '#     "paho-mqtt",' in text, True)
+        check(f"{name} has the flag", '"--mqtt",' in text, True)
+        check(f"{name} passes it to ServerBot", "mqtt=args.mqtt" in text, True)
+        check(f"{name} forwards it to the child", 'argv.append("--mqtt")' in text, True)
+    # bot.py is frozen as the original monitor and has no server to bridge from.
+    frozen = (root / "bot.py").read_text(encoding="utf-8")
+    check("bot.py is left alone", "--mqtt" in frozen, False)
+
+    # paho is imported on first use, not at module import: a bot started without
+    # --mqtt must not need a package it will never touch, which is also why it
+    # is not in _REQUIRED_MODULES.
+    check("paho is not a hard import", "import paho" in inspect.getsource(bot), False)
+    check("nor a required module", "paho" in str(bot._REQUIRED_MODULES), False)
 if __name__ == "__main__":
     original = bot.RULES_FILE
     try:
@@ -2292,6 +2897,17 @@ if __name__ == "__main__":
         test_when_falls_back_to_our_clock()
         test_server_report_understands_exclusions()
         test_urllib3_warning_filtered()
+        test_mqtt_broker_settings()
+        test_mqtt_uplink_reaches_the_broker()
+        test_mqtt_downlink_reaches_the_radio()
+        test_mqtt_is_off_without_the_flag()
+        test_mqtt_respects_the_device_settings()
+        test_mqtt_failures_stay_inside_the_bridge()
+        test_mqtt_uplink_survives_pubsub_delivery()
+        test_mqtt_reconnect_pacing()
+        test_mqtt_shutdown_is_bounded()
+        test_mqtt_shutdown_runs_before_the_interface()
+        test_mqtt_bridge_is_in_both_files()
     finally:
         bot.RULES_FILE = original
 

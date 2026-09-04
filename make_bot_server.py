@@ -94,8 +94,11 @@ from textual.widgets import Input, Label, ListItem, ListView, RichLog
 sub("\nimport lora_params\n", "")
 sub("import unicodedata\n", "")
 
-# Nobody should have to install a UI toolkit to run a headless server.
+# Nobody should have to install a UI toolkit to run a headless server. Every
+# other declared dependency is left alone: paho-mqtt in particular has to stay,
+# since --mqtt exists in both files.
 sub('#     "textual",\n', "")
+assert '#     "paho-mqtt",\n' in source, "paho-mqtt must survive into bot_server.py"
 required = re.search(r"_REQUIRED_MODULES = \[.*?\]\n", source, re.S).group(0)
 assert "textual" in required, "expected textual in _REQUIRED_MODULES"
 source = source.replace(
@@ -212,6 +215,10 @@ sub(
         "is never sent to the device or the mesh.",''',
 )
 
+# --wifi belongs to bot.py, and the --server guards have nothing to guard here.
+# The paho check survives: --mqtt is a real flag in both files, and finding out
+# the package is missing half a minute into a BLE connect - in the background,
+# by then - is exactly what checking it up front avoids.
 sub(
     '''    if args.wifi:
         if args.port:
@@ -225,7 +232,14 @@ sub(
     if args.daemon and not args.server:
         parser.error("--daemon 只能跟 --server 一起用")
 
-    if args.server:
+    if args.mqtt and not args.server:
+        parser.error("--mqtt 只能跟 --server 一起用")
+
+''',
+    "",
+)
+sub(
+    '''    if args.server:
         target = resolve_server_target(args.host, args.port, args.ble)
         if target is None:
             sys.exit(1)
@@ -233,10 +247,15 @@ sub(
         if args.daemon:
             sys.exit(
                 spawn_detached(
-                    detached_argv(target, args.here, args.heartbeat), Path(args.log)
+                    detached_argv(target, args.here, args.heartbeat, args.mqtt),
+                    Path(args.log),
                 )
             )
-        sys.exit(ServerBot(here=args.here, heartbeat=args.heartbeat).run(transport, address))
+        sys.exit(
+            ServerBot(here=args.here, heartbeat=args.heartbeat, mqtt=args.mqtt).run(
+                transport, address
+            )
+        )
 
     MeshtasticTUI(
         tcp_host=args.host,
@@ -251,10 +270,15 @@ sub(
     if args.daemon:
         sys.exit(
             spawn_detached(
-                detached_argv(target, args.here, args.heartbeat), Path(args.log)
+                detached_argv(target, args.here, args.heartbeat, args.mqtt),
+                Path(args.log),
             )
         )
-    sys.exit(ServerBot(here=args.here, heartbeat=args.heartbeat).run(transport, address))''',
+    sys.exit(
+        ServerBot(here=args.here, heartbeat=args.heartbeat, mqtt=args.mqtt).run(
+            transport, address
+        )
+    )''',
 )
 
 OUT.write_text(source, encoding="utf-8")
