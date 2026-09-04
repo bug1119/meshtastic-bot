@@ -874,6 +874,31 @@ def local_status_lines(bot) -> list[str]:
     return lines
 
 
+def channel_label(interface, index: int) -> str:
+    """`4(CLSE)` for a named channel, `4` for one without a name.
+
+    The number leads so a log stays greppable by it, and the name follows
+    because that is what anyone reading recognises - rules.txt is written in
+    channel names, so a line saying only `channel:4` means going and looking
+    the number up somewhere else.
+
+    An unnamed channel gets nothing rather than a guess. The firmware does
+    substitute the modem preset's display name for an empty primary when it
+    builds MQTT topics, but that substitution belongs to the firmware, and
+    printing it here would read as a name somebody had set.
+
+    Guarded, because this is a label on a log line: a channel table in an
+    unexpected shape must not stop a message from being handled.
+    """
+    try:
+        for ch in interface.localNode.channels or []:
+            if ch.settings and ch.index == index and ch.settings.name:
+                return f"{index}({ch.settings.name})"
+    except Exception:  # noqa: BLE001
+        pass
+    return str(index)
+
+
 BOT_REPLY_PREFIX = "BOT: "
 
 
@@ -2584,7 +2609,8 @@ class ServerBot(ReplyEngine):
             return
         sender = node_label(interface.nodes or {}, info["from_id"])
         kind, key = info["target"]
-        self.log(f"{kind}:{key} {format_incoming_line(info, sender, markup=False)}")
+        label = channel_label(interface, key) if kind == "channel" else key
+        self.log(f"{kind}:{label} {format_incoming_line(info, sender, markup=False)}")
         if info["from_id"] != self.my_id:
             self.received_count += 1
         if not self._should_auto_reply(info):
