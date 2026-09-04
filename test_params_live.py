@@ -3,6 +3,7 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #     "meshtastic",
+#     "paho-mqtt",
 #     "pypubsub",
 #     "textual",
 # ]
@@ -32,6 +33,12 @@ rules.txt is emptied for the duration and restored afterwards, so nothing here
 transmits on the mesh. --wifi is only checked for its argument handling: it
 writes to a device and reboots it, which is not something a test should do
 behind your back.
+
+--mqtt is the same kind of flag and gets the same treatment: its parsing and
+its clean-failure path are always checked, but actually bridging the node to
+its broker republishes the mesh to whatever address the device names - the
+public one, for an untouched config - so the connected case needs --mqtt-live
+before it will run.
 """
 
 from __future__ import annotations
@@ -53,6 +60,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PY = sys.executable
+
+# Whether the interpreter running this file can import paho, which is what the
+# programs' --mqtt guard checks. Declared in the header above, so the shebang
+# route always has it; a bare `python3 test_params_live.py` may not, and that
+# changes what --mqtt is expected to do rather than making it untestable.
+try:
+    import paho.mqtt.client  # noqa: F401
+    HAVE_PAHO = True
+except ImportError:
+    HAVE_PAHO = False
 
 # How long to hold a connected run. A BLE connect takes ~25-30s before config
 # sync lands, so anything much shorter tests the wrong thing.
@@ -326,6 +343,13 @@ def main():
         action="store_true",
         help="only the cases that need no connection (fast, no hardware)",
     )
+    parser.add_argument(
+        "--mqtt-live",
+        action="store_true",
+        help="also bridge the node to its real broker for one connected run. "
+        "Off by default: it republishes this mesh to whatever address the "
+        "device names, which is not a side effect a test should have.",
+    )
     args = parser.parse_args()
 
     node = None
@@ -356,9 +380,9 @@ def main():
             ("bot.py", ["--host", "--port", "--here", "--wifi"]),
             (
                 "bot_dual.py",
-                ["--host", "--port", "--ble", "--list", "--server", "--daemon", "--log", "--heartbeat", "--wifi"],
+                ["--host", "--port", "--ble", "--list", "--server", "--daemon", "--log", "--heartbeat", "--wifi", "--mqtt"],
             ),
-            ("bot_server.py", ["--host", "--port", "--ble", "--list", "--daemon", "--log", "--heartbeat"]),
+            ("bot_server.py", ["--host", "--port", "--ble", "--list", "--daemon", "--log", "--heartbeat", "--mqtt"]),
         ):
             run([program, "--help"], 120, expect_rc=0, expect_out=flags, name=f"{program} --help")
 
@@ -369,6 +393,10 @@ def main():
             expect_out=["--wifi needs a target"], name="bot_dual.py --wifi with no target")
         run(["bot_dual.py", "--daemon", "--port", "/dev/null"], 120, expect_rc=2,
             name="bot_dual.py --daemon without --server")
+        run(["bot_dual.py", "--mqtt", "--port", "/dev/null"], 120, expect_rc=2,
+            name="bot_dual.py --mqtt without --server")
+        run(["bot.py", "--mqtt"], 120, expect_rc=2,
+            name="bot.py has no --mqtt")
         run(["bot.py", "--here", "not-a-coord"], 120, expect_rc=2, name="--here nonsense")
         run(["bot_server.py", "--here", "999,999"], 120, expect_rc=2, name="--here out of range")
         run(["bot_server.py", "--ble", "X", "--heartbeat", "abc"], 120, expect_rc=2,
@@ -384,6 +412,20 @@ def main():
         run(["bot_dual.py", "--server", "--port", "/dev/cu.does-not-exist"], 300, expect_rc=1,
             expect_out=["連線失敗"], expect_absent=["Traceback"],
             name="bot_dual.py --server --port that does not exist")
+        # --mqtt must not change how a failed connect ends: the bridge only
+        # starts at config sync, so this never reaches a broker. Which of the
+        # two endings is correct depends on the interpreter running this file,
+        # and both are worth pinning - the whole point of checking paho up
+        # front is that it fails here rather than half a minute into a BLE
+        # connect, in the background, where nobody sees it.
+        if HAVE_PAHO:
+            run(["bot_server.py", "--mqtt", "--port", "/dev/cu.does-not-exist"], 300, expect_rc=1,
+                expect_out=["連線失敗"], expect_absent=["Traceback", "MQTT"],
+                name="bot_server.py --mqtt --port that does not exist")
+        else:
+            run(["bot_server.py", "--mqtt", "--port", "/dev/cu.does-not-exist"], 300, expect_rc=2,
+                expect_out=["paho-mqtt"], expect_absent=["Traceback", "連線"],
+                name="bot_server.py --mqtt without paho installed")
 
         print("\n=== --list ===")
         for program in ("bot_server.py", "bot_dual.py"):
@@ -400,6 +442,17 @@ def main():
             hold(["bot_dual.py", "--server", "--ble", node, "--heartbeat", "20"],
                  "bot_dual.py --server --ble", expect_out=["已連線", "設定同步完成", "[心跳]"],
                  key="bot_dual.py --server")
+            if args.mqtt_live:
+                # The only case here that talks to anything but the node, and
+                # the only one that puts this mesh on a public broker - hence
+                # the separate flag. "MQTT 已連線" rather than just "MQTT":
+                # every refusal line starts with MQTT too.
+                hold(["bot_server.py", "--ble", node, "--mqtt", "--heartbeat", "20"],
+                     "bot_server.py --ble --mqtt",
+                     expect_out=["設定同步完成", "MQTT 橋接啟動", "MQTT 已連線", "[心跳] "],
+                     key="bot_server.py --mqtt")
+            else:
+                print("  (--mqtt: skipped, needs --mqtt-live)")
             # "已連線" as well as the pane title: a TUI whose connection failed
             # stays up showing the device list, and its RSS would then be
             # reported as a connected figure when it is nothing of the kind.
