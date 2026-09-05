@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Regenerate bot_server.py from bot_dual.py by removing the UI.
+"""Regenerate bot_server.py from bot.py by removing the UI.
 
-There are three files and they are not three codebases:
+There are two files and they are not two codebases:
 
-    bot.py         the original monitor, left alone
-    bot_dual.py    the monitor plus a headless --server mode  <- edit this one
-    bot_server.py  generated: bot_dual.py with the UI removed
+    bot.py         the monitor plus a headless --server mode  <- edit this one
+    bot_server.py  generated: bot.py with the UI removed
 
-Run this after changing bot_dual.py. Only what must differ differs - the
+Run this after changing bot.py. Only what must differ differs - the
 dependency list, the imports, the module docstring and main() - so every shared
 function stays byte-identical, and test_rules.py compares them with
 inspect.getsource() so a hand-edit to bot_server.py fails the suite.
@@ -19,10 +18,10 @@ import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DUAL = HERE / "bot_dual.py"
+SOURCE = HERE / "bot.py"
 OUT = HERE / "bot_server.py"
 
-lines = DUAL.read_text(encoding="utf-8").splitlines(keepends=True)
+lines = SOURCE.read_text(encoding="utf-8").splitlines(keepends=True)
 
 
 def _bounds(name: str, kind: str) -> tuple[int, int]:
@@ -108,12 +107,12 @@ source = source.replace(
 )
 
 sub(
-    '''# bot_dual.py has a UI to suppress and so passes --server; bot_server.py is
+    '''# bot.py has a UI to suppress and so passes --server; bot_server.py is
 # nothing but the server and has no such flag. Keeping it in one place is what
 # lets detached_argv() be shared between them unchanged.
 HEADLESS_FLAGS = ["--server"]''',
     '''# Nothing to add: this file is only ever the server, so the background copy
-# needs no flag to suppress a UI. See bot_dual.py, which passes --server here.
+# needs no flag to suppress a UI. See bot.py, which passes --server here.
 HEADLESS_FLAGS: list[str] = []''',
 )
 
@@ -129,8 +128,8 @@ event to stdout. This is bot.py's rules engine with the three-pane monitor taken
 out: same rules.txt, same exact-match semantics, same [DM] / [channel] / [*]
 section precedence, so a rule tested in the UI behaves identically here.
 
-GENERATED from bot_dual.py by make_bot_server.py - do not edit by hand. Change
-bot_dual.py and regenerate; test_rules.py compares the shared functions of the
+GENERATED from bot.py by make_bot_server.py - do not edit by hand. Change
+bot.py and regenerate; test_rules.py compares the shared functions of the
 two files and fails if they differ.
 
     ./bot_server.py --port /dev/cu.usbmodem2101

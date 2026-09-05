@@ -2,7 +2,7 @@
 
 一個三窗格的 Meshtastic 終端介面(TUI),可以透過 **BLE / WiFi(TCP)/ USB serial** 連上節點,瀏覽並收發各頻道與 DM 的訊息,並依 `rules.txt` 做關鍵字自動回覆。
 
-另外附一個**無 UI 的 server 模式**(`bot_server.py`),用同一套規則引擎,可以丟到背景當服務長期跑 —— 見[三個檔案該用哪一個](#三個檔案該用哪一個)。
+另外附一個**無 UI 的 server 模式**(`bot_server.py`),用同一套規則引擎,可以丟到背景當服務長期跑 —— 見[兩個檔案該用哪一個](#兩個檔案該用哪一個)。
 
 ![meshtastic-bot 三窗格介面](docs/tui-layout.png)
 
@@ -37,23 +37,20 @@ python3 -m venv ~/.venvs/meshtastic-bot
 啟動時會自己檢查那三個套件,缺哪個會直接告訴你,不會丟一串 traceback。
 </details>
 
-## 三個檔案該用哪一個
+## 兩個檔案該用哪一個
 
 | 檔案 | 是什麼 | 什麼時候用 |
 |---|---|---|
-| `bot.py` | 原本的三窗格 TUI | 想看畫面、手動收發訊息 |
-| `bot_dual.py` | TUI **加上** `--server` 無 UI 模式 | 想用同一支程式兩種都跑 |
+| `bot.py` | 三窗格 TUI,**加上** `--server` 無 UI 模式 | 想看畫面、手動收發訊息;或用同一支跑兩種 |
 | `bot_server.py` | 只有 server,**完全沒有 UI** | 長期掛在背景當服務 |
 
-`bot.py` 不會被另外兩個影響,維持原狀。
-
-`bot_server.py` 是**由 `bot_dual.py` 產生的**,不要手改:
+`bot_server.py` 是**由 `bot.py` 產生的**,不要手改:
 
 ```sh
-./make_bot_server.py     # 改完 bot_dual.py 就跑這個重新產生
+./make_bot_server.py     # 改完 bot.py 就跑這個重新產生
 ```
 
-三者共用同一套規則引擎(`ReplyEngine`),所以在 TUI 測過的規則在 server 下行為完全一樣。
+兩者共用同一套規則引擎(`ReplyEngine`),所以在 TUI 測過的規則在 server 下行為完全一樣。
 `test_rules.py` 會用 `inspect.getsource()` 逐一比對共用函式,手改 `bot_server.py` 會**讓測試失敗**,
 這是刻意的 —— 兩份程式各自長歪比一次改錯更難發現。
 
@@ -61,58 +58,54 @@ python3 -m venv ~/.venvs/meshtastic-bot
 
 ## 用法
 
-三支吃的參數大致相同,差別在有沒有 UI、有沒有 server:
+兩支吃的參數大致相同,差別在有沒有 UI:
 
-| 參數 | `bot.py` | `bot_dual.py` | `bot_server.py` | 說明 |
-|---|:---:|:---:|:---:|---|
-| `--host HOST[:PORT]` | ✅ | ✅ | ✅ | 用 TCP 連,port 預設 4403 |
-| `--port PATH` | ✅ | ✅ | ✅ | 用 USB serial 連 |
-| `--ble NAME` | — | ✅ | ✅ | 指定 BLE 節點名稱,跳過約 10 秒掃描 |
-| `--here LAT,LON` | ✅ | ✅ | ✅ | 本機座標,用來算節點距離 |
-| `--list` | — | ✅ | ✅ | 列出連得到哪些裝置,然後結束 |
-| `--server` | — | ✅ | 本來就是 | 不開 UI,跑自動回覆 server |
-| `--daemon` | — | ✅ | ✅ | 選好裝置後丟到背景 |
-| `--log PATH` | — | ✅ | ✅ | `--daemon` 的輸出檔 |
-| `--heartbeat SECS` | — | ✅ | ✅ | 多久印一行「還活著」 |
-| `--mqtt` | — | ✅ | ✅ | 代節點連 MQTT broker(要跟 `--server` 一起) |
-| `--wifi on\|off` | ✅ | ✅ | — | 開關節點的 WiFi 後結束 |
+| 參數 | `bot.py` | `bot_server.py` | 說明 |
+|---|:---:|:---:|---|
+| `--host HOST[:PORT]` | ✅ | ✅ | 用 TCP 連,port 預設 4403 |
+| `--port PATH` | ✅ | ✅ | 用 USB serial 連 |
+| `--ble NAME` | ✅ | ✅ | 指定 BLE 節點名稱,跳過約 10 秒掃描 |
+| `--here LAT,LON` | ✅ | ✅ | 本機座標,用來算節點距離 |
+| `--list` | ✅ | ✅ | 列出連得到哪些裝置,然後結束 |
+| `--server` | ✅ | 本來就是 | 不開 UI,跑自動回覆 server |
+| `--daemon` | ✅ | ✅ | 選好裝置後丟到背景 |
+| `--log PATH` | ✅ | ✅ | `--daemon` 的輸出檔 |
+| `--heartbeat SECS` | ✅ | ✅ | 多久印一行「還活著」 |
+| `--mqtt` | ✅ | ✅ | 代節點連 MQTT broker(要跟 `--server` 一起) |
+| `--wifi on\|off` | ✅ | — | 開關節點的 WiFi 後結束 |
 
-`bot.py` 沒有 `--ble`,是因為它本來就會掃 BLE 並列在裝置窗格裡讓你點。
+不給 `--ble` 也可以:`bot.py` 本來就會掃 BLE 並列在裝置窗格裡讓你點。
 
-### bot.py — 互動 TUI
+### bot.py — TUI,加 `--server` 就變成無 UI
+
+不加 `--server` 是三窗格 TUI;加了就是無 UI 的 server。
 
 ```sh
-./bot.py                                              # 掃描並連 BLE
+./bot.py                                              # 掃描並連 BLE,開 TUI
+./bot.py --ble Bug2_1ca6                              # 開 TUI,直接連指定的 BLE 節點
 ./bot.py --host Meshtastic.local                      # 走 WiFi (TCP 4403)
 ./bot.py --host 192.168.0.247:4403                    # 指定 port
 ./bot.py --port /dev/cu.usbmodem2101                  # 走 USB serial
 ./bot.py --host Meshtastic.local --port /dev/cu.usbmodem2101   # 兩個都列出來,BLE 也繼續掃
 ./bot.py --host Meshtastic.local --here 25.0339,121.5645       # 顯示節點距離
 ./bot.py --port /dev/cu.usbmodem2101 --wifi on        # 只開節點的 WiFi,不啟動 UI
+
+./bot.py --server --port /dev/cu.usbmodem2101         # 無 UI,USB
+./bot.py --server --host 192.168.0.247                # 無 UI,WiFi
+./bot.py --server --ble Bug2_1ca6 --daemon --log ~/bot.log   # 無 UI,背景
+./bot.py --server --ble Bug2_1ca6 --mqtt              # 無 UI,並代節點上 MQTT
+./bot.py --list                                       # 只列出裝置
 ```
 
 | 參數 | 說明 |
 |---|---|
 | `--host HOST[:PORT]` | 用 TCP 連;port 預設 4403。指定後會**立刻連線**,不用等 BLE 掃描,BLE 掃描仍會繼續 |
 | `--port PATH` | 用 USB serial 連 |
+| `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒掃描 |
 | `--here LAT,LON` | 本機座標,用來算各節點距離。只在連上的節點沒有 GPS 定位時才需要。**只留在本機**,不會送給裝置或 mesh |
 | `--wifi on\|off` | 開關節點的 WiFi,做完直接結束(不啟動 UI)。需要 `--port` 或 `--host` |
 
-### bot_dual.py — 同一支,可選要不要 UI
-
-不加 `--server` 就跟 `bot.py` 一樣是 TUI;加了就是無 UI 的 server。
-
-```sh
-./bot_dual.py                                         # 開 TUI(等同 bot.py)
-./bot_dual.py --ble Bug2_1ca6                         # 開 TUI,直接連指定的 BLE 節點
-./bot_dual.py --server --port /dev/cu.usbmodem2101    # 無 UI,USB
-./bot_dual.py --server --host 192.168.0.247           # 無 UI,WiFi
-./bot_dual.py --server --ble Bug2_1ca6 --daemon --log ~/bot.log   # 無 UI,背景
-./bot_dual.py --server --ble Bug2_1ca6 --mqtt         # 無 UI,並代節點上 MQTT
-./bot_dual.py --list                                  # 只列出裝置
-```
-
-多出來的參數除了 `--server` 之外,都跟 `bot_server.py` 相同(見下)。
+`--server` 之外多出來的參數都跟 `bot_server.py` 相同(見下)。
 `--daemon` 與 `--mqtt` 都必須跟 `--server` 一起用,單獨給會被擋掉。
 
 ### bot_server.py — 只有 server,沒有 UI
@@ -306,16 +299,11 @@ macOS 特有的兩件事,程式裡有處理:
 | 程式 | 只 import | 跑起來(峰值 RSS) |
 |---|---|---|
 | `bot_server.py` | **46 MiB** | **72 MiB**(連上,無 UI) |
-| `bot_dual.py --server` | 60 MiB | 82 MiB(連上,無 UI) |
-| `bot_dual.py`(TUI) | 60 MiB | 98 MiB(連上,含 `--here`) |
-| `bot.py`(TUI) | 58 MiB | 87–88 MiB(掃描中,**尚未連線**) |
+| `bot.py --server` | 60 MiB | 82 MiB(連上,無 UI) |
+| `bot.py`(TUI) | 60 MiB | 98 MiB(連上,含 `--here`) |
 
 「只 import」那欄是**還沒做任何事**、相依套件的成本。`bot_server.py` 少 14 MiB
 就是不必載 `textual` 的差別;跑起來仍然少約 10 MiB。要長期掛著跑的話,這是選它的理由之一。
-
-`bot.py` 那格是掃描中未連線的狀態 —— 它沒有 `--ble`,而當下 USB 沒接、TCP 那台又被
-本機 VPN 擋住,沒辦法在同一輪自動連上。**它的 TUI 跟 `bot_dual.py` 是同一份程式**,
-所以連上後應該落在 98 MiB 附近。
 
 幾個要注意的地方,免得把這些數字當成保證:
 
@@ -366,7 +354,7 @@ macOS 特有的兩件事,程式裡有處理:
 
 ```sh
 ./bot_server.py --ble Bug2_1ca6 --mqtt
-./bot_dual.py --server --ble Bug2_1ca6 --mqtt --daemon --log ~/bot.log
+./bot.py --server --ble Bug2_1ca6 --mqtt --daemon --log ~/bot.log
 ```
 
 **為什麼需要**:ESP32 的韌體只在 WiFi 不可用時才開藍牙(`src/platform/esp32/main-esp32.cpp`),所以用 BLE 連的節點**必然沒有自己的網路** —— 它上 MQTT 的唯一路徑是 `mqtt.proxy_to_client_enabled`:節點把每一則 MQTT 交給當下連著的 client,由那個 client 去連 broker。手機 app 有做這件事,所以把手機換成這支程式之後,節點的 MQTT 就整段掉在地上,而且沒有任何訊息說它掉了。
@@ -686,9 +674,9 @@ BOT: pong
 ./test_rules.py
 ```
 
-600 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot_dual`,所以仍要那幾個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。MQTT 橋接也在裡面:broker 設定從節點讀出來、上行 publish 與下行回灌、沒給 `--mqtt` 時完全不動、paho 的例外不會逸出、重連沿用同一張退避表,以及 disconnect 卡住時的有界關閉 —— paho 是假的,不碰網路。
+727 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot`,所以仍要那幾個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。MQTT 橋接也在裡面:broker 設定從節點讀出來、上行 publish 與下行回灌、沒給 `--mqtt` 時完全不動、paho 的例外不會逸出、重連沿用同一張退避表,以及 disconnect 卡住時的有界關閉 —— paho 是假的,不碰網路。
 
-另外有 `test_params_live.py`,**需要硬體**:它把三支程式的每一個參數都跑一遍
+另外有 `test_params_live.py`,**需要硬體**:它把兩支程式的每一個參數都跑一遍
 (`--help`、每一種該被擋下來的參數組合、連不上的目標要乾淨失敗、`--list`、
 真的連上節點、`--daemon` 背景啟動後用 `SIGTERM` 停掉),並在連線期間取樣記憶體。
 `--wifi` 只測參數檢查,不會真的去改節點設定;`--mqtt` 同理,真的連 broker 那一項要另外給 `--mqtt-live` 才跑,因為那會把這個 mesh 轉發到公共 broker 上。

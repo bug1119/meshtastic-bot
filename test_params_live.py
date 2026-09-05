@@ -377,9 +377,8 @@ def main():
     try:
         print("=== --help ===")
         for program, flags in (
-            ("bot.py", ["--host", "--port", "--here", "--wifi"]),
             (
-                "bot_dual.py",
+                "bot.py",
                 ["--host", "--port", "--ble", "--list", "--server", "--daemon", "--log", "--heartbeat", "--wifi", "--mqtt"],
             ),
             ("bot_server.py", ["--host", "--port", "--ble", "--list", "--daemon", "--log", "--heartbeat", "--mqtt"]),
@@ -389,14 +388,10 @@ def main():
         print("\n=== arguments that must be rejected ===")
         run(["bot.py", "--wifi", "on"], 120, expect_rc=2,
             expect_out=["--wifi needs a target"], name="bot.py --wifi with no target")
-        run(["bot_dual.py", "--wifi", "on"], 120, expect_rc=2,
-            expect_out=["--wifi needs a target"], name="bot_dual.py --wifi with no target")
-        run(["bot_dual.py", "--daemon", "--port", "/dev/null"], 120, expect_rc=2,
-            name="bot_dual.py --daemon without --server")
-        run(["bot_dual.py", "--mqtt", "--port", "/dev/null"], 120, expect_rc=2,
-            name="bot_dual.py --mqtt without --server")
-        run(["bot.py", "--mqtt"], 120, expect_rc=2,
-            name="bot.py has no --mqtt")
+        run(["bot.py", "--daemon", "--port", "/dev/null"], 120, expect_rc=2,
+            name="bot.py --daemon without --server")
+        run(["bot.py", "--mqtt", "--port", "/dev/null"], 120, expect_rc=2,
+            name="bot.py --mqtt without --server")
         run(["bot.py", "--here", "not-a-coord"], 120, expect_rc=2, name="--here nonsense")
         run(["bot_server.py", "--here", "999,999"], 120, expect_rc=2, name="--here out of range")
         run(["bot_server.py", "--ble", "X", "--heartbeat", "abc"], 120, expect_rc=2,
@@ -409,9 +404,9 @@ def main():
         run(["bot_server.py", "--port", "/dev/cu.does-not-exist"], 300, expect_rc=1,
             expect_out=["連線失敗"], expect_absent=["Traceback"],
             name="bot_server.py --port that does not exist")
-        run(["bot_dual.py", "--server", "--port", "/dev/cu.does-not-exist"], 300, expect_rc=1,
+        run(["bot.py", "--server", "--port", "/dev/cu.does-not-exist"], 300, expect_rc=1,
             expect_out=["連線失敗"], expect_absent=["Traceback"],
-            name="bot_dual.py --server --port that does not exist")
+            name="bot.py --server --port that does not exist")
         # --mqtt must not change how a failed connect ends: the bridge only
         # starts at config sync, so this never reaches a broker. Which of the
         # two endings is correct depends on the interpreter running this file,
@@ -428,7 +423,7 @@ def main():
                 name="bot_server.py --mqtt without paho installed")
 
         print("\n=== --list ===")
-        for program in ("bot_server.py", "bot_dual.py"):
+        for program in ("bot_server.py", "bot.py"):
             run([program, "--list"], 300, expect_rc=0,
                 expect_out=["BLE 節點", "USB serial"], name=f"{program} --list")
 
@@ -439,9 +434,9 @@ def main():
             hold(["bot_server.py", "--ble", node, "--heartbeat", "20"],
                  "bot_server.py --ble", expect_out=["已連線", "設定同步完成", "[心跳]"],
                  key="bot_server.py")
-            hold(["bot_dual.py", "--server", "--ble", node, "--heartbeat", "20"],
-                 "bot_dual.py --server --ble", expect_out=["已連線", "設定同步完成", "[心跳]"],
-                 key="bot_dual.py --server")
+            hold(["bot.py", "--server", "--ble", node, "--heartbeat", "20"],
+                 "bot.py --server --ble", expect_out=["已連線", "設定同步完成", "[心跳]"],
+                 key="bot.py --server")
             if args.mqtt_live:
                 # The only case here that talks to anything but the node, and
                 # the only one that puts this mesh on a public broker - hence
@@ -456,18 +451,13 @@ def main():
             # "已連線" as well as the pane title: a TUI whose connection failed
             # stays up showing the device list, and its RSS would then be
             # reported as a connected figure when it is nothing of the kind.
-            hold(["bot_dual.py", "--ble", node, "--here", "25.0339,121.5645"],
-                 "bot_dual.py --ble --here (TUI)", tui=True,
-                 expect_out=["裝置", "已連線"], key="bot_dual.py (TUI)")
-            # bot.py has no --ble, so with nothing else reachable this one is
-            # deliberately measured unconnected - stated in the key so the
-            # figure cannot be quoted as a connected one.
-            hold(["bot.py"], "bot.py (TUI, scanning, NOT connected)", seconds=45,
-                 tui=True, expect_out=["裝置"], key="bot.py (TUI, NOT connected)")
+            hold(["bot.py", "--ble", node, "--here", "25.0339,121.5645"],
+                 "bot.py --ble --here (TUI)", tui=True,
+                 expect_out=["裝置", "已連線"], key="bot.py (TUI)")
 
             print("\n=== --daemon ===")
             daemon_case("bot_server.py", [], node)
-            daemon_case("bot_dual.py", ["--server"], node)
+            daemon_case("bot.py", ["--server"], node)
     finally:
         if had_rules:
             shutil.copy(backup, rules)
