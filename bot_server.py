@@ -324,6 +324,16 @@ def node_position(node: dict) -> tuple[float, float] | None:
     return lat_i / 1e7, lon_i / 1e7
 
 
+# How long to wait for a node to hand over its configuration before giving up
+# on a connect. The library defaults every transport to 300s, and a node that
+# accepts the connection but never finishes the handshake then buys five
+# minutes of silence - long enough to look like a hang rather than a failure,
+# which is exactly how it presented. The Apple client bounds the same step at
+# 120s; this is tighter still, because a failed attempt here costs only a retry
+# from the reconnect loop.
+CONNECT_TIMEOUT_SECS = 90
+
+
 def open_interface(transport: str, address: str):
     """Build and connect the meshtastic interface for one transport.
 
@@ -332,10 +342,16 @@ def open_interface(transport: str, address: str):
     """
     if transport == TRANSPORT_TCP:
         hostname, port = _split_host_port(address)
-        return meshtastic.tcp_interface.TCPInterface(hostname=hostname, portNumber=port)
+        return meshtastic.tcp_interface.TCPInterface(
+            hostname=hostname, portNumber=port, timeout=CONNECT_TIMEOUT_SECS
+        )
     if transport == TRANSPORT_SERIAL:
-        return meshtastic.serial_interface.SerialInterface(devPath=address)
-    return meshtastic.ble_interface.BLEInterface(address=address)
+        return meshtastic.serial_interface.SerialInterface(
+            devPath=address, timeout=CONNECT_TIMEOUT_SECS
+        )
+    return meshtastic.ble_interface.BLEInterface(
+        address=address, timeout=CONNECT_TIMEOUT_SECS
+    )
 
 
 def parse_latlon(text: str) -> tuple[float, float]:
@@ -905,6 +921,40 @@ class ReplyEngine:
         """
         index = min(max(attempt, 1), len(cls.RECONNECT_DELAYS)) - 1
         return cls.RECONNECT_DELAYS[index]
+
+    # How long a link may claim to be up while delivering nothing at all before
+    # it is treated as dead. connection.lost only fires when the transport
+    # itself gives up, and a BLE link can stop carrying packets one way while
+    # staying nominally connected: an observed run sat at 71 packets for 18
+    # minutes with reconnects at 0, silently dropping everything sent to it,
+    # while the MQTT bridge on the same link kept pushing 40 messages a minute
+    # in the other direction.
+    #
+    # Comfortably longer than the library's 300s heartbeat interval, because
+    # that heartbeat's own reply is traffic: a mesh with nothing to say still
+    # produces a packet every five minutes, so a quiet night cannot trip this.
+    STALE_LINK_SECS = 420
+    # How often to ask. Cheap - one subtraction - so the cost of asking often
+    # is nothing next to the cost of noticing late.
+    STALE_CHECK_SECS = 30
+
+    def _note_packet(self) -> None:
+        """Record that the link just delivered something. Called for every
+        packet, of any kind, before anything decides whether to care about it."""
+        self.last_packet_at = time.monotonic()
+
+    def _link_is_stale(self, now: float) -> bool:
+        """Whether the link is up on paper but has delivered nothing for too long.
+
+        False while there is no link, while one is already known to be down, and
+        while shutting down - all three have their own handling, and a stale
+        check firing on top would start a second reconnect.
+        """
+        if self.interface is None or self.link_down or self._closing:
+            return False
+        if self.last_packet_at is None:
+            return False
+        return (now - self.last_packet_at) > self.STALE_LINK_SECS
 
     def _describe_peer(self, interface, transport: str) -> str | None:
         """Address of the far end, for the status pane.
@@ -1550,7 +1600,7 @@ class MqttProxy:
         """Broker -> radio. The node decodes and filters it from here
         (onReceiveProto), so nothing is inspected on the way through."""
         interface = self._bot.interface
-        if interface is None or self._stopped.is_set():
+        if interface is None or self._stopped.is_set() or self._bot.link_down:
             return
         interface.sendMqttClientProxyMessage(message.topic, message.payload)
         self.down_count += 1
@@ -1653,6 +1703,8 @@ class ServerBot(ReplyEngine):
         self._closing = False
         self.reconnect_attempt = 0
         self.reconnect_total = 0
+        # See MeshtasticTUI.__init__ - same meaning, same reason.
+        self.last_packet_at: float | None = None
         self._stopped = threading.Event()
         # None unless --mqtt was given, and checked for None at every use
         # rather than swapped for a do-nothing stand-in: "is the bridge on" is
@@ -1677,6 +1729,7 @@ class ServerBot(ReplyEngine):
     def _adopt(self, interface, transport: str) -> None:
         self.interface = interface
         self.transport = transport
+        self.last_packet_at = time.monotonic()
         self.peer = self._describe_peer(interface, transport)
         where = f" ({self.peer})" if self.peer else ""
         self.log(f"{transport.upper()} 已連線{where},等待設定同步...")
@@ -1725,6 +1778,21 @@ class ServerBot(ReplyEngine):
             return
 
     # ---- pubsub handlers --------------------------------------------------
+
+    def _stale_watchdog(self) -> None:
+        """Poll for a link that is up but no longer delivering.
+
+        A thread of its own because the main loop waits on the heartbeat
+        interval, which is ten minutes by default and never with --heartbeat 0 -
+        neither is a rate at which to notice a dead link.
+        """
+        while not self._stopped.wait(self.STALE_CHECK_SECS):
+            now = time.monotonic()
+            if not self._link_is_stale(now):
+                continue
+            idle = int(now - self.last_packet_at)
+            self.log(f"{idle} 秒沒有收到任何封包,視為斷線")
+            self.on_connection_lost(self.interface)
 
     def on_config_synced(self, interface, topic=pub.AUTO_TOPIC) -> None:
         # Adopted here as well as in _adopt(). The library publishes
@@ -1806,6 +1874,7 @@ class ServerBot(ReplyEngine):
     def on_receive(self, packet, interface) -> None:
         # Before the text filter, for the reason the TUI does the same.
         self.packet_count += 1
+        self._note_packet()
         info = parse_incoming(packet, self.my_id)
         if info is None:
             return
@@ -1933,6 +2002,7 @@ class ServerBot(ReplyEngine):
             return 1
         self.connected_key = f"{transport}:{address}"
         self._adopt(interface, transport)
+        threading.Thread(target=self._stale_watchdog, daemon=True).start()
 
         # There is state worth closing now, so swap the hard abort for the
         # graceful path.
