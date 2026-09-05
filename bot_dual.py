@@ -142,6 +142,7 @@ import collections
 import functools
 import math
 import os
+import secrets
 import signal
 import subprocess
 import threading
@@ -2164,6 +2165,9 @@ class MqttProxy:
         # Whether the current outage has already been reported. One line per
         # state change means one line for the outage, not one per retry.
         self._reported_down = False
+        # Generated on first use and kept, so reconnects present the same id
+        # instead of leaving a trail of half-open sessions on the broker.
+        self._client_id_cached: str | None = None
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -2270,9 +2274,9 @@ class MqttProxy:
         unreachable broker would stop the bot answering messages because MQTT
         is down - the one thing a side channel must never do.
 
-        The client id is the node's own, as the firmware uses when it connects
-        directly (connectPubSub): brokers key their per-node state on it, and
-        two clients sharing an id take turns evicting each other.
+        The client id is the node's own with a random suffix - see client_id
+        for why the bare node id, which is what the firmware presents when it
+        connects directly (connectPubSub), cannot be used here.
         """
         client = self._new_client(settings)
         if settings["tls"]:
@@ -2298,9 +2302,34 @@ class MqttProxy:
         # retry on as well would put two schedules on one socket.
         return paho.Client(
             callback_api_version=paho.CallbackAPIVersion.VERSION2,
-            client_id=self._bot.my_id or "",
+            client_id=self.client_id(),
             reconnect_on_failure=False,
         )
+
+    def client_id(self) -> str:
+        """A broker-unique client id: the node's own, plus a random suffix.
+
+        MQTT requires client ids to be unique. A connection presenting an id
+        already in use evicts the one holding it, and the two then take turns
+        evicting each other for as long as both run. Using the bare node id
+        means exactly that whenever a second copy of this bot points at the
+        same node - another machine, or a forgotten one left running here.
+
+        The failure is one-sided and so does not look like a connection
+        problem at all. Publishes are fire-and-forget and mostly still land,
+        while the subscription dies with every eviction, so the node uplinks
+        steadily and receives nothing. A real capture showed 3349 uplinks
+        against 9 downlinks over 19 hours, with the downlink count frozen from
+        the 5-hour mark on and the link never once reported as down.
+
+        The node id stays as the prefix so a broker's connection log still
+        names the node. The suffix comes from the cached value, so reconnects
+        keep the id they had rather than opening a fresh session each time.
+        """
+        if self._client_id_cached is None:
+            base = self._bot.my_id or "meshtastic-bot"
+            self._client_id_cached = f"{base}-{secrets.token_hex(2)}"
+        return self._client_id_cached
 
     def _supervise(self) -> None:
         """Keep the broker connection up for as long as the bot is, pacing the
