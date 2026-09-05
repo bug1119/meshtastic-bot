@@ -1065,6 +1065,41 @@ class ReplyEngine:
         packet, of any kind, before anything decides whether to care about it."""
         self.last_packet_at = time.monotonic()
 
+    # How long to wait for the old connection to close before reconnecting.
+    # Short on purpose: the point is to hand the node's client slot back, and a
+    # close that has not returned by now is not going to.
+    RELEASE_TIMEOUT = 5
+
+    def _release_link(self, interface) -> None:
+        """Hand the node's client slot back before trying to take it again.
+
+        Only a transport that gave up by itself leaves nothing to close. When
+        the staleness check is what declared the link dead, the connection is
+        still open as far as both ends believe - and a node with a client
+        attached stops advertising, so every reconnect then fails to find it.
+        Observed live as nine consecutive "No Meshtastic BLE peripheral found"
+        retries against a node a metre away, which only cleared when the process
+        was killed.
+
+        Bounded on a side thread for the reason _shutdown does the same: close()
+        is the call that hangs, and waiting on it here would stall the very
+        reconnect this exists to enable. Errors are swallowed rather than
+        logged - nothing can be done about them, and the reconnect that follows
+        reports its own outcome.
+        """
+        if interface is None:
+            return
+
+        def close_quietly() -> None:
+            try:
+                interface.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        closer = threading.Thread(target=close_quietly, daemon=True)
+        closer.start()
+        closer.join(self.RELEASE_TIMEOUT)
+
     def _link_is_stale(self, now: float) -> bool:
         """Whether the link is up on paper but has delivered nothing for too long.
 
@@ -1659,6 +1694,7 @@ class MeshtasticTUI(ReplyEngine, App):
         self.reconnect_attempt = 0
         self._log_system("[red]連線中斷,自動重連中...[/red]")
         self._render_local_status()
+        self._release_link(self.interface)
         self.reconnect_loop()
 
     @work(thread=True)
@@ -2689,6 +2725,7 @@ class ServerBot(ReplyEngine):
         self.link_down = True
         self.reconnect_attempt = 0
         self.log("連線中斷,自動重連中...")
+        self._release_link(self.interface)
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
     def _reconnect_loop(self) -> None:
