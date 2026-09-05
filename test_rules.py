@@ -378,8 +378,11 @@ def test_packet_count():
         """A stand-in self for on_receive, enough for the counting paths."""
         app = types.SimpleNamespace(
             packet_count=0, received_count=0, last_signal=None,
-            my_id="!me", history={}, target=None,
+            my_id="!me", history={}, target=None, last_packet_at=None,
         )
+        # Real, not stubbed: every packet has to move the liveness clock, and
+        # that is cheap enough to exercise for its own sake here.
+        app._note_packet = lambda: bot.ReplyEngine._note_packet(app)
         app._track_signal = lambda pkt: bot.MeshtasticTUI._track_signal(app, pkt)
         app._mark_unread = lambda target: None
         app._log_system = lambda line: None
@@ -491,6 +494,87 @@ def link_app(interface="iface", closing=False, link_down=False):
 
     app._link_lost = _link_lost
     return app
+
+
+def stale_app(idle=None, interface="iface", link_down=False, closing=False):
+    """A stand-in self for the staleness check.
+
+    `idle` is how many seconds ago the last packet arrived; None means none has
+    ever arrived.
+    """
+    now = time.monotonic()
+    return types.SimpleNamespace(
+        interface=interface,
+        link_down=link_down,
+        _closing=closing,
+        last_packet_at=None if idle is None else now - idle,
+        STALE_LINK_SECS=bot.ReplyEngine.STALE_LINK_SECS,
+    )
+
+
+def is_stale(**kw):
+    return bot.ReplyEngine._link_is_stale(stale_app(**kw), time.monotonic())
+
+
+def test_stale_link_detection():
+    print("a link that stops delivering is treated as lost")
+
+    check("silent well past the limit", is_stale(idle=bot.ReplyEngine.STALE_LINK_SECS + 60), True)
+    check("still delivering", is_stale(idle=5), False)
+    check("just inside the limit", is_stale(idle=bot.ReplyEngine.STALE_LINK_SECS - 10), False)
+
+    # Each of these has its own handling; firing on top would start a second
+    # reconnect, or one against a link that does not exist.
+    check("no link at all", is_stale(idle=9999, interface=None), False)
+    check("already known to be down", is_stale(idle=9999, link_down=True), False)
+    check("shutting down", is_stale(idle=9999, closing=True), False)
+    check("nothing has arrived yet", is_stale(idle=None), False)
+
+    # The library sends a heartbeat every 300s and the reply to it is traffic,
+    # so a mesh with nothing to say still produces a packet on that cadence. A
+    # limit at or under it would fire on a merely quiet night.
+    check("limit clears the library's 300s heartbeat", bot.ReplyEngine.STALE_LINK_SECS > 300, True)
+    check("checked far more often than the limit", bot.ReplyEngine.STALE_CHECK_SECS < 60, True)
+
+    print("both programs carry it")
+    root = pathlib.Path(bot.__file__).parent
+    for name in ("bot_dual.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        check(f"{name} records every packet", "self._note_packet()" in text, True)
+        check(f"{name} acts on staleness", "_link_is_stale(" in text, True)
+    # bot.py is the frozen original and has no reconnect machinery to hang this
+    # off, so it is deliberately not in that list.
+
+
+def test_downlink_pauses_while_the_link_is_down():
+    print("the bridge stops pushing at a link that is down")
+
+    def downlink(payload):
+        # _on_message takes a paho message, not the protobuf the uplink uses.
+        proxy._on_message(
+            stub, None,
+            types.SimpleNamespace(topic="msh/TW/2/e/EDGE_ATS/!other", payload=payload),
+        )
+
+    proxy, stub, holder, to_radio, _ = _started_proxy()
+    proxy._on_connect(stub, None, {}, 0, None)
+
+    downlink(b"\x08\x01")
+    check("forwarded while the link is up", len(to_radio), 1)
+    check("and counted", proxy.down_count, 1)
+
+    # Left running through a reconnect it would compete with the config
+    # download that reconnect needs, which is why the Apple client disconnects
+    # its own proxy at the same point.
+    holder.link_down = True
+    downlink(b"\x08\x02")
+    check("nothing forwarded while down", len(to_radio), 1)
+    check("and not counted", proxy.down_count, 1)
+    check("nor treated as an error", proxy.error_count, 0)
+
+    holder.link_down = False
+    downlink(b"\x08\x03")
+    check("resumes by itself once back", len(to_radio), 2)
 
 
 def test_connection_lost():
@@ -2383,6 +2467,9 @@ def _mqtt_bot(config=None, channels=None, out=None):
         interface=interface,
         my_id="!f2dcbabe",
         log=lambda text: print(text, file=out),
+        # The downlink relay refuses to push at a link that is down, so the
+        # stand-in has to carry the flag the real bots both have.
+        link_down=False,
     )
     return holder, to_radio, out
 
@@ -3291,6 +3378,8 @@ if __name__ == "__main__":
         test_status_bar()
         test_status_bar_widget()
         test_packet_count()
+        test_stale_link_detection()
+        test_downlink_pauses_while_the_link_is_down()
         test_connection_lost()
         test_unread_bold()
         test_unread_bold_widgets()
