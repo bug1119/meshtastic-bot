@@ -483,6 +483,10 @@ def link_app(interface="iface", closing=False, link_down=False):
         rendered=0,
         reconnects=0,
     )
+    app.released = []
+    # Recorded rather than performed: the real one closes on a thread with a
+    # deadline, and what matters here is that it is asked at all.
+    app._release_link = app.released.append
     app.call_from_thread = lambda fn, *a: app.scheduled.append(getattr(fn, "__name__", str(fn)))
     app._log_system = app.logged.append
     app._render_local_status = lambda: setattr(app, "rendered", app.rendered + 1)
@@ -514,6 +518,44 @@ def stale_app(idle=None, interface="iface", link_down=False, closing=False):
 
 def is_stale(**kw):
     return bot.ReplyEngine._link_is_stale(stale_app(**kw), time.monotonic())
+
+
+def test_release_link():
+    print("the old link is handed back before reconnecting")
+
+    def release(interface, timeout=bot.ReplyEngine.RELEASE_TIMEOUT):
+        holder = types.SimpleNamespace(RELEASE_TIMEOUT=timeout)
+        started = time.monotonic()
+        bot.ReplyEngine._release_link(holder, interface)
+        return time.monotonic() - started
+
+    closed = []
+    release(types.SimpleNamespace(close=lambda: closed.append(True)))
+    check("closes the interface", closed, [True])
+
+    # A reconnect that found nothing to close still has to proceed.
+    release(None)
+    check("None is not an error", True, True)
+
+    # close() throwing must not take the reconnect down with it - the slot is
+    # gone either way and the reconnect reports its own outcome.
+    def boom():
+        raise OSError("device not configured")
+
+    release(types.SimpleNamespace(close=boom))
+    check("a failing close does not propagate", True, True)
+
+    # The whole point of the side thread: close() is the call that hangs, and
+    # waiting on it here would stall the reconnect it exists to enable.
+    hanging = types.SimpleNamespace(close=lambda: time.sleep(30))
+    elapsed = release(hanging, timeout=0.05)
+    check("a hanging close is not waited out", elapsed < 5, True)
+    check("the deadline is short", bot.ReplyEngine.RELEASE_TIMEOUT <= 10, True)
+
+    root = pathlib.Path(bot.__file__).parent
+    for name in ("bot_dual.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        check(f"{name} releases before reconnecting", "_release_link(self.interface)" in text, True)
 
 
 def test_stale_link_detection():
@@ -602,6 +644,10 @@ def test_connection_lost():
     check("it says so, in red", any("連線中斷" in ln and "red" in ln for ln in app.logged), True)
     check("the status pane is redrawn", app.rendered, 1)
     check("a reconnect is started", app.reconnects, 1)
+    # Without this the node keeps seeing a client attached, stops advertising,
+    # and every reconnect attempt fails to find it - which is exactly what a
+    # live run did, nine times over, until the process was killed.
+    check("the old link is handed back first", app.released, ["iface"])
 
     # A second event for the same outage must not start a second loop.
     app = link_app(link_down=True)
@@ -3378,6 +3424,7 @@ if __name__ == "__main__":
         test_status_bar()
         test_status_bar_widget()
         test_packet_count()
+        test_release_link()
         test_stale_link_detection()
         test_downlink_pauses_while_the_link_is_down()
         test_connection_lost()
