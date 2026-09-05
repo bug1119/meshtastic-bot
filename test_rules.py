@@ -2410,6 +2410,43 @@ def _proxy_message(topic, data=None, text=None, retained=False):
     return message
 
 
+def test_mqtt_client_id_is_unique():
+    print("the broker client id is unique per bridge")
+
+    holder, _, _ = _mqtt_bot()
+    proxy = _QuietMqttProxy(holder, client_factory=lambda settings: _StubBrokerClient())
+    first = proxy.client_id()
+
+    check("names the node", first.startswith("!f2dcbabe"), True)
+    # The whole point: MQTT evicts whoever already holds an id, so the bare
+    # node id makes two copies of this bot take turns knocking each other off.
+    check("is not the bare node id", first == "!f2dcbabe", False)
+
+    check("stable within one bridge", proxy.client_id(), first)
+
+    other_holder, _, _ = _mqtt_bot()
+    other = _QuietMqttProxy(other_holder, client_factory=lambda s: _StubBrokerClient())
+    check("differs between bridges on the same node", other.client_id() == first, False)
+    check("...but still names that node", other.client_id().startswith("!f2dcbabe"), True)
+
+    # Before config sync there is no node id yet, and an empty client id would
+    # ask the broker to allocate one - losing the suffix's purpose.
+    nameless, _, _ = _mqtt_bot()
+    nameless.my_id = None
+    bare = _QuietMqttProxy(nameless, client_factory=lambda s: _StubBrokerClient())
+    check("still unique without a node id", bare.client_id() != "", True)
+    check("...and not just the fallback word", bare.client_id() != "meshtastic-bot", True)
+
+    # The generated file has to carry it too, or the headless server keeps the
+    # colliding id while the TUI build is fixed.
+    check("bot_server carries the helper", hasattr(bot_server.MqttProxy, "client_id"), True)
+    check(
+        "and _new_client uses it, not self._bot.my_id",
+        "client_id=self.client_id()" in inspect.getsource(bot.MqttProxy._new_client),
+        True,
+    )
+
+
 def test_mqtt_broker_settings():
     print("the broker is read off the node, not written down here")
     # The operator changes these on the device. A bridge with its own copy would
@@ -3308,6 +3345,7 @@ if __name__ == "__main__":
         test_when_falls_back_to_our_clock()
         test_server_report_understands_exclusions()
         test_urllib3_warning_filtered()
+        test_mqtt_client_id_is_unique()
         test_mqtt_broker_settings()
         test_mqtt_uplink_reaches_the_broker()
         test_mqtt_downlink_reaches_the_radio()
