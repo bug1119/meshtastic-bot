@@ -14,8 +14,8 @@ event to stdout. This is bot.py's rules engine with the three-pane monitor taken
 out: same rules.txt, same exact-match semantics, same [DM] / [channel] / [*]
 section precedence, so a rule tested in the UI behaves identically here.
 
-GENERATED from bot_dual.py by make_bot_server.py - do not edit by hand. Change
-bot_dual.py and regenerate; test_rules.py compares the shared functions of the
+GENERATED from bot.py by make_bot_server.py - do not edit by hand. Change
+bot.py and regenerate; test_rules.py compares the shared functions of the
 two files and fails if they differ.
 
     ./bot_server.py --port /dev/cu.usbmodem2101
@@ -194,7 +194,7 @@ TRANSPORT_SERIAL = "serial"
 
 # What the detached copy of ourselves must be told to come up headless.
 # Nothing to add: this file is only ever the server, so the background copy
-# needs no flag to suppress a UI. See bot_dual.py, which passes --server here.
+# needs no flag to suppress a UI. See bot.py, which passes --server here.
 HEADLESS_FLAGS: list[str] = []
 
 # Meshtastic's socket API port. Firmware only accepts one TCP client at a

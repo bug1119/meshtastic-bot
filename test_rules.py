@@ -8,7 +8,7 @@
 #     "textual",
 # ]
 # ///
-"""Tests for bot_dual.py and bot_server.py: mostly their pure helpers - the per-channel rules.txt
+"""Tests for bot.py and bot_server.py: mostly their pure helpers - the per-channel rules.txt
 parser, the device-key / host-port parsing behind BLE-vs-TCP connections - plus
 one headless run of the App itself, for the unread bold that only shows up once
 real widgets are involved.
@@ -42,10 +42,9 @@ import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-# bot_dual.py is the module under test: bot.py is kept frozen as the original
-# monitor, and bot_server.py is generated from bot_dual by stripping the UI.
-# Imported as `bot` so every existing check reads unchanged.
-import bot_dual as bot  # noqa: E402
+# bot.py is the module under test: it is the one file that is edited by hand,
+# and bot_server.py is generated from it by stripping the UI.
+import bot  # noqa: E402
 import bot_server  # noqa: E402
 import lora_params  # noqa: E402
 from meshtastic.protobuf import config_pb2, mesh_pb2  # noqa: E402
@@ -553,7 +552,7 @@ def test_release_link():
     check("the deadline is short", bot.ReplyEngine.RELEASE_TIMEOUT <= 10, True)
 
     root = pathlib.Path(bot.__file__).parent
-    for name in ("bot_dual.py", "bot_server.py"):
+    for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         check(f"{name} releases before reconnecting", "_release_link(self.interface)" in text, True)
 
@@ -580,7 +579,7 @@ def test_stale_link_detection():
 
     print("both programs carry it")
     root = pathlib.Path(bot.__file__).parent
-    for name in ("bot_dual.py", "bot_server.py"):
+    for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         check(f"{name} records every packet", "self._note_packet()" in text, True)
         check(f"{name} acts on staleness", "_link_is_stale(" in text, True)
@@ -1558,7 +1557,7 @@ def test_detached_argv():
     call = bot.detached_argv
 
     argv = call((bot.TRANSPORT_SERIAL, "/dev/cu.usbmodem2101"), None, 600)
-    check("runs this script", argv[1].endswith("bot_dual.py"), True)
+    check("runs this script", argv[1].endswith("bot.py"), True)
     check("stays headless", "--server" in argv, True)
     check("carries the chosen device", argv[argv.index("--port") + 1], "/dev/cu.usbmodem2101")
     check("carries the heartbeat", argv[argv.index("--heartbeat") + 1], "600")
@@ -1601,7 +1600,7 @@ def test_detached_argv():
 
 
 def test_bot_server_is_generated_not_rewritten():
-    print("bot_server.py is bot_dual.py with the UI removed")
+    print("bot_server.py is bot.py with the UI removed")
     # Compared as source text, which is the only check that actually catches
     # drift: two copies that merely behave alike today will not stay alike.
     shared_functions = [
@@ -1643,9 +1642,9 @@ def test_bot_server_is_generated_not_rewritten():
 
     print("and the differences are the intended ones")
     check("bot_server carries no UI class", hasattr(bot_server, "MeshtasticTUI"), False)
-    check("bot_dual does", hasattr(bot, "MeshtasticTUI"), True)
+    check("bot.py does", hasattr(bot, "MeshtasticTUI"), True)
     # The one behavioural difference: what the detached child is told.
-    check("bot_dual tells its child to stay headless", bot.HEADLESS_FLAGS, ["--server"])
+    check("bot.py tells its child to stay headless", bot.HEADLESS_FLAGS, ["--server"])
     check("bot_server needs no such flag", bot_server.HEADLESS_FLAGS, [])
     check(
         "so bot_server's child argv has no --server",
@@ -1660,7 +1659,7 @@ def test_bot_server_is_generated_not_rewritten():
         True,
     )
     # Not needing a UI toolkit is the point of the file existing. Checked on the
-    # source, not sys.modules: this suite imports bot_dual, which does load it.
+    # source, not sys.modules: this suite imports bot.py, which does load it.
     # lora_params is deliberately not in this list - it is a module in this
     # repo rather than something to install, and the server derives the node's
     # frequency and bandwidth through it now that the status block is shared.
@@ -1673,7 +1672,7 @@ def test_bot_server_is_generated_not_rewritten():
 
 
 def test_bot_server_replies():
-    print("bot_server answers on its own, not only through bot_dual")
+    print("bot_server answers on its own, not only through bot.py")
     path = pathlib.Path(tempfile.mkdtemp()) / "rules.txt"
     path.write_text("[EDGE_ATS]\nping=pong\n", encoding="utf-8")
     original = bot_server.RULES_FILE
@@ -1924,7 +1923,6 @@ def test_packet_count_in_all_three_files():
     root = _pathlib.Path(bot.__file__).parent
     for name, expect_bar in (
         ("bot.py", True),
-        ("bot_dual.py", True),
         ("bot_server.py", False),  # no status bar; it has the heartbeat instead
     ):
         text = (root / name).read_text(encoding="utf-8")
@@ -1932,7 +1930,7 @@ def test_packet_count_in_all_three_files():
         check(f"{name} increments it", "self.packet_count += 1" in text, True)
         if expect_bar:
             check(f"{name} shows it in the status bar", "[bold]封包[/bold]" in text, True)
-    for name in ("bot_dual.py", "bot_server.py"):
+    for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         check(f"{name} shows it in the heartbeat", "f\" 封包 {self.packet_count}\"" in text, True)
 
@@ -2196,9 +2194,9 @@ def test_exclude_shipped_defaults():
     check("and they parse back", sorted(bot.excluded_channels()), sorted(wanted))
     check("and documents it", "channels [*] must NOT fire on" in bot.DEFAULT_RULES, True)
 
-    # All three programs read the same rules.txt, so one of them answering on a
-    # channel the others stay quiet on would be the worst of both.
-    for name in ("bot.py", "bot_dual.py", "bot_server.py"):
+    # Both programs read the same rules.txt, so one of them answering on a
+    # channel the other stays quiet on would be the worst of both.
+    for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         check(f"{name} knows the section", 'EXCLUDE_SECTION = "!exclude"' in text, True)
         check(f"{name} applies it", "if not is_excluded(name, index):" in text, True)
@@ -2387,7 +2385,7 @@ def test_urllib3_warning_filtered():
     import pathlib as _pathlib
 
     root = _pathlib.Path(bot.__file__).parent
-    for name in ("bot.py", "bot_dual.py", "bot_server.py"):
+    for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         check(
             f"{name} filters it",
@@ -3377,11 +3375,11 @@ def test_a_failed_send_is_reported_not_swallowed():
 
 
 def test_mqtt_bridge_is_in_both_files():
-    print("the bridge exists in bot_dual and in the generated bot_server")
+    print("the bridge exists in bot.py and in the generated bot_server")
     # bot_server.py is generated by stripping the UI. A feature that lands in
-    # bot_dual and not in the file people actually deploy is invisible until
+    # bot.py and not in the file people actually deploy is invisible until
     # someone tries to use it there.
-    check("bot_dual has the bridge", hasattr(bot, "MqttProxy"), True)
+    check("bot.py has the bridge", hasattr(bot, "MqttProxy"), True)
     check("bot_server has it too", hasattr(bot_server, "MqttProxy"), True)
     check(
         "and it is one implementation",
@@ -3399,7 +3397,7 @@ def test_mqtt_bridge_is_in_both_files():
     import pathlib as _pathlib
 
     root = _pathlib.Path(bot.__file__).parent
-    for name in ("bot_dual.py", "bot_server.py"):
+    for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         # The uv header is what makes ./bot_server.py work without a pip
         # install, and the generator edits that header, so it is the one place
@@ -3408,9 +3406,6 @@ def test_mqtt_bridge_is_in_both_files():
         check(f"{name} has the flag", '"--mqtt",' in text, True)
         check(f"{name} passes it to ServerBot", "mqtt=args.mqtt" in text, True)
         check(f"{name} forwards it to the child", 'argv.append("--mqtt")' in text, True)
-    # bot.py is frozen as the original monitor and has no server to bridge from.
-    frozen = (root / "bot.py").read_text(encoding="utf-8")
-    check("bot.py is left alone", "--mqtt" in frozen, False)
 
     # paho is imported on first use, not at module import: a bot started without
     # --mqtt must not need a package it will never touch, which is also why it
