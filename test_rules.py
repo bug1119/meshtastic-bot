@@ -660,6 +660,54 @@ def test_delayed_sync_cannot_steal_a_reconnect():
     check("the successful candidate brought the link up", server.link_down, False)
 
 
+def test_tui_reconnect_processes_sync_once():
+    print("a TUI reconnect processes an early sync exactly once")
+    interface = types.SimpleNamespace()
+    app = types.SimpleNamespace(
+        _closing=False,
+        link_down=True,
+        pending_interface=interface,
+        interface="old",
+        synced_interfaces={id(interface)},
+        config_runs=0,
+    )
+    app._release_link = lambda candidate: None
+    app._connected = lambda candidate, transport: setattr(app, "interface", candidate)
+
+    def config_synced(candidate):
+        app.config_runs += 1
+
+    app._config_synced = config_synced
+    bot.MeshtasticTUI._relinked(app, interface, bot.TRANSPORT_BLE)
+
+    check("config work ran once", app.config_runs, 1)
+    check("the candidate became active", app.interface is interface, True)
+    check("the outage ended", app.link_down, False)
+
+
+def test_shutdown_during_sync_does_not_log_timeout():
+    print("shutdown during config sync does not claim a timeout")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    server.connected_key = "ble:bug3_6d0e"
+    server.link_down = True
+    server._reconnect_delay = lambda attempt: 0
+    candidate = types.SimpleNamespace(close=lambda: None)
+    original = bot.open_interface
+
+    def opens_while_stopping(transport, address):
+        server._closing = True
+        return candidate
+
+    bot.open_interface = opens_while_stopping
+    try:
+        server._reconnect_loop()
+    finally:
+        bot.open_interface = original
+
+    check("no false timeout line", "沒有完成設定同步" in out.getvalue(), False)
+
+
 def test_config_sync_is_ignored_during_shutdown():
     print("shutdown rejects late config callbacks")
     out = io.StringIO()
@@ -3935,6 +3983,8 @@ if __name__ == "__main__":
         test_await_sync()
         test_reconnect_retries_when_the_config_never_arrives()
         test_delayed_sync_cannot_steal_a_reconnect()
+        test_tui_reconnect_processes_sync_once()
+        test_shutdown_during_sync_does_not_log_timeout()
         test_config_sync_is_ignored_during_shutdown()
         test_release_link()
         test_stale_link_detection()

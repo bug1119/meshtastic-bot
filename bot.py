@@ -1807,12 +1807,12 @@ class MeshtasticTUI(ReplyEngine, App):
             if synced_early:
                 self.synced_interfaces.add(id(interface))
             self.pending_interface = interface
-            if id(interface) in self.synced_interfaces:
-                # The library can publish before open_interface() returns, when
-                # no candidate existed yet. Re-run the UI half now that this
-                # interface is the registered attempt.
-                self.call_from_thread(self._config_synced, interface)
             if not self._await_sync(interface):
+                if self._closing:
+                    self.pending_interface = None
+                    self.synced_interfaces.clear()
+                    self._release_link(interface)
+                    return
                 self.call_from_thread(
                     self._log_system,
                     f"[yellow]重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試[/yellow]",
@@ -3064,6 +3064,11 @@ class ServerBot(ReplyEngine):
                 # it again now that this is the registered candidate.
                 self.on_config_synced(interface)
             if not self._await_sync(interface):
+                if self._closing:
+                    self.pending_interface = None
+                    self.synced_interfaces.clear()
+                    self._release_link(interface)
+                    return
                 self.log(f"重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試")
                 if self.pending_interface is interface:
                     self.pending_interface = None

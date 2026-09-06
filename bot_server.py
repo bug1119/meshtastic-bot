@@ -1986,6 +1986,11 @@ class ServerBot(ReplyEngine):
                 # it again now that this is the registered candidate.
                 self.on_config_synced(interface)
             if not self._await_sync(interface):
+                if self._closing:
+                    self.pending_interface = None
+                    self.synced_interfaces.clear()
+                    self._release_link(interface)
+                    return
                 self.log(f"重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試")
                 if self.pending_interface is interface:
                     self.pending_interface = None
