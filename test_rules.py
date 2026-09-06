@@ -319,6 +319,9 @@ def bar_app(**over):
         link_down=False,
         reconnect_attempt=0,
         reconnect_total=0,
+        # None unless a test asks for the bridge, matching an app started
+        # without --mqtt: the bar then says nothing about MQTT at all.
+        mqtt=None,
     )
     state.update(over)
     return types.SimpleNamespace(**state)
@@ -462,9 +465,41 @@ async def _status_bar_widget():
         check("the outage shows on the bar", "重連中 第 4 次" in bar.render().plain, True)
 
 
+async def _status_bar_with_mqtt():
+    from textual.widgets import Label
+
+    # A real app with the bridge on. The fragment is markup, and markup that
+    # does not parse raises inside the widget rather than in _status_bar_text -
+    # so a string comparison alone would not catch it.
+    app = bot.MeshtasticTUI(mqtt=True)
+    async with app.run_test() as pilot:
+        bar = app.query_one("#status-bar", Label)
+        await pilot.pause()
+        check("the app mounted with a bridge", app.mqtt is not None, True)
+        check("and the bar still renders", "執行" in bar.render().plain, True)
+        check("saying the bridge is not up yet", "MQTT" in bar.render().plain, True)
+
+        app.mqtt.connected = True
+        app.mqtt.up_count = 12
+        app.mqtt.down_count = 5
+        app.mqtt.error_count = 3
+        app._render_status_bar()
+        await pilot.pause()
+        plain = bar.render().plain
+        check("the counters reach the widget", "↑12 ↓5" in plain, True)
+        check("so does the error count", "錯誤 3" in plain, True)
+        # The bar it was added to has to survive it.
+        check("and the original columns are intact", "封包 0" in plain, True)
+
+
 def test_status_bar_widget():
     print("the status bar as a real widget")
     asyncio.run(_status_bar_widget())
+
+
+def test_status_bar_with_mqtt_widget():
+    print("the status bar as a real widget, with the bridge on")
+    asyncio.run(_status_bar_with_mqtt())
 
 
 def link_app(interface="iface", closing=False, link_down=False):
@@ -1812,11 +1847,12 @@ def test_config_sync_before_adopt():
 def test_tui_config_sync_before_adopt():
     print("TUI config sync can arrive before connect_device stores the interface")
     interface = types.SimpleNamespace(getMyUser=lambda: {"id": "!me"})
-    app = types.SimpleNamespace(interface=None, link_down=False, my_id=None)
+    app = types.SimpleNamespace(interface=None, link_down=False, my_id=None, mqtt=None)
     app._log_system = lambda line: None
     app._report_rule_coverage = lambda: None
     app._populate_targets = lambda: None
     app._render_local_status = lambda: None
+    app._render_status_bar = lambda: None
     app.fetch_metadata = lambda: None
 
     bot.MeshtasticTUI._config_synced(app, interface)
@@ -3669,6 +3705,125 @@ def test_stale_interface_events_are_ignored():
     check("stale config does not replace the active link", server.interface is current, True)
 
 
+def test_tui_can_bridge_mqtt():
+    print("the TUI builds a bridge only when it is asked to")
+    # Off unless asked, the same as the server: an unchanged device names the
+    # public broker, so starting one by default would republish a mesh the
+    # operator may think of as private.
+    check("off by default", bot.MeshtasticTUI().mqtt, None)
+    app = bot.MeshtasticTUI(mqtt=True)
+    # The same class the server uses. The bridge was always transport-agnostic
+    # - it just calls sendMqttClientProxyMessage() on whatever interface it
+    # holds - so what the TUI lacked was a host, not a capability.
+    check("the same bridge the server uses", type(app.mqtt) is bot.MqttProxy, True)
+
+    print("the host it is given answers for the app")
+    host = app.mqtt._bot
+    check("it is the adapter", isinstance(host, bot._TuiMqttHost), True)
+    app.interface, app.my_id, app.link_down = "iface", "!me", True
+    check("interface reads through", host.interface, "iface")
+    check("node id reads through", host.my_id, "!me")
+    check("link state reads through", host.link_down, True)
+    # Read through rather than captured at construction: the interface object is
+    # replaced on every reconnect, and a captured one would leave the bridge
+    # publishing at a link that is gone.
+    app.interface = "reconnected"
+    check("and keeps reading through", host.interface, "reconnected")
+
+    print("bridge text is escaped before it reaches the log")
+    written = []
+    app._log_system = written.append
+    host.log("MQTT 失敗: [Errno 61] Connection refused")
+    check(
+        "the bracket cannot open a style tag",
+        written,
+        ["MQTT 失敗: \\[Errno 61] Connection refused"],
+    )
+
+    print("and the flag no longer demands --server")
+    root = pathlib.Path(bot.__file__).parent
+    for name in ("bot.py", "bot_server.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        check(f"{name} has no --server guard on it", "--mqtt 只能跟 --server" in text, False)
+    # --daemon still does: it is about detaching a server, and there is no
+    # detached TUI to detach.
+    check(
+        "but --daemon still does",
+        "--daemon 只能跟 --server" in (root / "bot.py").read_text(encoding="utf-8"),
+        True,
+    )
+    # The adapter belongs to the app, and the app is what the generator strips.
+    check(
+        "the generated server carries no adapter",
+        hasattr(bot_server, "_TuiMqttHost"),
+        False,
+    )
+
+
+def test_tui_status_bar_shows_the_bridge():
+    print("the bar carries the MQTT counters, or says nothing about them")
+    check("nothing at all when there is no bridge", "MQTT" in bar_text(), False)
+
+    proxy = types.SimpleNamespace(connected=True, up_count=7, down_count=3, error_count=0)
+    proxy.status_fragment = lambda: bot.MqttProxy.status_fragment(proxy)
+    text = bar_text(mqtt=proxy)
+    check("says it is connected", "已連線" in text, True)
+    check("carries both directions", "↑7 ↓3" in text, True)
+    check("no error column while there are none", "錯誤" in text, False)
+    # The figures the bar already carried have to survive the addition.
+    check("and the existing columns are still there", "封包" in text and "收" in text, True)
+
+    proxy.connected, proxy.error_count = False, 2
+    text = bar_text(mqtt=proxy)
+    check("an outage is marked", "未連線" in text, True)
+    check("and errors are counted", "錯誤 2" in text, True)
+
+
+def test_tui_starts_and_stops_the_bridge():
+    print("the bridge starts once the node has handed its config over")
+
+    def synced_app(start):
+        app = types.SimpleNamespace(interface=None, link_down=False, my_id=None)
+        app.logged = []
+        app._log_system = app.logged.append
+        app._report_rule_coverage = lambda: None
+        app._populate_targets = lambda: None
+        app._render_local_status = lambda: None
+        app._render_status_bar = lambda: None
+        app.fetch_metadata = lambda: None
+        app.mqtt = types.SimpleNamespace(start=start)
+        return app
+
+    started = []
+    app = synced_app(lambda: started.append(True))
+    bot.MeshtasticTUI._config_synced(app, types.SimpleNamespace(getMyUser=lambda: {"id": "!me"}))
+    check("the bridge was started", started, [True])
+    check("after the node id was read", app.my_id, "!me")
+
+    print("and a bridge that cannot start costs the connection nothing")
+
+    def boom():
+        raise RuntimeError("no broker")
+
+    app2 = synced_app(boom)
+    bot.MeshtasticTUI._config_synced(app2, types.SimpleNamespace(getMyUser=lambda: {"id": "!me"}))
+    check("the failure is reported", any("MQTT 橋接啟動失敗" in line for line in app2.logged), True)
+    check("the rest of the sync still happened", app2.my_id, "!me")
+    check("and nothing was raised", app2.interface is not None, True)
+
+    print("stopping the app stops the bridge, before the link is closed")
+    # Source order rather than a live unmount: on_unmount unsubscribes real
+    # pubsub topics and unregisters an atexit hook, neither of which belongs in
+    # a unit test. What matters here is which of the two goes first.
+    source = inspect.getsource(bot.MeshtasticTUI.on_unmount)
+    check("the bridge is stopped there", "self.mqtt.stop()" in source, True)
+    check(
+        "before the interface is touched",
+        source.index("self.mqtt.stop()") < source.index("if self.interface:"),
+        True,
+    )
+
+
 def test_mqtt_bridge_is_in_both_files():
     print("the bridge exists in bot.py and in the generated bot_server")
     # bot_server.py is generated by stripping the UI. A feature that lands in
@@ -3713,6 +3868,7 @@ if __name__ == "__main__":
         test_default_rules_template()
         test_status_bar()
         test_status_bar_widget()
+        test_status_bar_with_mqtt_widget()
         test_packet_count()
         test_await_sync()
         test_reconnect_retries_when_the_config_never_arrives()
@@ -3788,6 +3944,9 @@ if __name__ == "__main__":
         test_mqtt_reconnect_pacing()
         test_mqtt_shutdown_is_bounded()
         test_mqtt_shutdown_runs_before_the_interface()
+        test_tui_can_bridge_mqtt()
+        test_tui_status_bar_shows_the_bridge()
+        test_tui_starts_and_stops_the_bridge()
         test_mqtt_bridge_is_in_both_files()
         test_local_status_rows()
         test_local_status_marks_derived_values()

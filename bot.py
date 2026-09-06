@@ -1367,6 +1367,52 @@ class ReplyEngine:
         return reply_line
 
 
+class _TuiMqttHost:
+    """What MqttProxy needs from its host, adapted for the TUI.
+
+    Two things make the app unusable as the host directly. Textual's App
+    already owns `log` - it is a Logger, and shadowing it with the plain
+    log(text) the bridge expects would break every internal call Textual makes
+    through it. And the bridge speaks from threads that must not touch a
+    widget: the uplink arrives on meshtastic's publishing thread, the downlink
+    and the connection callbacks on paho's.
+
+    So: forward the three attributes, and marshal the logging. ServerBot needs
+    none of this, which is why the adapter lives here rather than in MqttProxy.
+    """
+
+    def __init__(self, app) -> None:
+        self._app = app
+
+    # Read through to the app rather than copied at construction: the interface
+    # is replaced on every reconnect, and a captured one would leave the bridge
+    # publishing at a link that is gone.
+    @property
+    def interface(self):
+        return self._app.interface
+
+    @property
+    def my_id(self):
+        return self._app.my_id
+
+    @property
+    def link_down(self):
+        return self._app.link_down
+
+    def log(self, text: str) -> None:
+        # Brackets escaped for the reason format_incoming_line escapes them:
+        # RichLog reads the line as markup, and an exception message carrying a
+        # "[" would be parsed as a style tag - or raise while being parsed.
+        line = text.replace("[", "\\[")
+        # start() and stop() are called from the app's own thread, where
+        # call_from_thread refuses to run; everything else arrives from one of
+        # the two foreign threads above.
+        if threading.current_thread() is threading.main_thread():
+            self._app._log_system(line)
+        else:
+            self._app.call_from_thread(self._app._log_system, line)
+
+
 class MeshtasticTUI(ReplyEngine, App):
     """Three-pane Meshtastic BLE monitor: devices | channels & nodes | messages."""
 
@@ -1405,8 +1451,13 @@ class MeshtasticTUI(ReplyEngine, App):
         serial_port: str | None = None,
         here: tuple[float, float] | None = None,
         ble_address: str | None = None,
+        mqtt: bool = False,
     ) -> None:
         super().__init__()
+        # Off unless asked for, the same as the server: starting it would put a
+        # mesh the operator may think of as private onto whatever broker the
+        # device happens to name, and an unchanged device names the public one.
+        self.mqtt = MqttProxy(_TuiMqttHost(self)) if mqtt else None
         # Reference position for node distances, from --here. Local only - it is
         # never sent to the device or broadcast to the mesh.
         self.here = here
@@ -1535,6 +1586,11 @@ class MeshtasticTUI(ReplyEngine, App):
         pub.unsubscribe(self.on_receive, "meshtastic.receive")
         pub.unsubscribe(self.on_config_synced, "meshtastic.connection.established")
         pub.unsubscribe(self.on_connection_lost, "meshtastic.connection.lost")
+        # Before the interface, so the relay stops handing it work while it is
+        # being torn down - and bounded in its own right, since a broker socket
+        # can hang exactly as a BLE close can.
+        if self.mqtt is not None:
+            self.mqtt.stop()
         if self.interface:
             # BLEInterface registers its own atexit hook (self._exit_handler)
             # that also calls the same no-timeout disconnect - if the
@@ -1792,6 +1848,15 @@ class MeshtasticTUI(ReplyEngine, App):
         self._populate_targets()
         self._render_local_status()
         self.fetch_metadata()
+        # Last, and guarded, for the reason the server starts it last: the
+        # panes above are what the program is for, and a bridge that cannot
+        # start must not cost the operator the rest of the connection.
+        if self.mqtt is not None:
+            try:
+                self.mqtt.start()
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"[red]MQTT 橋接啟動失敗,略過: {exc}[/red]")
+            self._render_status_bar()
 
 
     def _report_rule_coverage(self) -> None:
@@ -2060,6 +2125,10 @@ class MeshtasticTUI(ReplyEngine, App):
             f"   [bold]收[/bold] {self.received_count}"
             f"   [bold]發[/bold] {sent} ([dim]自動 {self.sent_auto_count}[/dim])"
             f"{link}"
+            # The server puts these in its heartbeat; the bar is where the TUI
+            # says the same thing, and for the same reason - a line per relayed
+            # message would bury the log on a mesh moving hundreds a minute.
+            + (self.mqtt.status_fragment() if self.mqtt is not None else "")
         )
 
     def _render_status_bar(self) -> None:
@@ -2440,6 +2509,21 @@ class MqttProxy:
         )
         if self.error_count:
             text += f" 錯誤 {self.error_count}"
+        return text
+
+    def status_fragment(self) -> str:
+        """The same counters as heartbeat_fragment, for the TUI's status bar.
+
+        Marked up rather than plain, and short rather than spelled out: the bar
+        is one line that already carries five figures. Kept beside
+        heartbeat_fragment so the two cannot drift apart unnoticed.
+        """
+        text = "   [bold]MQTT[/bold] " + (
+            "已連線" if self.connected else "[red]未連線[/red]"
+        )
+        text += f" [dim]↑{self.up_count} ↓{self.down_count}[/dim]"
+        if self.error_count:
+            text += f" [red]錯誤 {self.error_count}[/red]"
         return text
 
     # ---- broker connection ------------------------------------------------
@@ -3433,9 +3517,6 @@ def main() -> None:
     if args.daemon and not args.server:
         parser.error("--daemon 只能跟 --server 一起用")
 
-    if args.mqtt and not args.server:
-        parser.error("--mqtt 只能跟 --server 一起用")
-
     # Checked here rather than left to fail at config sync, which on BLE is
     # half a minute away and in the background by then. MQTT_MODULE explains
     # why this is not simply in _REQUIRED_MODULES.
@@ -3471,6 +3552,7 @@ def main() -> None:
         serial_port=args.port,
         here=args.here,
         ble_address=args.ble,
+        mqtt=args.mqtt,
     ).run()
 
 
