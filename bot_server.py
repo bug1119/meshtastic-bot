@@ -598,6 +598,7 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
         "channel": packet.get("channel", 0),
         "from_id": from_id,
         "to_id": to_id,
+        "rx_time": rx_time,
         "target": target,
         "when": when,
         "transport": "MQTT" if packet.get("viaMqtt") else "LoRa",
@@ -926,22 +927,6 @@ class ReplyEngine:
         index = min(max(attempt, 1), len(cls.RECONNECT_DELAYS)) - 1
         return cls.RECONNECT_DELAYS[index]
 
-    # How long a link may claim to be up while delivering nothing at all before
-    # it is treated as dead. connection.lost only fires when the transport
-    # itself gives up, and a BLE link can stop carrying packets one way while
-    # staying nominally connected: an observed run sat at 71 packets for 18
-    # minutes with reconnects at 0, silently dropping everything sent to it,
-    # while the MQTT bridge on the same link kept pushing 40 messages a minute
-    # in the other direction.
-    #
-    # Comfortably longer than the library's 300s heartbeat interval, because
-    # that heartbeat's own reply is traffic: a mesh with nothing to say still
-    # produces a packet every five minutes, so a quiet night cannot trip this.
-    STALE_LINK_SECS = 420
-    # How often to ask. Cheap - one subtraction - so the cost of asking often
-    # is nothing next to the cost of noticing late.
-    STALE_CHECK_SECS = 30
-
     def _note_packet(self) -> None:
         """Record that the link just delivered something. Called for every
         packet, of any kind, before anything decides whether to care about it."""
@@ -981,19 +966,6 @@ class ReplyEngine:
         closer = threading.Thread(target=close_quietly, daemon=True)
         closer.start()
         closer.join(self.RELEASE_TIMEOUT)
-
-    def _link_is_stale(self, now: float) -> bool:
-        """Whether the link is up on paper but has delivered nothing for too long.
-
-        False while there is no link, while one is already known to be down, and
-        while shutting down - all three have their own handling, and a stale
-        check firing on top would start a second reconnect.
-        """
-        if self.interface is None or self.link_down or self._closing:
-            return False
-        if self.last_packet_at is None:
-            return False
-        return (now - self.last_packet_at) > self.STALE_LINK_SECS
 
     def _describe_peer(self, interface, transport: str) -> str | None:
         """Address of the far end, for the status pane.
@@ -1142,16 +1114,22 @@ class ReplyEngine:
             # Nothing to deduplicate on. Answering is the lesser failure - a
             # duplicate reply beats silently ignoring a real message.
             return True
-        reply_key = (info["from_id"], packet_id)
+        reply_key = (info["from_id"], packet_id, info.get("rx_time"), info["text"])
         if reply_key in self._replied_ids:
             return False
         return True
 
-    def _remember_reply(self, from_id: str, packet_id: int | None) -> None:
-        """Record a successfully answered packet, scoped to its sender."""
+    def _remember_reply(
+        self,
+        from_id: str,
+        packet_id: int | None,
+        rx_time: int | None,
+        text: str,
+    ) -> None:
+        """Record a successfully answered message without trusting IDs alone."""
         if packet_id is None:
             return
-        self._replied_ids[(from_id, packet_id)] = True
+        self._replied_ids[(from_id, packet_id, rx_time, text)] = True
         while len(self._replied_ids) > self.REPLIED_ID_LIMIT:
             self._replied_ids.pop(next(iter(self._replied_ids)))
 
@@ -1167,6 +1145,7 @@ class ReplyEngine:
         rssi: int | None = None,
         channel: int | None = None,
         packet_id: int | None = None,
+        rx_time: int | None = None,
     ) -> str | None:
         """Send + record the keyword auto-reply for `text` if a rule matches it
         exactly.
@@ -1219,7 +1198,7 @@ class ReplyEngine:
             # the server must not have it.
             return f"[red]{note}[/red]" if self.MARKUP else note
         self.sent_auto_count += 1
-        ReplyEngine._remember_reply(self, from_id, packet_id)
+        ReplyEngine._remember_reply(self, from_id, packet_id, rx_time, text)
 
         # The sent text carries literal brackets and a newline. For the TUI the
         # brackets have to be escaped, since RichLog reads the line as markup and
@@ -1943,21 +1922,6 @@ class ServerBot(ReplyEngine):
 
     # ---- pubsub handlers --------------------------------------------------
 
-    def _stale_watchdog(self) -> None:
-        """Poll for a link that is up but no longer delivering.
-
-        A thread of its own because the main loop waits on the heartbeat
-        interval, which is ten minutes by default and never with --heartbeat 0 -
-        neither is a rate at which to notice a dead link.
-        """
-        while not self._stopped.wait(self.STALE_CHECK_SECS):
-            now = time.monotonic()
-            if not self._link_is_stale(now):
-                continue
-            idle = int(now - self.last_packet_at)
-            self.log(f"{idle} 秒沒有收到任何封包,視為斷線")
-            self.on_connection_lost(self.interface)
-
     def on_config_synced(self, interface, topic=pub.AUTO_TOPIC) -> None:
         # Adopted here as well as in _adopt(). The library publishes
         # connection.established from its own thread while open_interface() is
@@ -2071,6 +2035,7 @@ class ServerBot(ReplyEngine):
             rssi=info["rssi"],
             channel=info["channel"],
             packet_id=info.get("id"),
+            rx_time=info.get("rx_time"),
         )
         if reply_line:
             self.log(reply_line)
@@ -2177,8 +2142,6 @@ class ServerBot(ReplyEngine):
             return 1
         self.connected_key = f"{transport}:{address}"
         self._adopt(interface, transport)
-        threading.Thread(target=self._stale_watchdog, daemon=True).start()
-
         # There is state worth closing now, so swap the hard abort for the
         # graceful path.
         for sig in (signal.SIGINT, signal.SIGTERM):
