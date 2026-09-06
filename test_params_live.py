@@ -320,18 +320,24 @@ def connects(name):
     lines: queue.Queue = queue.Queue()
 
     def pump() -> None:
-        for line in proc.stdout:
-            lines.put(line)
-        lines.put(None)
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            # Cleanup may close the pipe to wake a blocked reader.
+            pass
+        finally:
+            lines.put(None)
 
-    threading.Thread(target=pump, daemon=True).start()
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
 
     deadline = time.time() + PROBE_SECONDS
     seen = []
     try:
-        while True:
+        while time.time() < deadline:
             try:
-                line = lines.get(timeout=max(0.0, deadline - time.time()))
+                line = lines.get(timeout=deadline - time.time())
             except queue.Empty:
                 break
             if line is None:
@@ -342,10 +348,13 @@ def connects(name):
     finally:
         proc.terminate()
         try:
-            proc.wait(timeout=20)
+            proc.wait(timeout=max(0.0, deadline - time.time()))
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
+            proc.wait(timeout=1)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        reader.join(timeout=1)
     tail = "".join(seen).strip().splitlines()
     print(f"    {name} did not connect: {tail[-1][:90] if tail else 'no output'}")
     return False
@@ -354,7 +363,10 @@ def connects(name):
 def find_node():
     """The first scanned node that will actually talk to us."""
     for name in scan_names():
-        print(f"  probing {name} (up to {PROBE_SECONDS}s)...", flush=True)
+        print(
+            f"  probing {name} (up to {PROBE_SECONDS}s, plus at most 1s cleanup)...",
+            flush=True,
+        )
         if connects(name):
             return name
     return None
@@ -377,25 +389,25 @@ def main():
     )
     args = parser.parse_args()
 
-    node = None
-    if not args.quick:
-        node = args.node or find_node()
-        if node is None:
-            print(
-                "no BLE node would accept a connection - rerun with --quick, or "
-                "check the node is advertising and not already connected to a "
-                "phone (a scan finds it either way; only one of those works)",
-                file=sys.stderr,
-            )
-            return 2
-        print(f"using {node}\n")
-
     rules_dir = tempfile.TemporaryDirectory(prefix="meshtastic-bot-test-")
     rules = Path(rules_dir.name) / "rules.txt"
     rules.write_text("# test rules intentionally empty\n", encoding="utf-8")
     TEST_ENV["MESHTASTIC_RULES_FILE"] = str(rules)
 
     try:
+        node = None
+        if not args.quick:
+            node = args.node or find_node()
+            if node is None:
+                print(
+                    "no BLE node would accept a connection - rerun with --quick, or "
+                    "check the node is advertising and not already connected to a "
+                    "phone (a scan finds it either way; only one of those works)",
+                    file=sys.stderr,
+                )
+                return 2
+            print(f"using {node}\n")
+
         print("=== --help ===")
         for program, flags in (
             (

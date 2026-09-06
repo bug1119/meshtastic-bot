@@ -2292,7 +2292,11 @@ class MqttProxy:
         # Topics the channel list cannot produce, learned from what the node
         # publishes. Held apart from _wanted so a config re-sync can retire a
         # channel it no longer sees without retiring these along with it.
-        self._learned: set = set()
+        self._learned: dict[str, int] = {}
+        # Remember configured names for this broker too. If a named channel is
+        # removed, a late uplink on its old topic must not be mistaken for the
+        # unnamed primary.
+        self._configured_topics: set = set()
         # Guards _wanted and the connected flag together. Topics are added from
         # meshtastic's publishing thread as the node reveals them, while paho's
         # thread walks the set to re-subscribe on connect - without this, one
@@ -2361,6 +2365,7 @@ class MqttProxy:
         # Learned topics carry the old root in them, so a broker change makes
         # them wrong rather than merely stale.
         self._learned.clear()
+        self._configured_topics.clear()
         self._refresh_wanted_topics()
         try:
             self._client = self._build_client(self._settings)
@@ -2578,12 +2583,27 @@ class MqttProxy:
             wanted.add(self._channel_topic(MQTT_PKI_CHANNEL))
 
         with self._lock:
+            self._configured_topics |= {
+                self._channel_topic(channel.settings.name)
+                for channel in self._bot.interface.localNode.channels or []
+                if channel.settings and channel.settings.name
+            }
             # Union with what was learned, or this would unsubscribe it: the
             # unnamed primary is never in `wanted`, since the loop above can
             # only see channels that carry a name. Dropping it here would take
             # the primary's downlink away on every reconnect, and leave it off
             # until the node happened to publish there again.
-            wanted |= self._learned
+            active_indexes = {
+                channel.index
+                for channel in self._bot.interface.localNode.channels or []
+                if channel.settings and channel.settings.downlink_enabled
+            }
+            self._learned = {
+                topic: index
+                for topic, index in self._learned.items()
+                if index in active_indexes
+            }
+            wanted |= set(self._learned)
             removed = self._wanted - wanted
             added = wanted - self._wanted
             self._wanted = wanted
@@ -2601,13 +2621,15 @@ class MqttProxy:
         """
         return f"{self._settings['root']}{MQTT_ENVELOPE_PATH}{channel_id}/+"
 
-    def _want(self, topic: str) -> None:
+    def _want(self, topic: str, channel_index: int) -> None:
         """Add `topic` to the subscription set, sending it now if connected."""
         with self._lock:
+            # Observation is independent of whether config already requested
+            # the topic. It must survive a named -> unnamed channel transition.
+            self._learned[topic] = channel_index
             if topic in self._wanted:
                 return
             self._wanted.add(topic)
-            self._learned.add(topic)
             # Under the same lock as the flag it reads: a topic added in the
             # instant between "not connected yet" and on_connect's sweep would
             # otherwise be subscribed by neither.
@@ -2629,8 +2651,45 @@ class MqttProxy:
         if not topic.startswith(prefix):
             return
         channel_id = topic[len(prefix) :].split("/")[0]
-        if channel_id:
-            self._want(f"{prefix}{channel_id}/+")
+        if not channel_id:
+            return
+
+        channels = [
+            channel
+            for channel in self._bot.interface.localNode.channels or []
+            if channel.settings
+        ]
+        named = next(
+            (channel for channel in channels if channel.settings.name == channel_id), None
+        )
+        if named is not None:
+            matching = named if named.settings.downlink_enabled else None
+        else:
+            # A topic absent from the named channels can only represent an
+            # unnamed channel (normally the primary, named after its preset by
+            # firmware). Do not learn arbitrary disabled/removed named topics.
+            matching = None
+            candidate = f"{prefix}{channel_id}/+"
+            if candidate not in self._configured_topics:
+                matching = next(
+                    (
+                        channel
+                        for channel in channels
+                        if not channel.settings.name and channel.settings.downlink_enabled
+                    ),
+                    None,
+                )
+                # Some test/library channel lists omit the primary entry. In
+                # that shape the firmware-derived topic still belongs to the
+                # first enabled channel; known disabled/removed names remain
+                # blocked by _configured_topics above.
+                if matching is None:
+                    matching = next(
+                        (channel for channel in channels if channel.settings.downlink_enabled),
+                        None,
+                    )
+        if matching is not None:
+            self._want(f"{prefix}{channel_id}/+", matching.index)
 
     # ---- relay ------------------------------------------------------------
 
@@ -2643,7 +2702,11 @@ class MqttProxy:
         the JSON variant as `text`. Reading the wrong arm of a union gives
         whichever bytes happen to alias it, so it is selected explicitly.
         """
-        if self._client is None or self._stopped.is_set():
+        if (
+            self._client is None
+            or self._stopped.is_set()
+            or interface is not self._bot.interface
+        ):
             return
         if proxymessage.WhichOneof("payload_variant") == "text":
             payload = proxymessage.text.encode("utf-8")
