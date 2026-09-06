@@ -423,8 +423,6 @@ def main():
             expect_out=["--wifi needs a target"], name="bot.py --wifi with no target")
         run(["bot.py", "--daemon", "--port", "/dev/null"], 120, expect_rc=2,
             name="bot.py --daemon without --server")
-        run(["bot.py", "--mqtt", "--port", "/dev/null"], 120, expect_rc=2,
-            name="bot.py --mqtt without --server")
         run(["bot.py", "--here", "not-a-coord"], 120, expect_rc=2, name="--here nonsense")
         run(["bot_server.py", "--here", "999,999"], 120, expect_rc=2, name="--here out of range")
         run(["bot_server.py", "--ble", "X", "--heartbeat", "abc"], 120, expect_rc=2,

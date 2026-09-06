@@ -1475,6 +1475,21 @@ class MqttProxy:
             text += f" 錯誤 {self.error_count}"
         return text
 
+    def status_fragment(self) -> str:
+        """The same counters as heartbeat_fragment, for the TUI's status bar.
+
+        Marked up rather than plain, and short rather than spelled out: the bar
+        is one line that already carries five figures. Kept beside
+        heartbeat_fragment so the two cannot drift apart unnoticed.
+        """
+        text = "   [bold]MQTT[/bold] " + (
+            "已連線" if self.connected else "[red]未連線[/red]"
+        )
+        text += f" [dim]↑{self.up_count} ↓{self.down_count}[/dim]"
+        if self.error_count:
+            text += f" [red]錯誤 {self.error_count}[/red]"
+        return text
+
     # ---- broker connection ------------------------------------------------
 
     def _build_client(self, settings: dict):

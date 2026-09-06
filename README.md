@@ -71,7 +71,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 | `--daemon` | ✅ | ✅ | 選好裝置後丟到背景 |
 | `--log PATH` | ✅ | ✅ | `--daemon` 的輸出檔 |
 | `--heartbeat SECS` | ✅ | ✅ | 多久印一行「還活著」 |
-| `--mqtt` | ✅ | ✅ | 代節點連 MQTT broker(要跟 `--server` 一起) |
+| `--mqtt` | ✅ | ✅ | 代節點連 MQTT broker。TUI 與 server 都能用 |
 | `--wifi on\|off` | ✅ | — | 開關節點的 WiFi 後結束 |
 
 不給 `--ble` 也可以:`bot.py` 本來就會掃 BLE 並列在裝置窗格裡讓你點。
@@ -106,7 +106,8 @@ python3 -m venv ~/.venvs/meshtastic-bot
 | `--wifi on\|off` | 開關節點的 WiFi,做完直接結束(不啟動 UI)。需要 `--port` 或 `--host` |
 
 `--server` 之外多出來的參數都跟 `bot_server.py` 相同(見下)。
-`--daemon` 與 `--mqtt` 都必須跟 `--server` 一起用,單獨給會被擋掉。
+`--daemon` 必須跟 `--server` 一起用,單獨給會被擋掉 —— 它是把 server 丟到背景,
+而沒有「背景 TUI」這種東西。`--mqtt` 兩種模式都能用。
 
 ### bot_server.py — 只有 server,沒有 UI
 
@@ -354,12 +355,19 @@ macOS 特有的兩件事,程式裡有處理:
 
 ## MQTT 橋接:`--mqtt`
 
-節點自己上不了 MQTT broker 的時候,由這支程式代它上。只能跟 `--server` 一起用:
+節點自己上不了 MQTT broker 的時候,由這支程式代它上。TUI 與 server 都能用:
 
 ```sh
-./bot_server.py --ble Bug2_1ca6 --mqtt
-./bot.py --server --ble Bug2_1ca6 --mqtt --daemon --log ~/bot.log
+./bot.py --ble Bug2_1ca6 --mqtt                                   # TUI,橋接狀態顯示在狀態列
+./bot_server.py --ble Bug2_1ca6 --mqtt                            # 無 UI
+./bot.py --server --ble Bug2_1ca6 --mqtt --daemon --log ~/bot.log # 無 UI,背景
 ```
+
+TUI 模式下,橋接的連線狀態與上下行計數會接在狀態列後面
+(`MQTT 已連線 ↑12 ↓5`)—— server 模式沒有狀態列,同樣的數字放在心跳行裡。
+
+一台節點同一時間只接受一個 client,所以 TUI 與 server 不能同時對同一台跑;
+想要畫面就用前者,想長期掛背景就用後者。
 
 **為什麼需要**:ESP32 的韌體只在 WiFi 不可用時才開藍牙(`src/platform/esp32/main-esp32.cpp`),所以用 BLE 連的節點**必然沒有自己的網路** —— 它上 MQTT 的唯一路徑是 `mqtt.proxy_to_client_enabled`:節點把每一則 MQTT 交給當下連著的 client,由那個 client 去連 broker。手機 app 有做這件事,所以把手機換成這支程式之後,節點的 MQTT 就整段掉在地上,而且沒有任何訊息說它掉了。
 
@@ -390,7 +398,7 @@ MQTT: 節點的 proxy_to_client_enabled 是關的,不啟動橋接
 
 ### 藍牙、WiFi、USB 都可以,但意義不同
 
-橋接是搭在**「client 連線」**上的,不管那條連線是什麼 —— 它就是對手上那個 interface 物件呼叫 `sendMqttClientProxyMessage()`,`BLEInterface` / `TCPInterface` / `SerialInterface` 一視同仁。程式裡沒有任何連線方式的限制,唯一一條檢查是 `--mqtt` 要跟 `--server` 一起用。
+橋接是搭在**「client 連線」**上的,不管那條連線是什麼 —— 它就是對手上那個 interface 物件呼叫 `sendMqttClientProxyMessage()`,`BLEInterface` / `TCPInterface` / `SerialInterface` 一視同仁。程式裡沒有任何連線方式的限制,`--mqtt` 在 TUI 與 server 模式下都能用。
 
 ```sh
 ./bot_server.py --ble Bug2_1ca6 --mqtt                    # 藍牙

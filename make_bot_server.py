@@ -52,6 +52,11 @@ def drop(name: str, kind: str = "def") -> str:
 
 
 print("removing:")
+# Before MeshtasticTUI, which is what ends it: dropping the app first would
+# leave this class running to whatever followed the app instead.
+# The adapter exists only to hand the app to MqttProxy; ServerBot is a usable
+# host on its own, so there is nothing here to adapt.
+print("  " + drop("_TuiMqttHost", "class"))
 print("  " + drop("MeshtasticTUI", "class"))
 for name in ("display_width", "set_wifi"):
     print("  " + drop(name))
@@ -214,10 +219,12 @@ sub(
         "is never sent to the device or the mesh.",''',
 )
 
-# --wifi belongs to bot.py, and the --server guards have nothing to guard here.
-# The paho check survives: --mqtt is a real flag in both files, and finding out
-# the package is missing half a minute into a BLE connect - in the background,
-# by then - is exactly what checking it up front avoids.
+# --wifi belongs to bot.py, and the --daemon guard has nothing to guard here:
+# this file is only ever the server. (--mqtt no longer has a guard of its own -
+# the TUI bridges too now.) The paho check survives: --mqtt is a real flag in
+# both files, and finding out the package is missing half a minute into a BLE
+# connect - in the background, by then - is exactly what checking it up front
+# avoids.
 sub(
     '''    if args.wifi:
         if args.port:
@@ -230,9 +237,6 @@ sub(
 
     if args.daemon and not args.server:
         parser.error("--daemon 只能跟 --server 一起用")
-
-    if args.mqtt and not args.server:
-        parser.error("--mqtt 只能跟 --server 一起用")
 
 ''',
     "",
@@ -261,6 +265,7 @@ sub(
         serial_port=args.port,
         here=args.here,
         ble_address=args.ble,
+        mqtt=args.mqtt,
     ).run()''',
     '''    target = resolve_server_target(args.host, args.port, args.ble)
     if target is None:
@@ -288,6 +293,7 @@ print(f"\nwrote {OUT.name} ({len(source.splitlines())} lines)")
 for banned in (
     "textual",
     "MeshtasticTUI",
+    "_TuiMqttHost",
     "set_wifi",
     "display_width",
     "STATUS_PANE_WIDTH",
