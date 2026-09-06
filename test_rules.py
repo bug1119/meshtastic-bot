@@ -502,26 +502,6 @@ def link_app(interface="iface", closing=False, link_down=False):
     return app
 
 
-def stale_app(idle=None, interface="iface", link_down=False, closing=False):
-    """A stand-in self for the staleness check.
-
-    `idle` is how many seconds ago the last packet arrived; None means none has
-    ever arrived.
-    """
-    now = time.monotonic()
-    return types.SimpleNamespace(
-        interface=interface,
-        link_down=link_down,
-        _closing=closing,
-        last_packet_at=None if idle is None else now - idle,
-        STALE_LINK_SECS=bot.ReplyEngine.STALE_LINK_SECS,
-    )
-
-
-def is_stale(**kw):
-    return bot.ReplyEngine._link_is_stale(stale_app(**kw), time.monotonic())
-
-
 def test_release_link():
     print("the old link is handed back before reconnecting")
 
@@ -561,33 +541,17 @@ def test_release_link():
 
 
 def test_stale_link_detection():
-    print("a link that stops delivering is treated as lost")
-
-    check("silent well past the limit", is_stale(idle=bot.ReplyEngine.STALE_LINK_SECS + 60), True)
-    check("still delivering", is_stale(idle=5), False)
-    check("just inside the limit", is_stale(idle=bot.ReplyEngine.STALE_LINK_SECS - 10), False)
-
-    # Each of these has its own handling; firing on top would start a second
-    # reconnect, or one against a link that does not exist.
-    check("no link at all", is_stale(idle=9999, interface=None), False)
-    check("already known to be down", is_stale(idle=9999, link_down=True), False)
-    check("shutting down", is_stale(idle=9999, closing=True), False)
-    check("nothing has arrived yet", is_stale(idle=None), False)
-
-    # The library sends a heartbeat every 300s and the reply to it is traffic,
-    # so a mesh with nothing to say still produces a packet on that cadence. A
-    # limit at or under it would fire on a merely quiet night.
-    check("limit clears the library's 300s heartbeat", bot.ReplyEngine.STALE_LINK_SECS > 300, True)
-    check("checked far more often than the limit", bot.ReplyEngine.STALE_CHECK_SECS < 60, True)
-
-    print("both programs carry it")
+    print("silence alone never tears down a link")
+    # Meshtastic sends a heartbeat to the radio every 300 seconds, but the
+    # protocol does not promise a receive packet in response. A real healthy
+    # BLE link carried MQTT downlink for 423 quiet seconds, then the old
+    # watchdog killed it and the replacement never completed config sync.
     root = pathlib.Path(bot.__file__).parent
     for name in ("bot.py", "bot_server.py"):
         text = (root / name).read_text(encoding="utf-8")
         check(f"{name} records every packet", "self._note_packet()" in text, True)
-        check(f"{name} acts on staleness", "_link_is_stale(" in text, True)
-    # bot.py is the frozen original and has no reconnect machinery to hang this
-    # off, so it is deliberately not in that list.
+        check(f"{name} has no silence watchdog", "_link_is_stale(" in text, False)
+        check(f"{name} does not force-close a quiet link", "秒沒有收到任何封包" in text, False)
 
 
 def test_downlink_pauses_while_the_link_is_down():
@@ -760,15 +724,23 @@ def test_should_auto_reply():
     check("prefix after whitespace", call(app, {"from_id": "!them", "id": 92, "text": "  BOT: x"}), False)
     check("prefix must match case", call(app, {"from_id": "!them", "id": 93, "text": "bot: x"}), True)
     # The same packet again: the mesh rebroadcasts, and MQTT can bridge it back.
-    bot.MeshtasticTUI._remember_reply(app, "!them", 1)
+    bot.MeshtasticTUI._remember_reply(app, "!them", 1, None, "ping")
     check("the same packet a second time", call(app, {"from_id": "!them", "id": 1, "text": "ping"}), False)
     check("a different packet", call(app, {"from_id": "!them", "id": 2, "text": "ping"}), True)
     check("the same id from another sender", call(app, {"from_id": "!other", "id": 1, "text": "ping"}), True)
+    check(
+        "the same sender may reuse an id for different text",
+        call(app, {"from_id": "!them", "id": 1, "text": "Q"}),
+        True,
+    )
+    check(
+        "the same sender may reuse an id and text at a new time",
+        call(app, {"from_id": "!them", "id": 1, "rx_time": 2, "text": "ping"}),
+        True,
+    )
     # Our own outgoing text echoes back; answering it makes the bot self-reply.
     check("our own echo", call(app, {"from_id": "!me", "id": 3, "text": "ping"}), False)
-    # Keyed on (sender, id) since the ledger was scoped per sender - a bare id
-    # can no longer match anything, so checking for one would always pass.
-    check("our own echo is not remembered", ("!me", 3) in app._replied_ids, False)
+    check("our own echo is not remembered", ("!me", 3, None, "ping") in app._replied_ids, False)
     # No id to key on: replying twice beats ignoring a real message.
     check("packet with no id", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
     check("packet with no id again", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
@@ -776,10 +748,18 @@ def test_should_auto_reply():
     print("reply ledger stays bounded")
     app2 = types.SimpleNamespace(my_id="!me", _replied_ids={}, REPLIED_ID_LIMIT=8)
     for i in range(50):
-        bot.MeshtasticTUI._remember_reply(app2, "!them", i)
+        bot.MeshtasticTUI._remember_reply(app2, "!them", i, None, "ping")
     check("bounded to the limit", len(app2._replied_ids), 8)
-    check("keeps the newest", ("!them", 49) in app2._replied_ids, True)
-    check("drops the oldest", ("!them", 0) in app2._replied_ids, False)
+    check(
+        "keeps the newest",
+        ("!them", 49, None, "ping") in app2._replied_ids,
+        True,
+    )
+    check(
+        "drops the oldest",
+        ("!them", 0, None, "ping") in app2._replied_ids,
+        False,
+    )
 
 
 def test_dm_sections():
