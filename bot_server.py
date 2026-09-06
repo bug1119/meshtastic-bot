@@ -956,12 +956,12 @@ class ReplyEngine:
         """
         deadline = time.monotonic() + self.SYNC_TIMEOUT
         while not self._closing:
-            if self.synced_interface is interface:
+            if id(interface) in self.synced_interfaces:
                 return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(self.SYNC_POLL_SECS)
-        return self.synced_interface is interface
+        return False
 
     # How long to wait for the old connection to close before reconnecting.
     # Short on purpose: the point is to hand the node's client slot back, and a
@@ -1896,7 +1896,8 @@ class ServerBot(ReplyEngine):
         # The interface that finished its config download. Compared by identity
         # rather than kept as a flag, because connection.established can arrive
         # before the reconnect has adopted the interface it belongs to.
-        self.synced_interface = None
+        self.synced_interfaces: set[int] = set()
+        self.pending_interface = None
         self._stopped = threading.Event()
         # None unless --mqtt was given, and checked for None at every use
         # rather than swapped for a do-nothing stand-in: "is the bridge on" is
@@ -1961,20 +1962,43 @@ class ServerBot(ReplyEngine):
             if self._closing or not self.link_down:
                 return
             self.log(f"重連中(第 {attempt} 次)...")
+            self.synced_interfaces.clear()
             try:
                 interface = open_interface(transport, address)
             except Exception as e:  # noqa: BLE001
                 self.log(f"重連失敗: {e}")
                 continue
+            if self._closing or not self.link_down:
+                self._release_link(interface)
+                return
+            synced_early = id(interface) in self.synced_interfaces
+            self.synced_interfaces.clear()
+            if synced_early:
+                self.synced_interfaces.add(id(interface))
             # Adopted before the wait so a config sync that arrives during it
             # is recognised as this interface's; link_down stays set until the
             # sync lands, which keeps the heartbeat honest and holds the MQTT
             # downlink off a node still doing its config download.
+            self.pending_interface = interface
             self._adopt(interface, transport)
+            if id(interface) in self.synced_interfaces:
+                # The config event can precede the constructor return. Process
+                # it again now that this is the registered candidate.
+                self.on_config_synced(interface)
             if not self._await_sync(interface):
+                if self._closing:
+                    self.pending_interface = None
+                    self.synced_interfaces.clear()
+                    self._release_link(interface)
+                    return
                 self.log(f"重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試")
+                if self.pending_interface is interface:
+                    self.pending_interface = None
+                self.synced_interfaces.clear()
                 self._release_link(interface)
                 continue
+            self.pending_interface = None
+            self.synced_interfaces.clear()
             self.link_down = False
             return
 
@@ -1986,14 +2010,17 @@ class ServerBot(ReplyEngine):
         # still constructing the interface, so this can arrive before run() has
         # had the chance to assign self.interface - and _known_channel_sections
         # below reads it. The interface that published is ours by definition.
-        if self.interface is None:
+        if self._closing:
+            return
+        self.synced_interfaces.add(id(interface))
+        if self.link_down:
+            if interface is not self.pending_interface:
+                return
             self.interface = interface
-        elif self.link_down and interface is not self.interface:
+        elif self.interface is None:
             self.interface = interface
-            self.link_down = False
         elif interface is not self.interface:
             return
-        self.synced_interface = interface
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         name = my_user.get("longName") or my_user.get("shortName") or "?"
@@ -2148,11 +2175,24 @@ class ServerBot(ReplyEngine):
         and nothing else. The caller uses this to leave without atexit.
         """
         self._closing = True
+        for handler, topic in (
+            (self.on_receive, "meshtastic.receive"),
+            (self.on_config_synced, "meshtastic.connection.established"),
+            (self.on_connection_lost, "meshtastic.connection.lost"),
+        ):
+            try:
+                pub.unsubscribe(handler, topic)
+            except Exception:  # noqa: BLE001
+                pass
+        pending = self.pending_interface
+        self.pending_interface = None
         # Before the interface, so the relay stops handing it work while it is
         # being torn down - and bounded in its own right, since a broker socket
         # can hang exactly like a BLE one.
         if self.mqtt is not None:
             self.mqtt.stop()
+        if pending is not None and pending is not interface:
+            self._release_link(pending)
         closer = threading.Thread(
             target=self._close_quietly, args=(interface,), daemon=True
         )

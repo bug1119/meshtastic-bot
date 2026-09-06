@@ -1078,12 +1078,12 @@ class ReplyEngine:
         """
         deadline = time.monotonic() + self.SYNC_TIMEOUT
         while not self._closing:
-            if self.synced_interface is interface:
+            if id(interface) in self.synced_interfaces:
                 return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(self.SYNC_POLL_SECS)
-        return self.synced_interface is interface
+        return False
 
     # How long to wait for the old connection to close before reconnecting.
     # Short on purpose: the point is to hand the node's client slot back, and a
@@ -1507,7 +1507,10 @@ class MeshtasticTUI(ReplyEngine, App):
         # The interface that finished its config download. Compared by identity
         # rather than kept as a flag, because connection.established can arrive
         # before the reconnect has adopted the interface it belongs to.
-        self.synced_interface = None
+        self.synced_interfaces: set[int] = set()
+        # The one reconnect candidate whose config event may take ownership.
+        # A delayed event from any older attempt is ignored.
+        self.pending_interface = None
         # Status bar figures. monotonic, so the uptime cannot jump if the system
         # clock is corrected under us. Received counts text messages from other
         # nodes - our own echo would otherwise make sending one message read as
@@ -1787,18 +1790,39 @@ class MeshtasticTUI(ReplyEngine, App):
             if self._closing or not self.link_down:
                 return
             self.call_from_thread(self._log_system, f"重連中(第 {attempt} 次)...")
+            # Keep only sync events that can belong to this constructor call.
+            # Delayed events from older attempts must not accumulate until an
+            # object id is reused and falsely satisfy a future candidate.
+            self.synced_interfaces.clear()
             try:
                 interface = open_interface(transport, address)
             except Exception as e:  # noqa: BLE001
                 self.call_from_thread(self._log_system, f"[yellow]重連失敗: {e}[/yellow]")
                 continue
+            if self._closing or not self.link_down:
+                self._release_link(interface)
+                return
+            synced_early = id(interface) in self.synced_interfaces
+            self.synced_interfaces.clear()
+            if synced_early:
+                self.synced_interfaces.add(id(interface))
+            self.pending_interface = interface
             if not self._await_sync(interface):
+                if self._closing:
+                    self.pending_interface = None
+                    self.synced_interfaces.clear()
+                    self._release_link(interface)
+                    return
                 self.call_from_thread(
                     self._log_system,
                     f"[yellow]重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試[/yellow]",
                 )
+                if self.pending_interface is interface:
+                    self.pending_interface = None
+                self.synced_interfaces.clear()
                 self._release_link(interface)
                 continue
+            self.synced_interfaces.clear()
             self.call_from_thread(self._relinked, interface, transport)
             return
 
@@ -1810,8 +1834,16 @@ class MeshtasticTUI(ReplyEngine, App):
         node lists - which also picks up any node first heard while the link
         was down. self.history survives, so nothing already logged is lost.
         """
-        self.link_down = False
+        if self._closing or interface is not self.pending_interface:
+            self._release_link(interface)
+            return
         self._connected(interface, transport)
+        self.link_down = False
+        self.pending_interface = None
+        # During reconnect the pubsub callback only records completion; finish
+        # the UI/config work here so callback queue timing cannot invalidate the
+        # candidate before it is processed.
+        self._config_synced(interface)
 
     def _connected(self, interface, transport: str = TRANSPORT_BLE) -> None:
         # This fires as soon as the raw link is up. Channels/nodes/myUser are
@@ -1827,20 +1859,30 @@ class MeshtasticTUI(ReplyEngine, App):
 
     def on_config_synced(self, interface, topic=pub.AUTO_TOPIC) -> None:
         # Fires on meshtastic's own pubsub thread, not Textual's - hop back.
+        if self._closing:
+            return
+        self.synced_interfaces.add(id(interface))
+        # During reconnect an event may beat open_interface() back to its
+        # caller. Record it above, but do not queue UI work until that caller
+        # registers this object as the current candidate.
+        if self.link_down:
+            return
         self.call_from_thread(self._config_synced, interface)
 
     def _config_synced(self, interface) -> None:
         # connection.established can arrive while open_interface() is still
         # returning. Adopt the first interface here, but reject delayed events
         # from a link that has since been replaced.
-        if getattr(self, "interface", None) is None:
+        if self._closing:
+            return
+        if self.link_down:
+            if interface is not self.pending_interface:
+                return
             self.interface = interface
-        elif self.link_down and interface is not self.interface:
+        elif getattr(self, "interface", None) is None:
             self.interface = interface
-            self.link_down = False
         elif interface is not self.interface:
             return
-        self.synced_interface = interface
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         self._log_system(f"[green]設定同步完成[/green] (my id: {self.my_id})")
@@ -2932,7 +2974,8 @@ class ServerBot(ReplyEngine):
         # The interface that finished its config download. Compared by identity
         # rather than kept as a flag, because connection.established can arrive
         # before the reconnect has adopted the interface it belongs to.
-        self.synced_interface = None
+        self.synced_interfaces: set[int] = set()
+        self.pending_interface = None
         self._stopped = threading.Event()
         # None unless --mqtt was given, and checked for None at every use
         # rather than swapped for a do-nothing stand-in: "is the bridge on" is
@@ -2997,20 +3040,43 @@ class ServerBot(ReplyEngine):
             if self._closing or not self.link_down:
                 return
             self.log(f"重連中(第 {attempt} 次)...")
+            self.synced_interfaces.clear()
             try:
                 interface = open_interface(transport, address)
             except Exception as e:  # noqa: BLE001
                 self.log(f"重連失敗: {e}")
                 continue
+            if self._closing or not self.link_down:
+                self._release_link(interface)
+                return
+            synced_early = id(interface) in self.synced_interfaces
+            self.synced_interfaces.clear()
+            if synced_early:
+                self.synced_interfaces.add(id(interface))
             # Adopted before the wait so a config sync that arrives during it
             # is recognised as this interface's; link_down stays set until the
             # sync lands, which keeps the heartbeat honest and holds the MQTT
             # downlink off a node still doing its config download.
+            self.pending_interface = interface
             self._adopt(interface, transport)
+            if id(interface) in self.synced_interfaces:
+                # The config event can precede the constructor return. Process
+                # it again now that this is the registered candidate.
+                self.on_config_synced(interface)
             if not self._await_sync(interface):
+                if self._closing:
+                    self.pending_interface = None
+                    self.synced_interfaces.clear()
+                    self._release_link(interface)
+                    return
                 self.log(f"重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試")
+                if self.pending_interface is interface:
+                    self.pending_interface = None
+                self.synced_interfaces.clear()
                 self._release_link(interface)
                 continue
+            self.pending_interface = None
+            self.synced_interfaces.clear()
             self.link_down = False
             return
 
@@ -3022,14 +3088,17 @@ class ServerBot(ReplyEngine):
         # still constructing the interface, so this can arrive before run() has
         # had the chance to assign self.interface - and _known_channel_sections
         # below reads it. The interface that published is ours by definition.
-        if self.interface is None:
+        if self._closing:
+            return
+        self.synced_interfaces.add(id(interface))
+        if self.link_down:
+            if interface is not self.pending_interface:
+                return
             self.interface = interface
-        elif self.link_down and interface is not self.interface:
+        elif self.interface is None:
             self.interface = interface
-            self.link_down = False
         elif interface is not self.interface:
             return
-        self.synced_interface = interface
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         name = my_user.get("longName") or my_user.get("shortName") or "?"
@@ -3184,11 +3253,24 @@ class ServerBot(ReplyEngine):
         and nothing else. The caller uses this to leave without atexit.
         """
         self._closing = True
+        for handler, topic in (
+            (self.on_receive, "meshtastic.receive"),
+            (self.on_config_synced, "meshtastic.connection.established"),
+            (self.on_connection_lost, "meshtastic.connection.lost"),
+        ):
+            try:
+                pub.unsubscribe(handler, topic)
+            except Exception:  # noqa: BLE001
+                pass
+        pending = self.pending_interface
+        self.pending_interface = None
         # Before the interface, so the relay stops handing it work while it is
         # being torn down - and bounded in its own right, since a broker socket
         # can hang exactly like a BLE one.
         if self.mqtt is not None:
             self.mqtt.stop()
+        if pending is not None and pending is not interface:
+            self._release_link(pending)
         closer = threading.Thread(
             target=self._close_quietly, args=(interface,), daemon=True
         )
