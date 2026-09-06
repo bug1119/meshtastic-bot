@@ -166,7 +166,7 @@ from meshtastic.protobuf import config_pb2
 
 import lora_params
 
-RULES_FILE = Path(__file__).parent / "rules.txt"
+RULES_FILE = Path(os.environ.get("MESHTASTIC_RULES_FILE", Path(__file__).parent / "rules.txt"))
 
 DEFAULT_RULES = """\
 # Auto-reply rules, grouped by channel.
@@ -706,6 +706,10 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
     if to_id == BROADCAST_ADDR:
         target = ("channel", packet.get("channel", 0))
     else:
+        # A routed packet between two other nodes is not our DM. Radios may
+        # overhear and decode it, but answering would intrude on their exchange.
+        if my_id and from_id != my_id and to_id != my_id:
+            return None
         other = to_id if from_id == my_id else from_id
         target = ("node", other)
 
@@ -1260,13 +1264,18 @@ class ReplyEngine:
             # Nothing to deduplicate on. Answering is the lesser failure - a
             # duplicate reply beats silently ignoring a real message.
             return True
-        if packet_id in self._replied_ids:
+        reply_key = (info["from_id"], packet_id)
+        if reply_key in self._replied_ids:
             return False
+        return True
 
-        self._replied_ids[packet_id] = True
+    def _remember_reply(self, from_id: str, packet_id: int | None) -> None:
+        """Record a successfully answered packet, scoped to its sender."""
+        if packet_id is None:
+            return
+        self._replied_ids[(from_id, packet_id)] = True
         while len(self._replied_ids) > self.REPLIED_ID_LIMIT:
             self._replied_ids.pop(next(iter(self._replied_ids)))
-        return True
 
     def _maybe_auto_reply(
         self,
@@ -1279,6 +1288,7 @@ class ReplyEngine:
         snr: float | None = None,
         rssi: int | None = None,
         channel: int | None = None,
+        packet_id: int | None = None,
     ) -> str | None:
         """Send + record the keyword auto-reply for `text` if a rule matches it
         exactly.
@@ -1331,6 +1341,7 @@ class ReplyEngine:
             # the server must not have it.
             return f"[red]{note}[/red]" if self.MARKUP else note
         self.sent_auto_count += 1
+        ReplyEngine._remember_reply(self, from_id, packet_id)
 
         # The sent text carries literal brackets and a newline. For the TUI the
         # brackets have to be escaped, since RichLog reads the line as markup and
@@ -1757,6 +1768,16 @@ class MeshtasticTUI(ReplyEngine, App):
         self.call_from_thread(self._config_synced, interface)
 
     def _config_synced(self, interface) -> None:
+        # connection.established can arrive while open_interface() is still
+        # returning. Adopt the first interface here, but reject delayed events
+        # from a link that has since been replaced.
+        if getattr(self, "interface", None) is None:
+            self.interface = interface
+        elif self.link_down and interface is not self.interface:
+            self.interface = interface
+            self.link_down = False
+        elif interface is not self.interface:
+            return
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         self._log_system(f"[green]設定同步完成[/green] (my id: {self.my_id})")
@@ -2038,6 +2059,10 @@ class MeshtasticTUI(ReplyEngine, App):
         self.query_one("#status-bar", Label).update(self._status_bar_text())
 
     def on_receive(self, packet, interface) -> None:
+        if getattr(self, "interface", None) is None:
+            self.interface = interface
+        elif interface is not self.interface:
+            return
         # Counted first, ahead of the text-message filter below - a packet is a
         # packet whatever its portnum, and non-text ones are most of the traffic.
         self.packet_count += 1
@@ -2079,6 +2104,7 @@ class MeshtasticTUI(ReplyEngine, App):
                 snr=info["snr"],
                 rssi=info["rssi"],
                 channel=info["channel"],
+                packet_id=info.get("id"),
             )
         if reply_line:
             def update_ui2():
@@ -2092,17 +2118,24 @@ class MeshtasticTUI(ReplyEngine, App):
         text = event.value.strip()
         if not text or self.target is None:
             return
-        event.input.value = ""
+        if self.interface is None or self.link_down:
+            self._log_system("[red]目前未連線,訊息未送出[/red]")
+            return
         now = datetime.datetime.now().strftime("%H:%M:%S")
+
+        kind, key = self.target
+        try:
+            if kind == "channel":
+                self.interface.sendText(text, channelIndex=key)
+            else:
+                self.interface.sendText(text, destinationId=key)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"[red]訊息送出失敗: {type(exc).__name__}: {exc}[/red]")
+            return
+        event.input.value = ""
         line = f"[dim]{now}[/dim] [bold cyan]me[/bold cyan]: {text}"
         self.history.setdefault(self.target, []).append(line)
         self.query_one("#log", RichLog).write(line)
-
-        kind, key = self.target
-        if kind == "channel":
-            self.interface.sendText(text, channelIndex=key)
-        else:
-            self.interface.sendText(text, destinationId=key)
         self.sent_typed_count += 1
         self._render_status_bar()
 
@@ -2284,31 +2317,43 @@ class MqttProxy:
         Called from on_config_synced, the first moment both halves are known:
         moduleConfig.mqtt arrives with the config download and so does the
         channel list the downlink topics are built from. A link reconnect syncs
-        again, so this has to be safe to call repeatedly - the later calls only
-        refresh the subscriptions, since the channels may have been edited while
-        the link was down.
+        again, so this has to be safe to call repeatedly. Later calls refresh
+        subscriptions, rebuild the client if broker settings changed, or stop
+        the bridge if proxying was disabled while the link was down.
         """
         interface = self._bot.interface
         config = interface.localNode.moduleConfig.mqtt
-        self._settings = mqtt_broker_settings(config)
-
-        if self._client is not None:
-            self._refresh_wanted_topics()
-            return
-
         if not config.enabled:
+            if self._client is not None:
+                self.stop()
+                self._client = None
             self._bot.log("MQTT: 節點的 mqtt.enabled 是關的,不啟動橋接")
             return
         # Without this the node keeps its MQTT traffic to itself and there is
         # nothing to relay. Worth saying plainly: --mqtt was asked for, and the
         # fix is a device setting rather than anything on this side.
         if not config.proxy_to_client_enabled:
+            if self._client is not None:
+                self.stop()
+                self._client = None
             self._bot.log(
                 "MQTT: 節點的 mqtt.proxy_to_client_enabled 是關的,不啟動橋接"
                 "(節點不會把 MQTT 交給 client)"
             )
             return
 
+        settings = mqtt_broker_settings(config)
+        if self._client is not None and settings == self._settings:
+            self._refresh_wanted_topics()
+            return
+        if self._client is not None:
+            self.stop()
+            self._client = None
+
+        self._settings = settings
+        self._stopped = threading.Event()
+        self.connected = False
+        self._wanted.clear()
         self._refresh_wanted_topics()
         try:
             self._client = self._build_client(self._settings)
@@ -2325,7 +2370,11 @@ class MqttProxy:
             f"MQTT 橋接啟動: {scheme}://{self._settings['host']}:{self._settings['port']}"
             f" root={self._settings['root']} 下行 topic {len(self._wanted)} 個"
         )
-        threading.Thread(target=self._supervise, daemon=True).start()
+        threading.Thread(
+            target=self._supervise,
+            args=(self._client, self._settings, self._stopped),
+            daemon=True,
+        ).start()
 
     def stop(self) -> None:
         """Disconnect from the broker, but not at any price.
@@ -2336,22 +2385,24 @@ class MqttProxy:
         """
         if self._client is None:
             return
+        client = self._client
         self._stopped.set()
+        self.connected = False
         try:
             pub.unsubscribe(self.on_proxy_message, "meshtastic.mqttclientproxymessage")
         except Exception:  # noqa: BLE001
             # Unsubscribing is only tidiness by this point - the relay already
             # refuses work because _stopped is set.
             pass
-        stopper = threading.Thread(target=self._disconnect_quietly, daemon=True)
+        stopper = threading.Thread(target=self._disconnect_quietly, args=(client,), daemon=True)
         stopper.start()
         stopper.join(self.STOP_TIMEOUT)
         if stopper.is_alive():
             self._bot.log(f"MQTT 中斷逾時 ({self.STOP_TIMEOUT}s),不再等待")
 
-    def _disconnect_quietly(self) -> None:
+    def _disconnect_quietly(self, client=None) -> None:
         try:
-            self._client.disconnect()
+            (client or self._client).disconnect()
         except Exception as exc:  # noqa: BLE001
             self._bot.log(f"MQTT 中斷時出錯,忽略: {exc}")
 
@@ -2438,7 +2489,7 @@ class MqttProxy:
             self._client_id_cached = f"{base}-{secrets.token_hex(2)}"
         return self._client_id_cached
 
-    def _supervise(self) -> None:
+    def _supervise(self, client=None, settings=None, stopped=None) -> None:
         """Keep the broker connection up for as long as the bot is, pacing the
         attempts with ReplyEngine's table - the same table the link reconnect
         uses, and for the same reason: quick enough that a blip recovers at
@@ -2447,24 +2498,29 @@ class MqttProxy:
         loop_forever() returns instead of reconnecting, because the client was
         built with reconnect_on_failure off, so this loop sees every drop.
         """
+        client = client or self._client
+        settings = settings or self._settings
+        stopped = stopped or self._stopped
         attempt = 0
-        while not self._stopped.is_set():
+        while not stopped.is_set():
             attempt += 1
-            if self._stopped.wait(ReplyEngine._reconnect_delay(attempt)):
+            if stopped.wait(ReplyEngine._reconnect_delay(attempt)):
                 return
             try:
-                self._client.connect(
-                    self._settings["host"], self._settings["port"], keepalive=60
-                )
+                client.connect(settings["host"], settings["port"], keepalive=60)
             except Exception as exc:  # noqa: BLE001
+                if client is not self._client:
+                    return
                 self._note_outage(f"連不上 broker: {exc}")
                 continue
             # A connect that worked starts the table over, so the next outage
             # retries quickly instead of inheriting the last one's 30 seconds.
             attempt = 0
             try:
-                self._client.loop_forever()
+                client.loop_forever()
             except Exception as exc:  # noqa: BLE001
+                if client is not self._client:
+                    return
                 self._note_outage(f"broker 連線出錯: {exc}")
 
     def _note_outage(self, detail: str) -> None:
@@ -2503,15 +2559,26 @@ class MqttProxy:
         firmware's own filter: direct messages arrive under that pseudo-channel
         and no channel name reveals it.
         """
+        wanted = set()
         self._downlink_wanted = False
         for channel in self._bot.interface.localNode.channels or []:
             if not channel.settings or not channel.settings.downlink_enabled:
                 continue
             self._downlink_wanted = True
             if channel.settings.name:
-                self._want(self._channel_topic(channel.settings.name))
+                wanted.add(self._channel_topic(channel.settings.name))
         if self._downlink_wanted:
-            self._want(self._channel_topic(MQTT_PKI_CHANNEL))
+            wanted.add(self._channel_topic(MQTT_PKI_CHANNEL))
+
+        with self._lock:
+            removed = self._wanted - wanted
+            added = wanted - self._wanted
+            self._wanted = wanted
+            if self.connected:
+                for topic in sorted(removed):
+                    self._client.unsubscribe(topic)
+                for topic in sorted(added):
+                    self._client.subscribe(topic, qos=self.SUBSCRIBE_QOS)
 
     def _channel_topic(self, channel_id: str) -> str:
         """The broker topic carrying downlink for one channel.
@@ -2568,12 +2635,14 @@ class MqttProxy:
             payload = proxymessage.text.encode("utf-8")
         else:
             payload = proxymessage.data
-        self._client.publish(
+        result = self._client.publish(
             proxymessage.topic,
             payload,
             qos=self.PUBLISH_QOS,
             retain=bool(proxymessage.retained),
         )
+        if getattr(result, "rc", 0) != 0:
+            raise RuntimeError(f"broker 拒絕 publish (rc={result.rc})")
         self.up_count += 1
         self._learn_from_uplink(proxymessage.topic)
 
@@ -2581,6 +2650,8 @@ class MqttProxy:
     def _on_message(self, client, userdata, message) -> None:
         """Broker -> radio. The node decodes and filters it from here
         (onReceiveProto), so nothing is inspected on the way through."""
+        if client is not self._client:
+            return
         interface = self._bot.interface
         if interface is None or self._stopped.is_set() or self._bot.link_down:
             return
@@ -2589,6 +2660,8 @@ class MqttProxy:
 
     @_isolated
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        if client is not self._client:
+            return
         # A refusal is where a wrong username lands, and it deserves a line
         # of its own: the alternative is a bridge that looks up and moves
         # nothing. See mqtt_connect_failed for why this is not `if reason_code`.
@@ -2612,7 +2685,7 @@ class MqttProxy:
     def _on_disconnect(
         self, client, userdata, flags=None, reason_code=None, properties=None
     ) -> None:
-        if self._stopped.is_set():
+        if client is not self._client or self._stopped.is_set():
             return
         self._note_outage(f"連線中斷 ({reason_code})")
 
@@ -2783,7 +2856,13 @@ class ServerBot(ReplyEngine):
         # still constructing the interface, so this can arrive before run() has
         # had the chance to assign self.interface - and _known_channel_sections
         # below reads it. The interface that published is ours by definition.
-        self.interface = interface
+        if self.interface is None:
+            self.interface = interface
+        elif self.link_down and interface is not self.interface:
+            self.interface = interface
+            self.link_down = False
+        elif interface is not self.interface:
+            return
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         name = my_user.get("longName") or my_user.get("shortName") or "?"
@@ -2855,6 +2934,10 @@ class ServerBot(ReplyEngine):
                 self.log(f"MQTT 橋接啟動失敗,略過: {exc}")
 
     def on_receive(self, packet, interface) -> None:
+        if getattr(self, "interface", None) is None:
+            self.interface = interface
+        elif interface is not self.interface:
+            return
         # Before the text filter, for the reason the TUI does the same.
         self.packet_count += 1
         self._note_packet()
@@ -2879,6 +2962,7 @@ class ServerBot(ReplyEngine):
             snr=info["snr"],
             rssi=info["rssi"],
             channel=info["channel"],
+            packet_id=info.get("id"),
         )
         if reply_line:
             self.log(reply_line)
@@ -3001,7 +3085,7 @@ class ServerBot(ReplyEngine):
             self.log(self._heartbeat_line())
 
         self.log("停止中...")
-        closed = self._shutdown(interface)
+        closed = self._shutdown(self.interface)
         self.log(f"已停止。{self._heartbeat_line()}")
         if not closed:
             # The last line is out; leave before atexit can run the disconnect
@@ -3037,7 +3121,7 @@ def list_devices() -> int:
     print(f"BLE 節點 ({len(devices)}):")
     for device in devices:
         address = getattr(device, "address", "") or ""
-        print(f"  --ble {device.name}" + (f"    {address}" if address else ""))
+        print(f"  --ble {device.name}" + (f"    # {address}" if address else ""))
     if not devices:
         print("  (沒有節點在廣播 - 已經連上手機的節點通常就不廣播了)")
 

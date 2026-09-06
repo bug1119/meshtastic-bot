@@ -58,6 +58,8 @@ def check(label, got, want):
     print(("  OK   " if ok else "  FAIL ") + f"{label}: got {got!r}")
     if not ok:
         _failures.append(f"{label}: got {got!r}, want {want!r}")
+        if "pytest" in sys.modules:
+            raise AssertionError(_failures[-1])
 
 
 def with_rules(text: str):
@@ -757,8 +759,10 @@ def test_should_auto_reply():
     check("prefix after whitespace", call(app, {"from_id": "!them", "id": 92, "text": "  BOT: x"}), False)
     check("prefix must match case", call(app, {"from_id": "!them", "id": 93, "text": "bot: x"}), True)
     # The same packet again: the mesh rebroadcasts, and MQTT can bridge it back.
+    bot.MeshtasticTUI._remember_reply(app, "!them", 1)
     check("the same packet a second time", call(app, {"from_id": "!them", "id": 1, "text": "ping"}), False)
     check("a different packet", call(app, {"from_id": "!them", "id": 2, "text": "ping"}), True)
+    check("the same id from another sender", call(app, {"from_id": "!other", "id": 1, "text": "ping"}), True)
     # Our own outgoing text echoes back; answering it makes the bot self-reply.
     check("our own echo", call(app, {"from_id": "!me", "id": 3, "text": "ping"}), False)
     check("our own echo is not remembered", 3 in app._replied_ids, False)
@@ -769,10 +773,10 @@ def test_should_auto_reply():
     print("reply ledger stays bounded")
     app2 = types.SimpleNamespace(my_id="!me", _replied_ids={}, REPLIED_ID_LIMIT=8)
     for i in range(50):
-        call(app2, {"from_id": "!them", "id": i, "text": "ping"})
+        bot.MeshtasticTUI._remember_reply(app2, "!them", i)
     check("bounded to the limit", len(app2._replied_ids), 8)
-    check("keeps the newest", 49 in app2._replied_ids, True)
-    check("drops the oldest", 0 in app2._replied_ids, False)
+    check("keeps the newest", ("!them", 49) in app2._replied_ids, True)
+    check("drops the oldest", ("!them", 0) in app2._replied_ids, False)
 
 
 def test_dm_sections():
@@ -990,10 +994,15 @@ def test_derived_bandwidth():
     check("wide-lora widens it", lora_params.bandwidth_khz(wide), 812.5)
 
     custom = _lora(use_preset=False, bandwidth=62, region=_REGION.Value("TW"))
-    check("custom config uses the stored value", lora_params.bandwidth_khz(custom), 62.0)
+    check("custom bandwidth code is decoded", lora_params.bandwidth_khz(custom), 62.5)
 
     custom_zero = _lora(use_preset=False, bandwidth=0, region=_REGION.Value("TW"))
     check("custom config with nothing stored", lora_params.bandwidth_khz(custom_zero), None)
+
+    unknown = types.SimpleNamespace(
+        use_preset=True, modem_preset=99999, region=_REGION.Value("TW")
+    )
+    check("unknown preset is not guessed", lora_params.bandwidth_khz(unknown), None)
 
 
 def test_derived_frequency():
@@ -1297,6 +1306,8 @@ def test_packet_node_id():
     # And a packet with no usable sender at all still parses rather than raising.
     bare = {"decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hi"}, "toId": bot.BROADCAST_ADDR}
     check("no sender information at all", bot.parse_incoming(bare, "!me")["from_id"], "?")
+    third_party = _text_packet("private", "!someone-else", 2, from_id="!them")
+    check("a DM between other nodes is ignored", bot.parse_incoming(third_party, "!me"), None)
 
 
 def test_format_plain():
@@ -1732,6 +1743,25 @@ def test_config_sync_before_adopt():
     check("no traceback text in the log", "Traceback" in out.getvalue(), False)
 
 
+def test_tui_config_sync_before_adopt():
+    print("TUI config sync can arrive before connect_device stores the interface")
+    interface = types.SimpleNamespace(getMyUser=lambda: {"id": "!me"})
+    app = types.SimpleNamespace(interface=None, link_down=False, my_id=None)
+    app._log_system = lambda line: None
+    app._report_rule_coverage = lambda: None
+    app._populate_targets = lambda: None
+    app._render_local_status = lambda: None
+    app.fetch_metadata = lambda: None
+
+    bot.MeshtasticTUI._config_synced(app, interface)
+    check("TUI adopts the publishing interface", app.interface is interface, True)
+    check("TUI reads its node id", app.my_id, "!me")
+
+    stale = types.SimpleNamespace(getMyUser=lambda: {"id": "!stale"})
+    bot.MeshtasticTUI._config_synced(app, stale)
+    check("a stale config event is ignored", app.my_id, "!me")
+
+
 def test_shutdown_is_bounded():
     print("shutdown does not wait forever on a hanging close()")
     out = io.StringIO()
@@ -1828,7 +1858,7 @@ def test_list_devices():
         check("exits 0", code, 0)
         check("counts the BLE nodes", "BLE 節點 (2):" in out, True)
         # Printed as the flag you would pass, so a line is copy-pasteable.
-        check("names are ready to paste", "  --ble Bug2_1ca6    AA:BB:CC:DD:EE:FF" in out, True)
+        check("names are ready to paste", "  --ble Bug2_1ca6    # AA:BB:CC:DD:EE:FF" in out, True)
         check("an address-less device still lists", "  --ble Meshtastic_9f9c\n" in out, True)
         check("lists serial ports too", "  --port /dev/cu.usbmodem2101" in out, True)
         check("counts them", "USB serial (1):" in out, True)
@@ -2441,8 +2471,12 @@ class _StubBrokerClient:
     def subscribe(self, topic, qos=0):
         self.subscribed.append((topic, qos))
 
+    def unsubscribe(self, topic):
+        self.subscribed = [(item, qos) for item, qos in self.subscribed if item != topic]
+
     def publish(self, topic, payload, qos=0, retain=False):
         self.published.append((topic, payload, qos, retain))
+        return types.SimpleNamespace(rc=0)
 
     def connect(self, host, port, keepalive=60):
         self.connects.append((host, port, keepalive))
@@ -2464,7 +2498,7 @@ class _QuietMqttProxy(bot.MqttProxy):
 
     supervised = False
 
-    def _supervise(self):
+    def _supervise(self, client=None, settings=None, stopped=None):
         self.supervised = True
 
 
@@ -3373,6 +3407,25 @@ def test_a_failed_send_is_reported_not_swallowed():
     check("not counted as a reply", server.sent_auto_count, 0)
     check("no markup in the server's stream", "[red]" in log, False)
 
+    server.interface.sendText = lambda text, **kw: sent.append((text, kw))
+    server.on_receive(_text_packet("ping", bot.BROADCAST_ADDR, 701), server.interface)
+    check("redelivery retries after a failed send", len(sent), 1)
+
+
+def test_stale_interface_events_are_ignored():
+    print("events from a replaced interface are ignored")
+    out = io.StringIO()
+    server, sent = _fake_server("[*]\nping=pong\n", out)
+    current = server.interface
+    stale = types.SimpleNamespace(nodes=current.nodes, sendText=current.sendText)
+
+    server.on_receive(_text_packet("ping", bot.BROADCAST_ADDR, 801), stale)
+    check("stale packets do not count", server.packet_count, 0)
+    check("stale packets do not reply", sent, [])
+
+    server.on_config_synced(stale)
+    check("stale config does not replace the active link", server.interface is current, True)
+
 
 def test_mqtt_bridge_is_in_both_files():
     print("the bridge exists in bot.py and in the generated bot_server")
@@ -3460,6 +3513,7 @@ if __name__ == "__main__":
         test_bot_server_is_generated_not_rewritten()
         test_bot_server_replies()
         test_config_sync_before_adopt()
+        test_tui_config_sync_before_adopt()
         test_shutdown_is_bounded()
         test_stop_wakes_the_wait()
         test_list_devices()
@@ -3502,6 +3556,7 @@ if __name__ == "__main__":
         test_reply_variables_cannot_reach_into_the_program()
         test_gps_rule_end_to_end()
         test_a_failed_send_is_reported_not_swallowed()
+        test_stale_interface_events_are_ignored()
     finally:
         bot.RULES_FILE = original
 

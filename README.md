@@ -64,7 +64,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 |---|:---:|:---:|---|
 | `--host HOST[:PORT]` | ✅ | ✅ | 用 TCP 連,port 預設 4403 |
 | `--port PATH` | ✅ | ✅ | 用 USB serial 連 |
-| `--ble NAME` | ✅ | ✅ | 指定 BLE 節點名稱,跳過約 10 秒掃描 |
+| `--ble NAME` | ✅ | ✅ | 指定 BLE 節點名稱並立即連線;TUI 背景仍會掃描其他裝置 |
 | `--here LAT,LON` | ✅ | ✅ | 本機座標,用來算節點距離 |
 | `--list` | ✅ | ✅ | 列出連得到哪些裝置,然後結束 |
 | `--server` | ✅ | 本來就是 | 不開 UI,跑自動回覆 server |
@@ -101,7 +101,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 |---|---|
 | `--host HOST[:PORT]` | 用 TCP 連;port 預設 4403。指定後會**立刻連線**,不用等 BLE 掃描,BLE 掃描仍會繼續 |
 | `--port PATH` | 用 USB serial 連 |
-| `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒掃描 |
+| `--ble NAME` | 指定 BLE 節點名稱並立即連線,不用等待掃描;TUI 背景仍會掃描其他裝置 |
 | `--here LAT,LON` | 本機座標,用來算各節點距離。只在連上的節點沒有 GPS 定位時才需要。**只留在本機**,不會送給裝置或 mesh |
 | `--wifi on\|off` | 開關節點的 WiFi,做完直接結束(不啟動 UI)。需要 `--port` 或 `--host` |
 
@@ -125,7 +125,7 @@ python3 -m venv ~/.venvs/meshtastic-bot
 | 參數 | 說明 |
 |---|---|
 | `--list` | 列出現在連得到哪些節點(BLE 名稱 + USB serial 埠),然後結束,不連任何一台 |
-| `--ble NAME` | 指定 BLE 節點名稱,跳過約 10 秒的掃描。`--daemon` 要能無人啟動就靠這個 |
+| `--ble NAME` | 指定 BLE 節點名稱並直接連線,不先掃描。`--daemon` 要能無人啟動就靠這個 |
 | `--daemon` | 選好裝置後丟到背景,輸出寫到 `--log`,並印出 pid |
 | `--log PATH` | `--daemon` 的輸出檔,**附加**不覆蓋。預設 `meshtastic-bot.log` |
 | `--heartbeat SECS` | 多久印一行「還活著」與計數。`0` 關閉,只印真正發生的事。預設 600 |
@@ -194,8 +194,8 @@ UI 版左邊那欄「本機狀態」的內容,server mode 也會印 —— 在�
 $ ./bot_server.py --list
 掃描 BLE(約 10 秒)...
 BLE 節點 (2):
-  --ble Bug2_1ca6    F891A520-7FDB-A7FB-998C-04A6C606B42C
-  --ble bug_530c     E9FF9C79-E898-E0B8-867B-2015A1D74ECD
+  --ble Bug2_1ca6    # F891A520-7FDB-A7FB-998C-04A6C606B42C
+  --ble bug_530c     # E9FF9C79-E898-E0B8-867B-2015A1D74ECD
 
 USB serial (0):
   (沒有接上的裝置)
@@ -245,7 +245,10 @@ $ kill 98523
 <!-- ~/Library/LaunchAgents/com.local.meshtastic-bot.plist -->
 <key>ProgramArguments</key>
 <array>
-  <string>/usr/bin/python3</string>
+  <!-- 改成 `command -v uv` 顯示的絕對路徑 -->
+  <string>/Users/you/.local/bin/uv</string>
+  <string>run</string>
+  <string>--script</string>
   <string>/Users/you/meshtastic-bot/bot_server.py</string>
   <string>--port</string><string>/dev/cu.usbmodem2101</string>
 </array>
@@ -255,6 +258,7 @@ $ kill 98523
 
 這種情況**不要**加 `--daemon`:launchd 要自己盯著行程,所以讓它跑在前景、
 由 `StandardOutPath` 收 log 就好。
+`launchd` 不會讀互動 shell 的 PATH,所以 plist 必須使用 `command -v uv` 查到的絕對路徑。
 
 ### 按鍵
 
@@ -345,6 +349,8 @@ macOS 特有的兩件事,程式裡有處理:
 **為什麼需要這個**:meshtastic 套件的 reader thread 在 `StreamInterface.__reader` 裡對 `OSError` 的處理是「記一行 log,然後在 `finally` 呼叫 `_disconnected()`」—— 而 **TCP timeout 就是 `OSError` 的子類**(`TimeoutError`)。那個 thread 就此永久結束,套件**只有**在對方乾淨關閉(`recv` 回 `b""`)時才會自己重連,錯誤路徑不會。
 
 所以在加上這段之前:**連線一斷,bot 的畫面還一直寫著「已連線」、狀態列一個字都不說,而且從此再也收不到任何封包。** 之後別台傳過來的訊息全部看不到,而且沒有任何提示 —— 這就是「好像會掉訊息」的真正原因,不是漏掉一兩則,是斷線之後全丟。
+
+此外,連線若 **420 秒完全沒有任何封包**也視為失效並重連。這比 Meshtastic library 的 300 秒 heartbeat 長,正常的安靜 mesh 不會觸發;用途是偵測 transport 表面仍連著、實際已停止交付封包的半斷線狀態。
 
 **能救回多少**:重連本身不會把斷線期間的訊息變出來。韌體的 `toPhoneQueue` 有限的緩衝會在重連後送出一部分,超出的就是真的沒了。這個修正保證的是「不會無聲無息地永久停擺」。
 
@@ -674,9 +680,9 @@ BOT: pong
 ./test_rules.py
 ```
 
-727 項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot`,所以仍要那幾個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。MQTT 橋接也在裡面:broker 設定從節點讀出來、上行 publish 與下行回灌、沒給 `--mqtt` 時完全不動、paho 的例外不會逸出、重連沿用同一張退避表,以及 disconnect 卡住時的有界關閉 —— paho 是假的,不碰網路。
+700 多項檢查,不需要 pytest 也不需要硬體(但因為它直接 `import bot`,所以仍要那幾個套件 —— shebang 已經處理好了)。涵蓋規則解析與優先序、連線時的規則覆蓋回報、裝置 key 與 host:port 解析、中文顯示寬度、位置擷取與距離、頻率/頻寬推導、未讀粗體、斷線偵測與重連退避、狀態列的執行時間與封包/收發計數,自動回覆的文字組成,以及 server mode:回覆行為、無 markup 的純文字輸出、裝置選單與 `--list`、背景啟動的命令列(特別是**不能**把 `--daemon` 傳給子行程,否則會無限衍生)、有界的訊息歷史、設定同步比 interface 指派更早到的競態,還有 `close()` 卡死時的有界關閉。MQTT 橋接也在裡面:broker 設定從節點讀出來、上行 publish 與下行回灌、沒給 `--mqtt` 時完全不動、paho 的例外不會逸出、重連沿用同一張退避表,以及 disconnect 卡住時的有界關閉 —— paho 是假的,不碰網路。
 
-另外有 `test_params_live.py`,**需要硬體**:它把兩支程式的每一個參數都跑一遍
+另外有 `test_params_live.py`,**完整模式需要 BLE 硬體**:它驗證兩支程式的參數解析與主要 BLE 實機路徑
 (`--help`、每一種該被擋下來的參數組合、連不上的目標要乾淨失敗、`--list`、
 真的連上節點、`--daemon` 背景啟動後用 `SIGTERM` 停掉),並在連線期間取樣記憶體。
 `--wifi` 只測參數檢查,不會真的去改節點設定;`--mqtt` 同理,真的連 broker 那一項要另外給 `--mqtt-live` 才跑,因為那會把這個 mesh 轉發到公共 broker 上。
@@ -685,7 +691,7 @@ BOT: pong
 ./test_params_live.py            # 需要一台在廣播的 BLE 節點
 ```
 
-其中未讀粗體有一項是**唯一會真的把 App 跑起來**的測試(Textual 的 headless 模式,仍然不需要硬體)—— 因為「找到那一列並重畫」這件事只有真的 widget 在時才存在,假造的 self 測不到。
+其中數項 UI 測試會用 Textual 的 headless `run_test()` 啟動 App,仍然不需要硬體,用來驗證 widget 重畫、狀態列與重新建立清單等行為。
 
 頻率推導的斷言是對**獨立來源**驗證,不是自我循環:
 

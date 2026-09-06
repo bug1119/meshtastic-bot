@@ -8,7 +8,7 @@
 #     "textual",
 # ]
 # ///
-"""Exercise every flag of all three programs against real hardware.
+"""Exercise both programs' CLI validation and main BLE paths.
 
 test_rules.py covers the logic and needs nothing plugged in. This covers the
 things only a real run reaches: that each flag is actually wired to something,
@@ -29,10 +29,10 @@ it.
 Needs one Meshtastic node advertising over BLE. A node already connected to a
 phone usually is not advertising - disconnect the phone app first.
 
-rules.txt is emptied for the duration and restored afterwards, so nothing here
-transmits on the mesh. --wifi is only checked for its argument handling: it
-writes to a device and reboots it, which is not something a test should do
-behind your back.
+A temporary empty rules file is supplied to every child, so nothing here
+auto-replies on the mesh and the operator's rules.txt is never modified.
+--wifi is only checked for its argument handling: it writes to a device and
+reboots it, which is not something a test should do behind your back.
 
 --mqtt is the same kind of flag and gets the same treatment: its parsing and
 its clean-failure path are always checked, but actually bridging the node to
@@ -48,13 +48,14 @@ import fcntl
 import os
 import pty
 import re
-import shutil
+import select
 import signal
 import struct
 import subprocess
 import sys
 import termios
 import threading
+import tempfile
 import time
 from pathlib import Path
 
@@ -78,6 +79,7 @@ SAMPLE_EVERY = 2
 
 results: list[tuple[str, bool, str]] = []
 memory: dict[str, int] = {}
+TEST_ENV = os.environ.copy()
 
 
 def record(name: str, ok: bool, detail: str) -> None:
@@ -98,7 +100,8 @@ def run(
     name = name or " ".join(args)
     try:
         proc = subprocess.run(
-            [PY, *args], cwd=HERE, capture_output=True, text=True, timeout=timeout
+            [PY, *args], cwd=HERE, capture_output=True, text=True, timeout=timeout,
+            env=TEST_ENV,
         )
     except subprocess.TimeoutExpired:
         record(name, False, f"timed out after {timeout}s")
@@ -134,7 +137,7 @@ def _on_pty(args):
         stdin=slave,
         stdout=slave,
         stderr=slave,
-        env=dict(os.environ, TERM="xterm-256color"),
+        env=dict(TEST_ENV, TERM="xterm-256color"),
     )
     os.close(slave)
     chunks: list[bytes] = []
@@ -164,6 +167,7 @@ def hold(args, name, seconds=HOLD_SECONDS, tui=False, expect_out=(), key=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=TEST_ENV,
         )
         chunks = None
 
@@ -220,6 +224,7 @@ def daemon_case(program, extra, node):
         capture_output=True,
         text=True,
         timeout=180,
+        env=TEST_ENV,
     )
     parent_took = time.time() - started
     pid = next((int(t) for t in proc.stderr.replace("=", " ").split() if t.isdigit()), None)
@@ -308,6 +313,9 @@ def connects(name):
         while time.time() < deadline:
             if proc.poll() is not None:
                 break
+            ready, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.time()))
+            if not ready:
+                break
             line = proc.stdout.readline()
             if not line:
                 break
@@ -365,14 +373,10 @@ def main():
             return 2
         print(f"using {node}\n")
 
-    rules = HERE / "rules.txt"
-    backup = HERE / ".rules.txt.params-live-backup"
-    had_rules = rules.exists()
-    if had_rules:
-        shutil.copy(rules, backup)
-    rules.write_text(
-        "# emptied by test_params_live.py - nothing here may transmit\n", encoding="utf-8"
-    )
+    rules_dir = tempfile.TemporaryDirectory(prefix="meshtastic-bot-test-")
+    rules = Path(rules_dir.name) / "rules.txt"
+    rules.write_text("# test rules intentionally empty\n", encoding="utf-8")
+    TEST_ENV["MESHTASTIC_RULES_FILE"] = str(rules)
 
     try:
         print("=== --help ===")
@@ -422,14 +426,14 @@ def main():
                 expect_out=["paho-mqtt"], expect_absent=["Traceback", "連線"],
                 name="bot_server.py --mqtt without paho installed")
 
-        print("\n=== --list ===")
-        for program in ("bot_server.py", "bot.py"):
-            run([program, "--list"], 300, expect_rc=0,
-                expect_out=["BLE 節點", "USB serial"], name=f"{program} --list")
-
         if args.quick:
-            print("\n(--quick: skipping the connected cases)")
+            print("\n(--quick: skipping device scans and connected cases)")
         else:
+            print("\n=== --list ===")
+            for program in ("bot_server.py", "bot.py"):
+                run([program, "--list"], 300, expect_rc=0,
+                    expect_out=["BLE 節點", "USB serial"], name=f"{program} --list")
+
             print(f"\n=== connected to {node} ===")
             hold(["bot_server.py", "--ble", node, "--heartbeat", "20"],
                  "bot_server.py --ble", expect_out=["已連線", "設定同步完成", "[心跳]"],
@@ -459,12 +463,9 @@ def main():
             daemon_case("bot_server.py", [], node)
             daemon_case("bot.py", ["--server"], node)
     finally:
-        if had_rules:
-            shutil.copy(backup, rules)
-            backup.unlink()
-        else:
-            rules.unlink(missing_ok=True)
-        print("\nrules.txt restored")
+        TEST_ENV.pop("MESHTASTIC_RULES_FILE", None)
+        rules_dir.cleanup()
+        print("\ntemporary rules.txt removed")
 
     failed = [name for name, ok, _ in results if not ok]
     print("\n" + "=" * 62)
