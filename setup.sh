@@ -61,8 +61,8 @@ UV_DIR="$(dirname "$(command -v uv)")"
 # without the bit, or `git config core.fileMode false` on a shared volume.
 
 say "確認執行權限"
-chmod +x bot.py test_rules.py
-echo "bot.py / test_rules.py 可執行"
+chmod +x bot.py bot_server.py make_bot_server.py test_rules.py test_params_live.py
+echo "程式與測試檔可執行"
 
 # -------------------------------------------------------- 3. warm the uv cache
 #

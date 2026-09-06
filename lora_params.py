@@ -63,9 +63,16 @@ PRESET_PARAMS = {
     "TINY_SLOW": (15.6, 15.6, 8, 6),
 }
 
-# The firmware's default branch is LONG_FAST, so an unrecognised preset lands
-# there on the device too.
-_DEFAULT_PRESET = "LONG_FAST"
+# Firmware stores custom bandwidths as compact integer codes for values that
+# cannot all be represented exactly in the protobuf field.
+CUSTOM_BANDWIDTH_KHZ = {
+    31: 31.25,
+    62: 62.5,
+    200: 203.125,
+    400: 406.25,
+    800: 812.5,
+    1600: 1625.0,
+}
 
 # Channel geometry per region profile: (spacing MHz, padding MHz).
 _PROFILE_STD = (0.0, 0.0)
@@ -139,10 +146,13 @@ def bandwidth_khz(lora) -> float | None:
     preset it comes from the preset table, widened for the 2.4 GHz band.
     """
     if not lora.use_preset:
-        return float(lora.bandwidth) or None
+        stored = int(lora.bandwidth)
+        if not stored:
+            return None
+        return CUSTOM_BANDWIDTH_KHZ.get(stored, float(stored))
 
     name = preset_name(lora.modem_preset)
-    params = PRESET_PARAMS.get(name) or PRESET_PARAMS.get(_DEFAULT_PRESET)
+    params = PRESET_PARAMS.get(name)
     if params is None:
         return None
     narrow, wide, _sf, _cr = params

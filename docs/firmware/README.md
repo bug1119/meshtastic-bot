@@ -442,7 +442,7 @@ if (!isWifiAvailable() && config.bluetooth.enabled == true) {
 
 WiFi 開著,藍牙**永遠不會啟動**,而且 ESP32 會直接釋放 BT 記憶體(`Released BTDM memory`),**不可逆,要重開機才能反轉**。
 
-連帶影響 MQTT:走藍牙就等於節點沒有自己的網路,MQTT 只能靠 `proxy_to_client_enabled`,而那需要**連著的 client 真的去做 broker 連線**(手機 app 有內建;`bot_server.py` 沒有)。
+連帶影響 MQTT:走藍牙就等於節點沒有自己的網路,MQTT 只能靠 `proxy_to_client_enabled`,而那需要**連著的 client 真的去做 broker 連線**(手機 app 有內建;`bot_server.py` 要加 `--mqtt`)。
 
 另外 **device-ui 的畫面上有藍牙開關,會蓋掉 CLI 的設定** —— 要開藍牙請從螢幕上按。
 
