@@ -29,6 +29,10 @@ git am /path/to/patches/*.patch
 
 `0002` 和 `0003` 是實際會讓裝置無法使用的兩個。`0004` 的數值(16kB / 8 檔 / 2048)是針對這台調的 —— 換算方式見上一層 README。
 
+## firmware 那一側
+
+`meshtastic-firmware` 的 `build/cjk-crashfix` 也有四個沒推到任何遠端的 commit(兩個是自製功能、一個是 build 設定、一個是 LEDC 修正),在 [`firmware/`](firmware/),共 26 KB。
+
 ## 為什麼沒有中文字型的 patch
 
 那個 commit 是 **352,135 行**,全是 `generated/ui_240x320/ui_font_noto_sans_tc_{12,14,16,20}.c` 裡由工具產生的字符資料。做成 patch 會是 10MB+ 的文字檔,而且它是**產物不是原始碼** —— 該版控的是產生它的步驟,不是產生出來的位元組。

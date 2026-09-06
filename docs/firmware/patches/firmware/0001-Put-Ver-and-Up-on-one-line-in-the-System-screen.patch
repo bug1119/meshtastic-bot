@@ -1,0 +1,102 @@
+From 3c83c8dc15ea7f7c2cb13e5cc2108d886f78a07c Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Sun, 30 Aug 2026 00:44:10 +0800
+Subject: [PATCH] Put Ver and Up on one line in the System screen
+
+Version left-aligned, uptime right-aligned, sharing the row's full width
+instead of sitting on two separate centred lines.
+
+The version now always uses the short form (trailing build hash dropped),
+which was previously only done at UltraLow resolution: "Ver: x.y.z (hash)"
+on its own already nearly fills a 128px OLED, so there'd be no room for an
+uptime beside it.
+
+The "can the screen show the uptime" height check now tests the shared row
+rather than the line below it, since the uptime no longer needs a line of
+its own - which also frees a line for the API/client state below.
+
+Built clean for rak4631.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012Hx1mSRtfsXVsbhDGk6jBz
+---
+ src/graphics/draw/DebugRenderer.cpp | 52 +++++++++++++----------------
+ 1 file changed, 24 insertions(+), 28 deletions(-)
+
+diff --git a/src/graphics/draw/DebugRenderer.cpp b/src/graphics/draw/DebugRenderer.cpp
+index 5cca4c4aa..075d597f2 100644
+--- a/src/graphics/draw/DebugRenderer.cpp
++++ b/src/graphics/draw/DebugRenderer.cpp
+@@ -443,45 +443,41 @@ void drawSystemScreen(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x
+     }
+ 
+     char appversionstr[35];
+-    char appversionstr_formatted[40];
+ 
+     const char *ver = optstr(APP_VERSION);
+     char verbuf[32];
+     strncpy(verbuf, ver, sizeof(verbuf) - 1);
+     verbuf[sizeof(verbuf) - 1] = '\0';
+ 
++    // Short form (trailing build hash dropped) at every resolution: Ver and Up
++    // share a line now, and "Ver: x.y.z (hash)" on its own already nearly fills
++    // a 128px OLED, leaving no room for an uptime beside it.
+     char *lastDot = strrchr(verbuf, '.');
+-
+-    if (currentResolution == ScreenResolution::UltraLow) {
+-        if (lastDot != nullptr) {
+-            *lastDot = '\0';
+-        }
+-        snprintf(appversionstr, sizeof(appversionstr), "Ver: %s", verbuf);
+-    } else {
+-        if (lastDot) {
+-            size_t prefixLen = (size_t)(lastDot - verbuf);
+-            snprintf(appversionstr_formatted, sizeof(appversionstr_formatted), "Ver: %.*s", (int)prefixLen, verbuf);
+-            strncat(appversionstr_formatted, " (", sizeof(appversionstr_formatted) - strlen(appversionstr_formatted) - 1);
+-            strncat(appversionstr_formatted, lastDot + 1, sizeof(appversionstr_formatted) - strlen(appversionstr_formatted) - 1);
+-            strncat(appversionstr_formatted, ")", sizeof(appversionstr_formatted) - strlen(appversionstr_formatted) - 1);
+-            strncpy(appversionstr, appversionstr_formatted, sizeof(appversionstr) - 1);
+-            appversionstr[sizeof(appversionstr) - 1] = '\0';
+-        } else {
+-            snprintf(appversionstr, sizeof(appversionstr), "Ver: %s", verbuf);
+-        }
++    if (lastDot != nullptr) {
++        *lastDot = '\0';
+     }
+-    int textWidth = display->getStringWidth(appversionstr);
+-    int nameX = (SCREEN_WIDTH - textWidth) / 2;
++    snprintf(appversionstr, sizeof(appversionstr), "Ver: %s", verbuf);
+ 
+-    display->drawString(nameX, getTextPositions(display)[line++], appversionstr);
++    bool showUptime =
++        !graphics::isCompactPanel(display) &&
++        (SCREEN_HEIGHT > 64 || (SCREEN_HEIGHT <= 64 && line <= 5)); // Only show uptime if the screen can show it
+ 
+-    if (!graphics::isCompactPanel(display) &&
+-        (SCREEN_HEIGHT > 64 || (SCREEN_HEIGHT <= 64 && line <= 5))) { // Only show uptime if the screen can show it
+-        char uptimeStr[32] = "";
++    char uptimeStr[32] = "";
++    if (showUptime) {
+         getUptimeStr(millis(), "Up: ", uptimeStr, sizeof(uptimeStr));
+-        textWidth = display->getStringWidth(uptimeStr);
+-        nameX = (SCREEN_WIDTH - textWidth) / 2;
+-        display->drawString(nameX, getTextPositions(display)[line++], uptimeStr);
++    }
++
++    int verY = getTextPositions(display)[line++];
++    if (uptimeStr[0] != '\0') {
++        // Ver on the left, Up on the right - sharing the full width beats
++        // centring one under the other now that they're on the same row.
++        display->setTextAlignment(TEXT_ALIGN_LEFT);
++        display->drawString(labelX, verY, appversionstr);
++        display->setTextAlignment(TEXT_ALIGN_RIGHT);
++        display->drawString(SCREEN_WIDTH, verY, uptimeStr);
++        display->setTextAlignment(TEXT_ALIGN_LEFT);
++    } else {
++        display->drawString((SCREEN_WIDTH - display->getStringWidth(appversionstr)) / 2, verY, appversionstr);
+     }
+ 
+     if (SCREEN_HEIGHT > 64 || (SCREEN_HEIGHT <= 64 && line <= 5)) { // Only show API state if the screen can show it
+-- 
+2.50.1 (Apple Git-155)
+

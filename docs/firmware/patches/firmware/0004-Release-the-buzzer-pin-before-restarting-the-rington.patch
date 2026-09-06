@@ -1,0 +1,131 @@
+From a7fcde38adbdc9b4fdbf150d7ac963b2d2ce2ce9 Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Fri, 4 Sep 2026 21:21:45 +0800
+Subject: [PATCH] Release the buzzer pin before restarting the ringtone, and
+ let a build say which build it is
+
+Two things, both about a device that could not tell you what was wrong with it.
+
+NonBlockingRtttl::begin() calls toneSetup(), an unconditional
+ledcAttach(pin, 1000, 10). The Arduino core refuses to attach a pin that
+already holds an LEDC bus - it logs "Pin N is already attached to LEDC" plus a
+misleading "No free timers available" from the wrapper, and returns false. That
+pin is always held by then: buzz.cpp's boot melody uses tone() on it, and after
+that every restart is us.
+
+ExternalNotificationModule takes the restart branch whenever the song is not
+playing, on the 25ms fast interval, for as long as it is nagging - 15 seconds
+per message. On a mesh with 114 nodes online that never stops, so a pair of
+errors became the entire log: 1128 of 1128 lines in a 12-minute capture on a
+Heltec V4 TFT, burying everything the radio was doing and making the device
+look dead when it was fine. Detaching first makes the attach succeed, at the
+cost of one log line the very first time, when nothing has claimed the pin yet.
+
+It also means the tones now reach the buzzer. They previously did not - the
+attach was refused, so the node silently failed to make any sound. Anyone who
+wants it quiet should turn external notification off rather than rely on that.
+
+The second half: readprops.py now accepts MESHTASTIC_BUILD_TAG. The long
+version is "{short}.{sha}" and the sha is this repo's, so two builds of one
+commit report the same string even when they differ in ways that matter - most
+of all whether the CJK fonts are linked in, which comes from a device-ui
+symlink and leaves no trace here. Both builds claiming 2.8.0.b2a7635 meant the
+only way to tell a flashed device apart was to look at the screen and see
+whether Chinese rendered.
+
+The tag is validated before the sha lookup, not inside it: that lookup sits in
+a bare `except:` which swallows everything, SystemExit included, so a tag
+rejected in there would quietly degrade the version to the short form and build
+a firmware that misreports itself - the exact failure the tag exists to
+prevent. DeviceMetadata.firmware_version is char[18], the sha is pinned to 7 by
+--short=7, so the room left is computed rather than assumed and a tag too long
+raises instead of truncating.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ bin/readprops.py                           | 24 ++++++++++++++++++++-
+ src/modules/ExternalNotificationModule.cpp | 25 ++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/bin/readprops.py b/bin/readprops.py
+index 4b92d63dd..3fbecd5a4 100644
+--- a/bin/readprops.py
++++ b/bin/readprops.py
+@@ -16,6 +16,28 @@ def readProps(prefsLoc):
+         deb="unset",
+     )
+ 
++    # Two builds of one commit can differ in ways the commit does not capture -
++    # above all whether the CJK fonts are linked in, which comes from a
++    # device-ui symlink rather than from here. Without a tag they report an
++    # identical version, and the only way to tell them apart is to look at the
++    # screen and see whether Chinese renders.
++    #
++    # Checked here rather than below because the sha lookup is wrapped in a
++    # bare `except:` that swallows everything - a tag rejected in there would
++    # quietly degrade the version to the short form and build a firmware that
++    # misreports itself, which is the failure this tag exists to prevent.
++    #
++    # DeviceMetadata.firmware_version is char[18], so 17 usable. The sha length
++    # is pinned to 7 by the --short=7 below.
++    tag = os.environ.get("MESHTASTIC_BUILD_TAG", "").strip()
++    if tag:
++        room = 17 - len(verObj["short"]) - 1 - 7 - 1
++        if len(tag) > room:
++            raise ValueError(
++                f"MESHTASTIC_BUILD_TAG {tag!r} is {len(tag)} characters; only "
++                f"{room} fit before DeviceMetadata.firmware_version[18] truncates"
++            )
++
+     # Try to find current build SHA if if the workspace is clean.  This could fail if git is not installed
+     try:
+         # Pin abbreviation length to keep local builds and CI matching (avoid auto-shortening)
+@@ -27,7 +49,7 @@ def readProps(prefsLoc):
+         isDirty = (
+             subprocess.check_output(["git", "diff", "HEAD"]).decode("utf-8").strip()
+         )
+-        suffix = sha
++        suffix = sha if not tag else f"{sha}.{tag}"
+         # if isDirty:
+         #     # short for 'dirty', we want to keep our verstrings source for protobuf reasons
+         #     suffix = sha + "-d"
+diff --git a/src/modules/ExternalNotificationModule.cpp b/src/modules/ExternalNotificationModule.cpp
+index 420697689..4a10e52d0 100644
+--- a/src/modules/ExternalNotificationModule.cpp
++++ b/src/modules/ExternalNotificationModule.cpp
+@@ -174,6 +174,31 @@ int32_t ExternalNotificationModule::runOnce()
+             if (rtttl::isPlaying()) {
+                 rtttl::play();
+             } else if (isNagging && !Throttle::deadlinePassed(nagCycleCutoff)) {
++                // Release the pin before restarting the song.
++                //
++                // NonBlockingRtttl::begin() calls toneSetup(), which is an
++                // unconditional ledcAttach(pin, 1000, 10). The Arduino core
++                // refuses to attach a pin that already holds an LEDC bus: it
++                // logs "Pin N is already attached to LEDC" plus a misleading
++                // "No free timers available" from the wrapper, and returns
++                // false. Something always holds this pin by the time we get
++                // here - the boot melody in buzz.cpp uses tone() on it, and
++                // after that every restart of the ringtone is us.
++                //
++                // Because this branch runs on the 25ms fast interval for as
++                // long as the song is not playing, that pair of errors is
++                // logged several times a second for the whole nag. On a mesh
++                // busy enough to keep nagging it fills the log completely -
++                // 1128 of 1128 lines in a 12-minute capture on a Heltec V4
++                // TFT, which buried everything the radio was actually doing
++                // and made the device look dead when it was fine.
++                //
++                // Detaching first makes the attach succeed, which also means
++                // the tones now reach the buzzer instead of being dropped.
++                // The detach itself logs one line the very first time, when
++                // nothing has claimed the pin yet; one line at boot in
++                // exchange for thousands afterwards.
++                ledcDetach(config.device.buzzer_gpio);
+                 // start the song again if we have time left
+                 rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+             }
+-- 
+2.50.1 (Apple Git-155)
+
