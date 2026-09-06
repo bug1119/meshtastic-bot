@@ -47,8 +47,8 @@ import argparse
 import fcntl
 import os
 import pty
+import queue
 import re
-import select
 import signal
 import struct
 import subprocess
@@ -306,18 +306,41 @@ def connects(name):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # Without this the probe runs against the operator's real rules.txt and
+        # can answer a message that lands mid-probe - the one thing this file
+        # promises not to do.
+        env=TEST_ENV,
     )
+    # Read on a thread rather than polling the pipe. select() reports on the
+    # file descriptor while readline() reads from Python's own buffer, so a
+    # child that writes several lines at once leaves the later ones invisible
+    # to select - and the line this is waiting for is exactly the sort that
+    # arrives in such a burst. The thread is a daemon, so a readline that never
+    # returns cannot hold the run open.
+    lines: queue.Queue = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except (OSError, ValueError):
+            # Cleanup may close the pipe to wake a blocked reader.
+            pass
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+
     deadline = time.time() + PROBE_SECONDS
     seen = []
     try:
         while time.time() < deadline:
-            if proc.poll() is not None:
+            try:
+                line = lines.get(timeout=deadline - time.time())
+            except queue.Empty:
                 break
-            ready, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.time()))
-            if not ready:
-                break
-            line = proc.stdout.readline()
-            if not line:
+            if line is None:
                 break
             seen.append(line)
             if "設定同步完成" in line:
@@ -325,10 +348,13 @@ def connects(name):
     finally:
         proc.terminate()
         try:
-            proc.wait(timeout=20)
+            proc.wait(timeout=max(0.0, deadline - time.time()))
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
+            proc.wait(timeout=1)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        reader.join(timeout=1)
     tail = "".join(seen).strip().splitlines()
     print(f"    {name} did not connect: {tail[-1][:90] if tail else 'no output'}")
     return False
@@ -337,7 +363,10 @@ def connects(name):
 def find_node():
     """The first scanned node that will actually talk to us."""
     for name in scan_names():
-        print(f"  probing {name} (up to {PROBE_SECONDS}s)...", flush=True)
+        print(
+            f"  probing {name} (up to {PROBE_SECONDS}s, plus at most 1s cleanup)...",
+            flush=True,
+        )
         if connects(name):
             return name
     return None
@@ -360,25 +389,25 @@ def main():
     )
     args = parser.parse_args()
 
-    node = None
-    if not args.quick:
-        node = args.node or find_node()
-        if node is None:
-            print(
-                "no BLE node would accept a connection - rerun with --quick, or "
-                "check the node is advertising and not already connected to a "
-                "phone (a scan finds it either way; only one of those works)",
-                file=sys.stderr,
-            )
-            return 2
-        print(f"using {node}\n")
-
     rules_dir = tempfile.TemporaryDirectory(prefix="meshtastic-bot-test-")
     rules = Path(rules_dir.name) / "rules.txt"
     rules.write_text("# test rules intentionally empty\n", encoding="utf-8")
     TEST_ENV["MESHTASTIC_RULES_FILE"] = str(rules)
 
     try:
+        node = None
+        if not args.quick:
+            node = args.node or find_node()
+            if node is None:
+                print(
+                    "no BLE node would accept a connection - rerun with --quick, or "
+                    "check the node is advertising and not already connected to a "
+                    "phone (a scan finds it either way; only one of those works)",
+                    file=sys.stderr,
+                )
+                return 2
+            print(f"using {node}\n")
+
         print("=== --help ===")
         for program, flags in (
             (

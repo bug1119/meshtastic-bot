@@ -47,6 +47,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bot  # noqa: E402
 import bot_server  # noqa: E402
 import lora_params  # noqa: E402
+import test_params_live  # noqa: E402
 from meshtastic.protobuf import config_pb2, mesh_pb2  # noqa: E402
 from pubsub import pub  # noqa: E402
 
@@ -765,7 +766,9 @@ def test_should_auto_reply():
     check("the same id from another sender", call(app, {"from_id": "!other", "id": 1, "text": "ping"}), True)
     # Our own outgoing text echoes back; answering it makes the bot self-reply.
     check("our own echo", call(app, {"from_id": "!me", "id": 3, "text": "ping"}), False)
-    check("our own echo is not remembered", 3 in app._replied_ids, False)
+    # Keyed on (sender, id) since the ledger was scoped per sender - a bare id
+    # can no longer match anything, so checking for one would always pass.
+    check("our own echo is not remembered", ("!me", 3) in app._replied_ids, False)
     # No id to key on: replying twice beats ignoring a real message.
     check("packet with no id", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
     check("packet with no id again", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
@@ -2744,6 +2747,182 @@ def test_mqtt_uplink_reaches_the_broker():
     check("the volume is in the heartbeat instead", "上行 4" in proxy.heartbeat_fragment(), True)
 
 
+def test_mqtt_learned_topics_survive_a_resync():
+    print("a topic learned from the node outlives the next config sync")
+    # The unnamed primary is what this protects. _refresh_wanted_topics can only
+    # see channels carrying a name, so the primary's topic exists solely because
+    # _learn_from_uplink read it off what the node published. A resync that
+    # treated its own list as the whole truth would take it away again - and
+    # start() runs on every reconnect, so the primary's downlink would go quiet
+    # after each one, until the node happened to publish there again. Silently:
+    # nothing about an unsubscribe reaches the log.
+    proxy, stub, holder, _, _ = _started_proxy(
+        channels=[_mqtt_channel(0, ""), _mqtt_channel(3, "EDGE_ATS")]
+    )
+    proxy._on_connect(stub, None, {}, 0, None)
+    learned = "msh/TW/2/e/MediumFast/+"
+    named = "msh/TW/2/e/EDGE_ATS/+"
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/MediumFast/!f2dcbabe", data=b"x"), holder.interface
+    )
+    check("learned from the uplink", learned in proxy._wanted, True)
+    check("and subscribed", learned in [topic for topic, _ in stub.subscribed], True)
+
+    proxy.start()  # what every reconnect does
+    check("still wanted after a resync", learned in proxy._wanted, True)
+    check("and still subscribed", learned in [topic for topic, _ in stub.subscribed], True)
+    check("the named channel is untouched", named in [topic for topic, _ in stub.subscribed], True)
+
+    print("a channel the node no longer offers is still dropped")
+    # Or the fix would amount to "never unsubscribe", and the bridge would carry
+    # every topic it ever saw for the rest of the run.
+    holder.interface.localNode.channels = [_mqtt_channel(0, "")]
+    proxy.start()
+    check("the retired channel is not wanted", named in proxy._wanted, False)
+    check("and is unsubscribed", named in [topic for topic, _ in stub.subscribed], False)
+    check("the learned one survives that too", learned in proxy._wanted, True)
+
+    print("a different broker starts the learning over")
+    # A learned topic has the old root inside it, which makes it wrong rather
+    # than merely stale once the broker changes.
+    holder.interface.localNode.moduleConfig.mqtt = _mqtt_config(root="msh/EU")
+    proxy.start()
+    check("nothing learned carries across", proxy._learned, {})
+    check("the old root is not still wanted", learned in proxy._wanted, False)
+    check("the new root is", "msh/EU/2/e/PKI/+" in proxy._wanted, True)
+
+    print("turning all downlinks off retires learned topics")
+    holder.interface.localNode.channels = [_mqtt_channel(0, "", downlink=False)]
+    proxy.start()
+    check("learned topics are cleared", proxy._learned, {})
+    check("and no downlink remains wanted", proxy._wanted, set())
+
+
+def test_mqtt_only_learns_eligible_channels():
+    print("uplinks only teach topics for downlink-enabled channels")
+    proxy, stub, holder, _, _ = _started_proxy(
+        channels=[
+            _mqtt_channel(0, ""),
+            _mqtt_channel(3, "EDGE_ATS"),
+            _mqtt_channel(4, "PRIVATE", downlink=False),
+        ]
+    )
+    proxy._on_connect(stub, None, {}, 0, None)
+    disabled = "msh/TW/2/e/PRIVATE/+"
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/PRIVATE/!f2dcbabe", data=b"x"), holder.interface
+    )
+    check("disabled named channel is not learned", disabled in proxy._learned, False)
+    check("disabled named channel is not subscribed", disabled in proxy._wanted, False)
+
+    print("an observed configured topic survives becoming unnamed")
+    named = "msh/TW/2/e/EDGE_ATS/+"
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/EDGE_ATS/!f2dcbabe", data=b"y"), holder.interface
+    )
+    check("an already-wanted topic is still learned", named in proxy._learned, True)
+    holder.interface.localNode.channels = [
+        _mqtt_channel(0, ""),
+        _mqtt_channel(3, ""),
+    ]
+    proxy.start()
+    check("the observed topic survives the name clearing", named in proxy._wanted, True)
+
+
+def test_live_probe_reads_the_whole_burst():
+    print("the hardware probe cannot lose lines to buffering")
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO("raw link up\nsettings follow\n設定同步完成: node\n")
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    original_popen = test_params_live.subprocess.Popen
+    original_probe = test_params_live.PROBE_SECONDS
+    captured = {}
+    process = FakeProcess()
+    try:
+        def popen(*args, **kwargs):
+            captured.update(kwargs)
+            return process
+
+        test_params_live.subprocess.Popen = popen
+        test_params_live.PROBE_SECONDS = 1
+        check("finds config sync in a burst", test_params_live.connects("node"), True)
+        check("passes the isolated environment", captured.get("env") is test_params_live.TEST_ENV, True)
+        check("terminates the probe", process.terminated, True)
+        check("closes the reader pipe", process.stdout.closed, True)
+    finally:
+        test_params_live.subprocess.Popen = original_popen
+        test_params_live.PROBE_SECONDS = original_probe
+
+    print("continuous output cannot extend the probe deadline")
+    class StreamingOutput:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.closed:
+                raise StopIteration
+            time.sleep(0.002)
+            return "still connecting\n"
+
+        def close(self):
+            self.closed = True
+
+    class StreamingProcess(FakeProcess):
+        def __init__(self):
+            super().__init__()
+            self.stdout = StreamingOutput()
+
+    streaming = StreamingProcess()
+    try:
+        test_params_live.subprocess.Popen = lambda *a, **k: streaming
+        test_params_live.PROBE_SECONDS = 0.03
+        started = time.monotonic()
+        check("continuous output does not connect", test_params_live.connects("node"), False)
+        check("deadline remains bounded", time.monotonic() - started < 0.5, True)
+        check("streaming reader is closed", streaming.stdout.closed, True)
+    finally:
+        test_params_live.subprocess.Popen = original_popen
+        test_params_live.PROBE_SECONDS = original_probe
+
+    print("the rules environment exists before node discovery")
+    original_find = test_params_live.find_node
+    original_argv = sys.argv
+    observed = []
+    try:
+        def find_node():
+            path = test_params_live.TEST_ENV.get("MESHTASTIC_RULES_FILE")
+            observed.append(bool(path and pathlib.Path(path).exists()))
+            return None
+
+        test_params_live.find_node = find_node
+        sys.argv = ["test_params_live.py"]
+        check("a missing node exits cleanly", test_params_live.main(), 2)
+        check("probe saw the temporary rules file", observed, [True])
+        check(
+            "temporary env is removed afterwards",
+            "MESHTASTIC_RULES_FILE" in test_params_live.TEST_ENV,
+            False,
+        )
+    finally:
+        test_params_live.find_node = original_find
+        sys.argv = original_argv
+
+
 def test_mqtt_downlink_reaches_the_radio():
     print("a broker message is handed back to the node")
     proxy, stub, holder, to_radio, _ = _started_proxy()
@@ -3533,6 +3712,9 @@ if __name__ == "__main__":
         test_mqtt_client_id_is_unique()
         test_mqtt_broker_settings()
         test_mqtt_uplink_reaches_the_broker()
+        test_mqtt_learned_topics_survive_a_resync()
+        test_mqtt_only_learns_eligible_channels()
+        test_live_probe_reads_the_whole_burst()
         test_mqtt_downlink_reaches_the_radio()
         test_mqtt_is_off_without_the_flag()
         test_mqtt_respects_the_device_settings()
