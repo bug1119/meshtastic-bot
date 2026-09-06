@@ -540,14 +540,14 @@ def link_app(interface="iface", closing=False, link_down=False):
 def test_await_sync():
     print("a transport that connected is not a link until the config lands")
     app = types.SimpleNamespace(
-        synced_interface=None, _closing=False,
+        synced_interfaces=set(), _closing=False,
         SYNC_TIMEOUT=0.25, SYNC_POLL_SECS=0.02,
     )
     interface = types.SimpleNamespace()
     call = bot.ReplyEngine._await_sync
 
     check("nothing has synced yet", call(app, interface), False)
-    app.synced_interface = interface
+    app.synced_interfaces.add(id(interface))
     check("the sync it was waiting for", call(app, interface), True)
     # connection.established from the link that was replaced must not be taken
     # as this one arriving - that is the whole reason it is compared by
@@ -555,7 +555,7 @@ def test_await_sync():
     check("someone else's sync does not count", call(app, types.SimpleNamespace()), False)
 
     print("quitting does not wait out the deadline")
-    app.synced_interface = None
+    app.synced_interfaces.clear()
     app._closing = True
     app.SYNC_TIMEOUT = 30  # would stall the suite if it were honoured
     started = time.monotonic()
@@ -605,9 +605,10 @@ def test_reconnect_retries_when_the_config_never_arrives():
     server2._reconnect_delay = lambda attempt: 0
 
     def syncs(transport, address):
-        interface = types.SimpleNamespace(close=lambda: None)
+        interface = types.SimpleNamespace(**vars(server2.interface))
+        interface.close = lambda: None
         # What on_config_synced records once the node hands its config over.
-        server2.synced_interface = interface
+        server2.synced_interfaces.add(id(interface))
         return interface
 
     bot.open_interface = syncs
@@ -618,6 +619,61 @@ def test_reconnect_retries_when_the_config_never_arrives():
 
     check("the link is up", server2.link_down, False)
     check("and adopted", server2.interface is not None, True)
+
+
+def test_delayed_sync_cannot_steal_a_reconnect():
+    print("a timed-out candidate cannot steal the next reconnect")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    server.connected_key = "ble:bug3_6d0e"
+    server.link_down = True
+    server.SYNC_TIMEOUT = 0.1
+    server.SYNC_POLL_SECS = 0.01
+    server._reconnect_delay = lambda attempt: 0
+    server.mqtt = None
+
+    first = types.SimpleNamespace(**vars(server.interface))
+    first.close = lambda: None
+    second = types.SimpleNamespace(**vars(server.interface))
+    second.close = lambda: None
+    opened = []
+    original = bot.open_interface
+
+    def open_candidate(transport, address):
+        candidate = first if not opened else second
+        opened.append(candidate)
+        if candidate is second:
+            # The abandoned first attempt reports late. It must neither take
+            # ownership nor clear link_down.
+            server.on_config_synced(first)
+            server.synced_interfaces.add(id(second))
+        return candidate
+
+    bot.open_interface = open_candidate
+    try:
+        server._reconnect_loop()
+    finally:
+        bot.open_interface = original
+
+    check("the second candidate won", server.interface is second, True)
+    check("the stale callback did not stop retrying", len(opened), 2)
+    check("the successful candidate brought the link up", server.link_down, False)
+
+
+def test_config_sync_is_ignored_during_shutdown():
+    print("shutdown rejects late config callbacks")
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    current = server.interface
+    late = types.SimpleNamespace(getMyUser=lambda: {"id": "!late"})
+    server._closing = True
+    server.pending_interface = late
+
+    server.on_config_synced(late)
+
+    check("ownership stays on the active interface", server.interface is current, True)
+    check("the late sync is not recorded", id(late) in server.synced_interfaces, False)
+    check("no shutdown-time sync report", "!late" in out.getvalue(), False)
 
 
 def test_release_link():
@@ -1847,7 +1903,10 @@ def test_config_sync_before_adopt():
 def test_tui_config_sync_before_adopt():
     print("TUI config sync can arrive before connect_device stores the interface")
     interface = types.SimpleNamespace(getMyUser=lambda: {"id": "!me"})
-    app = types.SimpleNamespace(interface=None, link_down=False, my_id=None, mqtt=None)
+    app = types.SimpleNamespace(
+        interface=None, link_down=False, my_id=None, mqtt=None,
+        _closing=False, pending_interface=None,
+    )
     app._log_system = lambda line: None
     app._report_rule_coverage = lambda: None
     app._populate_targets = lambda: None
@@ -3783,7 +3842,10 @@ def test_tui_starts_and_stops_the_bridge():
     print("the bridge starts once the node has handed its config over")
 
     def synced_app(start):
-        app = types.SimpleNamespace(interface=None, link_down=False, my_id=None)
+        app = types.SimpleNamespace(
+            interface=None, link_down=False, my_id=None,
+            _closing=False, pending_interface=None,
+        )
         app.logged = []
         app._log_system = app.logged.append
         app._report_rule_coverage = lambda: None
@@ -3872,6 +3934,8 @@ if __name__ == "__main__":
         test_packet_count()
         test_await_sync()
         test_reconnect_retries_when_the_config_never_arrives()
+        test_delayed_sync_cannot_steal_a_reconnect()
+        test_config_sync_is_ignored_during_shutdown()
         test_release_link()
         test_stale_link_detection()
         test_downlink_pauses_while_the_link_is_down()
