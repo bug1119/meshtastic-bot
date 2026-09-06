@@ -1054,6 +1054,37 @@ class ReplyEngine:
         packet, of any kind, before anything decides whether to care about it."""
         self.last_packet_at = time.monotonic()
 
+    # How long a reconnected transport has to finish its config download
+    # before the attempt is written off. Generous: the download normally
+    # completes before open_interface() even returns, so reaching this at all
+    # means something is wrong.
+    SYNC_TIMEOUT = 60
+    SYNC_POLL_SECS = 0.2
+
+    def _await_sync(self, interface) -> bool:
+        """Whether `interface` finishes its config download before the deadline.
+
+        A transport that connected is not yet a link. The node still has to
+        hand over its config, and until it does there is no channel list, no
+        node id, and nothing that can answer a message. A reconnect that
+        stopped at that point used to be reported as "已連線" with the packet
+        count frozen - observed for three minutes, and it would have run
+        indefinitely, since nothing else looks for it now that the
+        receive-silence check is gone.
+
+        Usually true on entry: the library publishes connection.established
+        from its own thread while open_interface() is still constructing the
+        interface, so the sync has normally landed before the caller asks.
+        """
+        deadline = time.monotonic() + self.SYNC_TIMEOUT
+        while not self._closing:
+            if self.synced_interface is interface:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.SYNC_POLL_SECS)
+        return self.synced_interface is interface
+
     # How long to wait for the old connection to close before reconnecting.
     # Short on purpose: the point is to hand the node's client slot back, and a
     # close that has not returned by now is not going to.
@@ -1422,6 +1453,10 @@ class MeshtasticTUI(ReplyEngine, App):
         # the staleness check cannot fire on a link that has yet to say
         # anything - a fresh connect gets its config download in first.
         self.last_packet_at: float | None = None
+        # The interface that finished its config download. Compared by identity
+        # rather than kept as a flag, because connection.established can arrive
+        # before the reconnect has adopted the interface it belongs to.
+        self.synced_interface = None
         # Status bar figures. monotonic, so the uptime cannot jump if the system
         # clock is corrected under us. Received counts text messages from other
         # nodes - our own echo would otherwise make sending one message read as
@@ -1701,6 +1736,13 @@ class MeshtasticTUI(ReplyEngine, App):
             except Exception as e:  # noqa: BLE001
                 self.call_from_thread(self._log_system, f"[yellow]重連失敗: {e}[/yellow]")
                 continue
+            if not self._await_sync(interface):
+                self.call_from_thread(
+                    self._log_system,
+                    f"[yellow]重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試[/yellow]",
+                )
+                self._release_link(interface)
+                continue
             self.call_from_thread(self._relinked, interface, transport)
             return
 
@@ -1742,6 +1784,7 @@ class MeshtasticTUI(ReplyEngine, App):
             self.link_down = False
         elif interface is not self.interface:
             return
+        self.synced_interface = interface
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         self._log_system(f"[green]設定同步完成[/green] (my id: {self.my_id})")
@@ -2802,6 +2845,10 @@ class ServerBot(ReplyEngine):
         self.reconnect_total = 0
         # See MeshtasticTUI.__init__ - same meaning, same reason.
         self.last_packet_at: float | None = None
+        # The interface that finished its config download. Compared by identity
+        # rather than kept as a flag, because connection.established can arrive
+        # before the reconnect has adopted the interface it belongs to.
+        self.synced_interface = None
         self._stopped = threading.Event()
         # None unless --mqtt was given, and checked for None at every use
         # rather than swapped for a do-nothing stand-in: "is the bridge on" is
@@ -2871,8 +2918,16 @@ class ServerBot(ReplyEngine):
             except Exception as e:  # noqa: BLE001
                 self.log(f"重連失敗: {e}")
                 continue
-            self.link_down = False
+            # Adopted before the wait so a config sync that arrives during it
+            # is recognised as this interface's; link_down stays set until the
+            # sync lands, which keeps the heartbeat honest and holds the MQTT
+            # downlink off a node still doing its config download.
             self._adopt(interface, transport)
+            if not self._await_sync(interface):
+                self.log(f"重連後 {self.SYNC_TIMEOUT} 秒沒有完成設定同步,重試")
+                self._release_link(interface)
+                continue
+            self.link_down = False
             return
 
     # ---- pubsub handlers --------------------------------------------------
@@ -2890,6 +2945,7 @@ class ServerBot(ReplyEngine):
             self.link_down = False
         elif interface is not self.interface:
             return
+        self.synced_interface = interface
         my_user = interface.getMyUser() or {}
         self.my_id = my_user.get("id")
         name = my_user.get("longName") or my_user.get("shortName") or "?"
