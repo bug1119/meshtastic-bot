@@ -1,0 +1,231 @@
+From 5b720bb668e7551105feb9ad7b17c1de918f2c14 Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Mon, 31 Aug 2026 23:09:48 +0800
+Subject: [PATCH] Let a phone app connect over WiFi on MUI devices
+
+The socket API (TCP 4403) was skipped whenever displaymode is COLOR, so on MUI
+boards a phone app could only ever connect over BLE - and device-ui's programming
+mode turns WiFi off outright as part of that hand-off. mDNS still advertised 4403
+regardless, so the node looked reachable and refused every connection.
+
+The reason for the gate is real but narrower than the gate itself: the on-device
+UI is a PhoneAPI client too (PacketAPI, polling every 10-50ms), and
+MeshService::toPhoneQueue has a single destructive dequeue with no per-client
+fan-out, so two clients steal packets from each other. Everything else in
+PhoneAPI is already per-instance - state machine, fromRadioScratch, auth slot -
+so only the live-packet drain actually needs arbitrating.
+
+So arbitrate there instead of disabling the server: PhoneAPI::wantsLivePackets()
+gates the toPhoneQueue drain, and PacketAPI overrides it to stand down while a
+socket-API client is attached. The phone then receives every packet rather than
+the two splitting them, and the UI reclaims the queue on its own when the phone
+disconnects. Config download, request/response and heartbeats keep flowing to the
+UI throughout, so the screen stays healthy - it just stops seeing new mesh
+traffic while the phone is connected.
+
+The client count lives in an inline function's local static rather than a global
+in ServerAPI.cpp, because InterfacesTemplates.cpp #includes that .cpp to
+instantiate the templates - a plain definition there is a duplicate symbol.
+
+The web server stays gated: it needs an HTTPS/mbedTLS heap budget the LVGL
+targets do not have, which is a separate problem from the queue.
+
+Verified on a Heltec V4 TFT (heltec-v4-tft, 2.8.0.3c83c8d): flash unchanged at
+97.6%, device boots clean, and a phone app connects over WiFi TCP.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ src/mesh/PhoneAPI.cpp          |  4 +++-
+ src/mesh/PhoneAPI.h            | 14 ++++++++++++++
+ src/mesh/api/PacketAPI.cpp     | 10 ++++++++++
+ src/mesh/api/PacketAPI.h       | 11 +++++++++++
+ src/mesh/api/ServerAPI.cpp     |  3 +++
+ src/mesh/api/ServerAPI.h       | 35 ++++++++++++++++++++++++++++++++++
+ src/mesh/wifi/WiFiAPClient.cpp | 11 ++++++++---
+ 7 files changed, 84 insertions(+), 4 deletions(-)
+
+diff --git a/src/mesh/PhoneAPI.cpp b/src/mesh/PhoneAPI.cpp
+index 813d413de..d59c647b0 100644
+--- a/src/mesh/PhoneAPI.cpp
++++ b/src/mesh/PhoneAPI.cpp
+@@ -1713,7 +1713,9 @@ bool PhoneAPI::available()
+ #endif
+ #endif
+ 
+-        if (!packetForPhone)
++        // wantsLivePackets() lets the on-device MUI stand down from this shared,
++        // destructively-dequeued queue while a socket-API client owns it.
++        if (!packetForPhone && wantsLivePackets())
+             packetForPhone = service->getForPhone();
+         hasPacket = !!packetForPhone;
+         if (hasPacket)
+diff --git a/src/mesh/PhoneAPI.h b/src/mesh/PhoneAPI.h
+index ab04c178b..0e399b443 100644
+--- a/src/mesh/PhoneAPI.h
++++ b/src/mesh/PhoneAPI.h
+@@ -172,6 +172,20 @@ class PhoneAPI
+     bool isConnected() { return state != STATE_SEND_NOTHING; }
+     bool isSendingPackets() { return state == STATE_SEND_PACKETS; }
+ 
++    /**
++     * Whether this client should be fed live mesh packets from the shared
++     * MeshService::toPhoneQueue.
++     *
++     * That queue has a single destructive dequeue (getForPhone()) with no per-client
++     * fan-out, so two clients polling it steal packets from each other. Everything
++     * else in this class is already per-instance (state machine, fromRadioScratch,
++     * auth slot), so only the live-packet drain needs arbitrating.
++     *
++     * Default is true. The on-device MUI (PacketAPI) overrides it to stand down
++     * while a socket-API client owns the queue.
++     */
++    virtual bool wantsLivePackets() const { return true; }
++
+ #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
+     /// Per-connection auth: tracked in a small file-scope slot table keyed
+     /// by PhoneAPI*. Adding state members directly to PhoneAPI broke
+diff --git a/src/mesh/api/PacketAPI.cpp b/src/mesh/api/PacketAPI.cpp
+index c8adda520..c83031bc4 100644
+--- a/src/mesh/api/PacketAPI.cpp
++++ b/src/mesh/api/PacketAPI.cpp
+@@ -35,6 +35,16 @@ PacketAPI::PacketAPI(PacketServer *_server)
+ int32_t PacketAPI::runOnce()
+ {
+     bool success = false;
++
++    // Make the hand-off visible on serial. Edge-triggered, so it logs twice per
++    // phone session rather than every 10ms. Single PacketAPI instance, hence static.
++    static bool wasStoodDown = false;
++    const bool standDown = !wantsLivePackets();
++    if (standDown != wasStoodDown) {
++        LOG_INFO("MUI %s live-packet queue (socket API client %s)", standDown ? "yields" : "reclaims",
++                 standDown ? "attached" : "gone");
++        wasStoodDown = standDown;
++    }
+ #ifndef ARCH_PORTDUINO
+     if (config.bluetooth.enabled) {
+         if (!programmingMode) {
+diff --git a/src/mesh/api/PacketAPI.h b/src/mesh/api/PacketAPI.h
+index aececf85e..24c70254d 100644
+--- a/src/mesh/api/PacketAPI.h
++++ b/src/mesh/api/PacketAPI.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "PhoneAPI.h"
++#include "api/ServerAPI.h"
+ #include "comms/PacketServer.h"
+ #include "concurrency/OSThread.h"
+ 
+@@ -18,6 +19,16 @@ class PacketAPI : public PhoneAPI, public concurrency::OSThread
+     // Check the current underlying physical queue to see if the client is fetching packets
+     bool checkIsConnected() override;
+ 
++    /**
++     * Stand down from the shared live-packet queue while a socket-API client (a phone
++     * app over WiFi/TCP) is attached, so it receives every packet instead of the two
++     * of us splitting them. Config/admin traffic, the config download and heartbeats
++     * are all per-instance and keep flowing to the on-device UI regardless, so the
++     * screen stays alive - it just stops seeing new mesh traffic until the phone
++     * disconnects, at which point this returns true again on its own.
++     */
++    bool wantsLivePackets() const override { return !isSocketApiClientAttached(); }
++
+   protected:
+     explicit PacketAPI(PacketServer *_server);
+ 
+diff --git a/src/mesh/api/ServerAPI.cpp b/src/mesh/api/ServerAPI.cpp
+index 20ff8af99..c6e768091 100644
+--- a/src/mesh/api/ServerAPI.cpp
++++ b/src/mesh/api/ServerAPI.cpp
+@@ -11,11 +11,14 @@ static constexpr uint32_t TCP_IDLE_TIMEOUT_MS = 15 * 60 * 1000UL;
+ template <typename T>
+ ServerAPI<T>::ServerAPI(T &_client) : StreamAPI(&client), concurrency::OSThread("ServerAPI"), client(_client)
+ {
++    socketApiClientCount()++; // MUI stands down from the live-packet queue while we are attached
+     LOG_INFO("Incoming API connection");
+ }
+ 
+ template <typename T> ServerAPI<T>::~ServerAPI()
+ {
++    if (socketApiClientCount())
++        socketApiClientCount()--;
+     client.stop();
+ }
+ 
+diff --git a/src/mesh/api/ServerAPI.h b/src/mesh/api/ServerAPI.h
+index ece8e0ba2..4e8aea271 100644
+--- a/src/mesh/api/ServerAPI.h
++++ b/src/mesh/api/ServerAPI.h
+@@ -1,10 +1,45 @@
+ #pragma once
+ 
+ #include "StreamAPI.h"
++#include <cstdint>
+ #include <memory>
+ 
+ #define SERVER_API_DEFAULT_PORT 4403
+ 
++/**
++ * Number of live socket-API clients (a phone/PC app over TCP - WiFi or Ethernet).
++ * Maintained by the ServerAPI ctor/dtor, so it covers every transport deriving
++ * from it without per-transport bookkeeping.
++ *
++ * Deliberately a function-local static inside an inline function rather than a
++ * plain global in ServerAPI.cpp: InterfacesTemplates.cpp #includes ServerAPI.cpp
++ * to instantiate the templates, so that file is compiled twice. A non-template
++ * definition there is a duplicate symbol at link time, whereas an inline
++ * function's local static is one shared instance across all translation units.
++ */
++inline uint8_t &socketApiClientCount()
++{
++    static uint8_t count = 0;
++    return count;
++}
++
++/**
++ * True while at least one socket-API client is attached.
++ *
++ * MeshService::toPhoneQueue is a single queue with a destructive dequeue, so two
++ * PhoneAPI clients polling it steal packets from each other. On MUI devices the
++ * on-device UI is itself a PhoneAPI client (PacketAPI) that polls every 10-50ms,
++ * so it uses this to stand down from the live-packet queue while a socket client
++ * owns it - see PhoneAPI::wantsLivePackets().
++ *
++ * Header-only, so this is safe to call from builds without WiFi or Ethernet: the
++ * count simply never leaves zero.
++ */
++inline bool isSocketApiClientAttached()
++{
++    return socketApiClientCount() > 0;
++}
++
+ /**
+  * Provides both debug printing and, if the client starts sending protobufs to us, switches to send/receive protobufs
+  * (and starts dropping debug printing - FIXME, eventually those prints should be encapsulated in protobufs).
+diff --git a/src/mesh/wifi/WiFiAPClient.cpp b/src/mesh/wifi/WiFiAPClient.cpp
+index c7fc1b25f..afda281a4 100644
+--- a/src/mesh/wifi/WiFiAPClient.cpp
++++ b/src/mesh/wifi/WiFiAPClient.cpp
+@@ -230,9 +230,14 @@ static void onNetworkConnected()
+         }
+ #endif
+ #if !MESHTASTIC_EXCLUDE_SOCKETAPI
+-        if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
+-            initApiServer();
+-        }
++        // Started on MUI devices too, so a phone app can connect over WiFi. The reason this
++        // used to be skipped for DisplayMode_COLOR is that the on-device UI is itself a
++        // PhoneAPI client and both would drain the shared MeshService::toPhoneQueue; that is
++        // now arbitrated at the queue instead - see PhoneAPI::wantsLivePackets() and
++        // PacketAPI's override, which stands the UI down only while a client is attached.
++        // The web server above stays gated: it needs an HTTPS/mbedTLS heap budget the LVGL
++        // targets do not have, and that is a separate problem from the queue.
++        initApiServer();
+ #endif
+         APStartupComplete = true;
+     }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,91 @@
+From b2a76356ef457ed3eadb1490b5e013638737d0ff Mon Sep 17 00:00:00 2001
+From: Joseph Yu <josephyu@yahooinc.com>
+Date: Thu, 3 Sep 2026 01:59:48 +0800
+Subject: [PATCH] Local-only build config: CJK device-ui, stock partitions (do
+ not upstream)
+
+Points the device-ui dependency at the cjk-only worktree - upstream device-ui
+plus two cherry-picks: the Noto Sans TC glyph fallback, and the fix for
+updatePosition dereferencing a node panel that was never created. No Dashboard,
+no Zhuyin IME.
+
+Also drops the chewing_dict partition table and returns to stock default_16MB,
+since nothing needs a dictionary partition any more. OTA is nominally back,
+though at 95.5% flash a second image of this size still would not fit.
+
+Absolute paths, so this only builds on this machine.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011VjqMrWWLWXvmh69rvGCEo
+---
+ partition-heltec-v4-tft-chewing.csv       | 23 +++++++++++++++++++++++
+ platformio.ini                            |  9 +++++++--
+ variants/esp32s3/heltec_v4/platformio.ini |  2 +-
+ 3 files changed, 31 insertions(+), 3 deletions(-)
+ create mode 100644 partition-heltec-v4-tft-chewing.csv
+
+diff --git a/partition-heltec-v4-tft-chewing.csv b/partition-heltec-v4-tft-chewing.csv
+new file mode 100644
+index 000000000..7ac03578e
+--- /dev/null
++++ b/partition-heltec-v4-tft-chewing.csv
+@@ -0,0 +1,23 @@
++# Partition table for heltec-v4-tft ONLY.
++#
++# Derived from default_16MB.csv, with the second OTA slot (app1, ota_1)
++# repurposed as a read-only data partition holding the packed libchewing
++# Zhuyin dictionary blob. The CJK display font already pushed app0 to ~97%
++# full, leaving nowhere in the application image for a ~3.3MB dictionary.
++#
++# CONSEQUENCE: this build cannot do OTA firmware updates - there is no second
++# app slot to receive them. Flashing is USB-only, which is how this device has
++# always been updated. Meshtastic's OTA code (src/platform/esp32/MeshtasticOTA.cpp)
++# null-checks esp_partition_find_first(...APP_OTA_1...) and degrades gracefully,
++# so nothing crashes; remote OTA requests simply answer "Cannot start OTA".
++#
++# Kept as a separate file rather than editing default_16MB.csv because that file
++# is shared by ~20 other boards that still want working OTA.
++#
++# Name,       Type, SubType,  Offset,   Size,     Flags
++nvs,          data, nvs,      0x9000,   0x5000,
++otadata,      data, ota,      0xe000,   0x2000,
++app0,         app,  ota_0,    0x10000,  0x640000,
++chewing_dict, data, 0x40,     0x650000, 0x640000,
++spiffs,       data, spiffs,   0xc90000, 0x360000,
++coredump,     data, coredump, 0xFF0000, 0x10000,
+diff --git a/platformio.ini b/platformio.ini
+index 2c7973ecf..149ca3bf9 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -136,8 +136,13 @@ lib_deps =
+ 
+ [device-ui_base]
+ lib_deps =
+-	# renovate: datasource=git-refs depName=meshtastic/device-ui packageName=https://github.com/meshtastic/device-ui gitBranch=master
+-	https://github.com/meshtastic/device-ui/archive/7bfabe5e9ba468b4f82a15bae69e6b068ca124f0.zip
++	# LOCAL OVERRIDE for Dashboard screen dev — points at the fix/dashboard-bugs worktree
++	# (branched from feature/dashboard-screen) under ~/git/device-ui/.claude/worktrees/dashboard-fix.
++	# Backup pushed to https://github.com/josephyu_ytwec/device-ui-heltec-dashboard (private — EMU account
++	# can't fork/host public repos, so PlatformIO can't fetch it anonymously; build locally via symlink instead).
++	# Original pinned upstream dependency (restore this to go back to stock):
++	# https://github.com/meshtastic/device-ui/archive/7bfabe5e9ba468b4f82a15bae69e6b068ca124f0.zip
++	symlink:///Users/josephyu/git/device-ui/.claude/worktrees/cjk-only
+ custom_sdkconfig =
+ 	# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+ 	CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+diff --git a/variants/esp32s3/heltec_v4/platformio.ini b/variants/esp32s3/heltec_v4/platformio.ini
+index fcc20d045..1bfdb5fb8 100644
+--- a/variants/esp32s3/heltec_v4/platformio.ini
++++ b/variants/esp32s3/heltec_v4/platformio.ini
+@@ -49,7 +49,7 @@ custom_meshtastic_partition_scheme = 16MB
+ 
+ extends = heltec_v4_base
+ board_level = release
+-build_flags = 
++build_flags =
+   ${heltec_v4_base.build_flags} ;-Os
+   -D HELTEC_V4_TFT
+   -D I2C_SDA=4
+-- 
+2.50.1 (Apple Git-155)
+
