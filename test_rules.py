@@ -765,7 +765,9 @@ def test_should_auto_reply():
     check("the same id from another sender", call(app, {"from_id": "!other", "id": 1, "text": "ping"}), True)
     # Our own outgoing text echoes back; answering it makes the bot self-reply.
     check("our own echo", call(app, {"from_id": "!me", "id": 3, "text": "ping"}), False)
-    check("our own echo is not remembered", 3 in app._replied_ids, False)
+    # Keyed on (sender, id) since the ledger was scoped per sender - a bare id
+    # can no longer match anything, so checking for one would always pass.
+    check("our own echo is not remembered", ("!me", 3) in app._replied_ids, False)
     # No id to key on: replying twice beats ignoring a real message.
     check("packet with no id", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
     check("packet with no id again", call(app, {"from_id": "!them", "id": None, "text": "ping"}), True)
@@ -2744,6 +2746,72 @@ def test_mqtt_uplink_reaches_the_broker():
     check("the volume is in the heartbeat instead", "上行 4" in proxy.heartbeat_fragment(), True)
 
 
+def test_mqtt_learned_topics_survive_a_resync():
+    print("a topic learned from the node outlives the next config sync")
+    # The unnamed primary is what this protects. _refresh_wanted_topics can only
+    # see channels carrying a name, so the primary's topic exists solely because
+    # _learn_from_uplink read it off what the node published. A resync that
+    # treated its own list as the whole truth would take it away again - and
+    # start() runs on every reconnect, so the primary's downlink would go quiet
+    # after each one, until the node happened to publish there again. Silently:
+    # nothing about an unsubscribe reaches the log.
+    proxy, stub, holder, _, _ = _started_proxy(
+        channels=[_mqtt_channel(0, ""), _mqtt_channel(3, "EDGE_ATS")]
+    )
+    proxy._on_connect(stub, None, {}, 0, None)
+    learned = "msh/TW/2/e/MediumFast/+"
+    named = "msh/TW/2/e/EDGE_ATS/+"
+    proxy.on_proxy_message(
+        _proxy_message("msh/TW/2/e/MediumFast/!f2dcbabe", data=b"x"), holder.interface
+    )
+    check("learned from the uplink", learned in proxy._wanted, True)
+    check("and subscribed", learned in [topic for topic, _ in stub.subscribed], True)
+
+    proxy.start()  # what every reconnect does
+    check("still wanted after a resync", learned in proxy._wanted, True)
+    check("and still subscribed", learned in [topic for topic, _ in stub.subscribed], True)
+    check("the named channel is untouched", named in [topic for topic, _ in stub.subscribed], True)
+
+    print("a channel the node no longer offers is still dropped")
+    # Or the fix would amount to "never unsubscribe", and the bridge would carry
+    # every topic it ever saw for the rest of the run.
+    holder.interface.localNode.channels = [_mqtt_channel(0, "")]
+    proxy.start()
+    check("the retired channel is not wanted", named in proxy._wanted, False)
+    check("and is unsubscribed", named in [topic for topic, _ in stub.subscribed], False)
+    check("the learned one survives that too", learned in proxy._wanted, True)
+
+    print("a different broker starts the learning over")
+    # A learned topic has the old root inside it, which makes it wrong rather
+    # than merely stale once the broker changes.
+    holder.interface.localNode.moduleConfig.mqtt = _mqtt_config(root="msh/EU")
+    proxy.start()
+    check("nothing learned carries across", proxy._learned, set())
+    check("the old root is not still wanted", learned in proxy._wanted, False)
+    check("the new root is", "msh/EU/2/e/PKI/+" in proxy._wanted, True)
+
+
+def test_live_probe_reads_the_whole_burst():
+    print("the hardware probe cannot lose lines to buffering")
+    # connects() waits for one line among several the child writes at once.
+    # select() answers about the file descriptor while readline() reads from
+    # Python's own buffer, so the later lines of a burst are invisible to it -
+    # the probe gives up and reports a healthy node as refusing to connect.
+    # Source text rather than behaviour: the function needs a node to run.
+    source = (pathlib.Path(bot.__file__).parent / "test_params_live.py").read_text(
+        encoding="utf-8"
+    )
+    probe = source[source.index("def connects("):source.index("def main(")]
+    check("does not select on the pipe", "select.select" in probe, False)
+    check("reads on a thread instead", "daemon=True" in probe, True)
+    check("and hands the lines over a queue", "queue.Queue" in probe, True)
+    # The probe launches a real bot against a real node; with the operator's
+    # own rules.txt it could answer a message that lands mid-probe, which is
+    # the one thing this file promises not to do.
+    check("runs against the test rules", "env=TEST_ENV" in probe, True)
+    check("select is no longer imported at all", "\nimport select\n" in source, False)
+
+
 def test_mqtt_downlink_reaches_the_radio():
     print("a broker message is handed back to the node")
     proxy, stub, holder, to_radio, _ = _started_proxy()
@@ -3533,6 +3601,8 @@ if __name__ == "__main__":
         test_mqtt_client_id_is_unique()
         test_mqtt_broker_settings()
         test_mqtt_uplink_reaches_the_broker()
+        test_mqtt_learned_topics_survive_a_resync()
+        test_live_probe_reads_the_whole_burst()
         test_mqtt_downlink_reaches_the_radio()
         test_mqtt_is_off_without_the_flag()
         test_mqtt_respects_the_device_settings()

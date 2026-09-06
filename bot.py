@@ -2289,6 +2289,10 @@ class MqttProxy:
         self._client = None
         self._settings: dict | None = None
         self._wanted: set = set()
+        # Topics the channel list cannot produce, learned from what the node
+        # publishes. Held apart from _wanted so a config re-sync can retire a
+        # channel it no longer sees without retiring these along with it.
+        self._learned: set = set()
         # Guards _wanted and the connected flag together. Topics are added from
         # meshtastic's publishing thread as the node reveals them, while paho's
         # thread walks the set to re-subscribe on connect - without this, one
@@ -2354,6 +2358,9 @@ class MqttProxy:
         self._stopped = threading.Event()
         self.connected = False
         self._wanted.clear()
+        # Learned topics carry the old root in them, so a broker change makes
+        # them wrong rather than merely stale.
+        self._learned.clear()
         self._refresh_wanted_topics()
         try:
             self._client = self._build_client(self._settings)
@@ -2571,6 +2578,12 @@ class MqttProxy:
             wanted.add(self._channel_topic(MQTT_PKI_CHANNEL))
 
         with self._lock:
+            # Union with what was learned, or this would unsubscribe it: the
+            # unnamed primary is never in `wanted`, since the loop above can
+            # only see channels that carry a name. Dropping it here would take
+            # the primary's downlink away on every reconnect, and leave it off
+            # until the node happened to publish there again.
+            wanted |= self._learned
             removed = self._wanted - wanted
             added = wanted - self._wanted
             self._wanted = wanted
@@ -2594,6 +2607,7 @@ class MqttProxy:
             if topic in self._wanted:
                 return
             self._wanted.add(topic)
+            self._learned.add(topic)
             # Under the same lock as the flag it reads: a topic added in the
             # instant between "not connected yet" and on_connect's sweep would
             # otherwise be subscribed by neither.
