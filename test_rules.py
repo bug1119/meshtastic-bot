@@ -502,6 +502,89 @@ def link_app(interface="iface", closing=False, link_down=False):
     return app
 
 
+def test_await_sync():
+    print("a transport that connected is not a link until the config lands")
+    app = types.SimpleNamespace(
+        synced_interface=None, _closing=False,
+        SYNC_TIMEOUT=0.25, SYNC_POLL_SECS=0.02,
+    )
+    interface = types.SimpleNamespace()
+    call = bot.ReplyEngine._await_sync
+
+    check("nothing has synced yet", call(app, interface), False)
+    app.synced_interface = interface
+    check("the sync it was waiting for", call(app, interface), True)
+    # connection.established from the link that was replaced must not be taken
+    # as this one arriving - that is the whole reason it is compared by
+    # identity rather than kept as a flag.
+    check("someone else's sync does not count", call(app, types.SimpleNamespace()), False)
+
+    print("quitting does not wait out the deadline")
+    app.synced_interface = None
+    app._closing = True
+    app.SYNC_TIMEOUT = 30  # would stall the suite if it were honoured
+    started = time.monotonic()
+    check("returns at once", call(app, interface), False)
+    check("without sleeping on it", time.monotonic() - started < 1, True)
+
+
+def test_reconnect_retries_when_the_config_never_arrives():
+    print("a reconnect that stops at the handshake is retried, not announced")
+    # Observed live: the transport reconnected, "BLE 已連線,等待設定同步..." was
+    # the last thing said about it, and the heartbeat then reported 已連線 with
+    # the packet count frozen for three minutes until the process was killed.
+    out = io.StringIO()
+    server, _ = _fake_server("[*]\nping=pong\n", out)
+    server.connected_key = "ble:bug3_6d0e"
+    server.link_down = True
+    server.SYNC_TIMEOUT = 0.15
+    server.SYNC_POLL_SECS = 0.02
+    server._reconnect_delay = lambda attempt: 0
+
+    opened = []
+    original = bot.open_interface
+
+    def never_syncs(transport, address):
+        opened.append(address)
+        if len(opened) >= 3:
+            server._closing = True  # the loop is otherwise endless, by design
+        return types.SimpleNamespace(close=lambda: None)
+
+    bot.open_interface = never_syncs
+    try:
+        server._reconnect_loop()
+    finally:
+        bot.open_interface = original
+
+    check("kept trying rather than settling", len(opened) >= 3, True)
+    check("never called itself connected", server.link_down, True)
+    check("and said why", "沒有完成設定同步" in out.getvalue(), True)
+
+    print("and one that does sync is adopted")
+    out2 = io.StringIO()
+    server2, _ = _fake_server("[*]\nping=pong\n", out2)
+    server2.connected_key = "ble:bug3_6d0e"
+    server2.link_down = True
+    server2.SYNC_TIMEOUT = 5
+    server2.SYNC_POLL_SECS = 0.02
+    server2._reconnect_delay = lambda attempt: 0
+
+    def syncs(transport, address):
+        interface = types.SimpleNamespace(close=lambda: None)
+        # What on_config_synced records once the node hands its config over.
+        server2.synced_interface = interface
+        return interface
+
+    bot.open_interface = syncs
+    try:
+        server2._reconnect_loop()
+    finally:
+        bot.open_interface = original
+
+    check("the link is up", server2.link_down, False)
+    check("and adopted", server2.interface is not None, True)
+
+
 def test_release_link():
     print("the old link is handed back before reconnecting")
 
@@ -3631,6 +3714,8 @@ if __name__ == "__main__":
         test_status_bar()
         test_status_bar_widget()
         test_packet_count()
+        test_await_sync()
+        test_reconnect_retries_when_the_config_never_arrives()
         test_release_link()
         test_stale_link_detection()
         test_downlink_pauses_while_the_link_is_down()
