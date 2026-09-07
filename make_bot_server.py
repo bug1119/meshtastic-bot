@@ -91,7 +91,7 @@ sub(
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Input, Label, ListItem, ListView, RichLog
+from textual.widgets import Input, Label, ListItem, ListView, RichLog
 
 """,
     "",

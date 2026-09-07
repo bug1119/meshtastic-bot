@@ -566,10 +566,18 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
         return None
 
+    # rxTime is the *node's* clock, and a node that has never had a GPS fix or a
+    # phone connected reports 0 - which is the normal state for a bench node, so
+    # this used to render as "??:??:??" on every single message. Falling back to
+    # our own clock is honest: the packet is parsed as it arrives, so the two are
+    # within a second of each other. Marked with "~" to say it was derived here
+    # rather than reported, the same convention the status pane uses.
     rx_time = packet.get("rxTime")
-    # Shared with the packet table, so a message and the packet that carried it
-    # can never disagree about when it arrived. See packet_when().
-    when = packet_when(packet)
+    when = (
+        datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S")
+        if rx_time
+        else "~" + datetime.datetime.now().strftime("%H:%M:%S")
+    )
 
     to_id = packet_node_id(packet, "toId", "to") or BROADCAST_ADDR
     from_id = packet_node_id(packet, "fromId", "from") or "?"
@@ -609,124 +617,6 @@ def node_label(nodes: dict, node_id: str) -> str:
     """
     user = (nodes.get(node_id) or {}).get("user") or {}
     return user.get("shortName") or user.get("longName") or node_id
-
-
-# What each port number is called in the packet table. Abbreviated because the
-# column is narrow and the raw names all end in the same "_APP"; a port number
-# absent from here is shown as the library named it, so a firmware that adds
-# one stays legible rather than blank.
-# The packet table's columns, as (heading, width). Widths are fixed so the
-# columns do not jump about as rows arrive - a table that reflows on every
-# packet is unreadable on a busy mesh. Sized to their worst case: "~23:56:04"
-# for a derived time, "TRACEROUTE" for the longest type, "-18.5" for a
-# negative SNR. Content takes what is left, hence a width of None.
-PACKET_TABLE_COLUMNS = (
-    ("時間", 9),
-    ("節點", 10),
-    ("Ch", 3),
-    ("SNR", 6),
-    ("RSSI", 5),
-    ("類型", 11),
-    ("Hops", 5),
-    ("內容", None),
-)
-
-# How many rows the packet table keeps. This pane is meant to stay up for days
-# on a mesh moving hundreds of packets a minute, so an unbounded table is a
-# slow leak; 500 is comfortably more than fits on screen, leaving room to
-# scroll back through what just happened.
-PACKET_TABLE_LIMIT = 500
-
-PORTNUM_LABELS = {
-    "TEXT_MESSAGE_APP": "TEXT",
-    "TELEMETRY_APP": "TELEMETRY",
-    "NODEINFO_APP": "NODEINFO",
-    "TRACEROUTE_APP": "TRACEROUTE",
-    "POSITION_APP": "POSITION",
-}
-
-
-def packet_table_row(packet: dict, nodes: dict, my_id: str | None) -> dict | None:
-    """One row of the packet table, from a raw packet of any port number.
-
-    Deliberately separate from parse_incoming(), which the auto-reply path
-    shares: that one drops everything but TEXT_MESSAGE_APP, and letting
-    telemetry through there would have the bot match rules against it.
-    """
-    decoded = packet.get("decoded") or {}
-    portnum = decoded.get("portnum") or ""
-    from_id = packet_node_id(packet, "fromId", "from") or "?"
-    # No decoded payload means the radio could not decrypt it - a channel this
-    # node holds no key for. The mesh carries these constantly and they are
-    # meaningful as themselves, so they are named rather than left blank, which
-    # would be indistinguishable from a rendering fault.
-    kind = PORTNUM_LABELS.get(portnum, portnum) if decoded else "encrypted"
-    return {
-        "when": packet_when(packet),
-        "node": node_label(nodes, from_id),
-        "channel": packet.get("channel", 0),
-        "snr": packet.get("rxSnr"),
-        "rssi": packet.get("rxRssi"),
-        "type": kind,
-        "hops": _packet_hops(packet),
-        "detail": _packet_detail(portnum, decoded),
-    }
-
-
-def _packet_hops(packet: dict) -> str:
-    """Hops travelled out of the sender's starting limit, as "2/3".
-
-    hopStart is what the sender set; hopLimit is what is left by the time it
-    reached us, so the difference is how far it actually travelled. The library
-    omits both on some paths, and a computed "0/0" would read as a fact rather
-    than an absence - hence "--", the same marker the node list and status pane
-    use for a figure that could not be determined.
-    """
-    start, limit = packet.get("hopStart"), packet.get("hopLimit")
-    if start is None or limit is None:
-        return "--"
-    return f"{start - limit}/{start}"
-
-
-def packet_when(packet: dict) -> str:
-    """A packet's arrival time, from the node's clock or failing that ours.
-
-    rxTime is the *node's* clock, and a node that has never had a GPS fix or a
-    phone connected reports 0 - the normal state for a bench node, which would
-    otherwise render as "??:??:??" on every single packet. Falling back to our
-    own clock is honest: the packet is handled as it arrives, so the two are
-    within a second of each other. Marked with "~" to say it was derived here
-    rather than reported.
-    """
-    rx_time = packet.get("rxTime")
-    if rx_time:
-        return datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S")
-    return "~" + datetime.datetime.now().strftime("%H:%M:%S")
-
-
-def _packet_detail(portnum: str, decoded: dict) -> str:
-    """The packet table's rightmost column: a one-line summary per type.
-
-    A summary rather than a dump, because this column is shared with message
-    text and is the first thing squeezed when the pane narrows. Telemetry
-    reports what an operator actually scans for - voltage and battery - and a
-    type with nothing worth summarising leaves it empty instead of filler.
-    """
-    if portnum == "TEXT_MESSAGE_APP":
-        return decoded.get("text", "")
-    if portnum == "TELEMETRY_APP":
-        metrics = (decoded.get("telemetry") or {}).get("deviceMetrics") or {}
-        parts = []
-        if metrics.get("voltage") is not None:
-            parts.append(f"{metrics['voltage']:.2f}V")
-        if metrics.get("batteryLevel") is not None:
-            parts.append(f"{metrics['batteryLevel']}%")
-        return " ".join(parts)
-    if portnum == "NODEINFO_APP":
-        # The long name, because the short one is already the node column.
-        user = decoded.get("user") or {}
-        return user.get("longName") or user.get("shortName") or ""
-    return ""
 
 
 def format_incoming_line(info: dict, sender: str | None = None, markup: bool = True) -> str:

@@ -155,7 +155,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Input, Label, ListItem, ListView, RichLog
+from textual.widgets import Input, Label, ListItem, ListView, RichLog
 
 import meshtastic
 import meshtastic.ble_interface
@@ -688,10 +688,18 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
         return None
 
+    # rxTime is the *node's* clock, and a node that has never had a GPS fix or a
+    # phone connected reports 0 - which is the normal state for a bench node, so
+    # this used to render as "??:??:??" on every single message. Falling back to
+    # our own clock is honest: the packet is parsed as it arrives, so the two are
+    # within a second of each other. Marked with "~" to say it was derived here
+    # rather than reported, the same convention the status pane uses.
     rx_time = packet.get("rxTime")
-    # Shared with the packet table, so a message and the packet that carried it
-    # can never disagree about when it arrived. See packet_when().
-    when = packet_when(packet)
+    when = (
+        datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S")
+        if rx_time
+        else "~" + datetime.datetime.now().strftime("%H:%M:%S")
+    )
 
     to_id = packet_node_id(packet, "toId", "to") or BROADCAST_ADDR
     from_id = packet_node_id(packet, "fromId", "from") or "?"
@@ -731,124 +739,6 @@ def node_label(nodes: dict, node_id: str) -> str:
     """
     user = (nodes.get(node_id) or {}).get("user") or {}
     return user.get("shortName") or user.get("longName") or node_id
-
-
-# What each port number is called in the packet table. Abbreviated because the
-# column is narrow and the raw names all end in the same "_APP"; a port number
-# absent from here is shown as the library named it, so a firmware that adds
-# one stays legible rather than blank.
-# The packet table's columns, as (heading, width). Widths are fixed so the
-# columns do not jump about as rows arrive - a table that reflows on every
-# packet is unreadable on a busy mesh. Sized to their worst case: "~23:56:04"
-# for a derived time, "TRACEROUTE" for the longest type, "-18.5" for a
-# negative SNR. Content takes what is left, hence a width of None.
-PACKET_TABLE_COLUMNS = (
-    ("時間", 9),
-    ("節點", 10),
-    ("Ch", 3),
-    ("SNR", 6),
-    ("RSSI", 5),
-    ("類型", 11),
-    ("Hops", 5),
-    ("內容", None),
-)
-
-# How many rows the packet table keeps. This pane is meant to stay up for days
-# on a mesh moving hundreds of packets a minute, so an unbounded table is a
-# slow leak; 500 is comfortably more than fits on screen, leaving room to
-# scroll back through what just happened.
-PACKET_TABLE_LIMIT = 500
-
-PORTNUM_LABELS = {
-    "TEXT_MESSAGE_APP": "TEXT",
-    "TELEMETRY_APP": "TELEMETRY",
-    "NODEINFO_APP": "NODEINFO",
-    "TRACEROUTE_APP": "TRACEROUTE",
-    "POSITION_APP": "POSITION",
-}
-
-
-def packet_table_row(packet: dict, nodes: dict, my_id: str | None) -> dict | None:
-    """One row of the packet table, from a raw packet of any port number.
-
-    Deliberately separate from parse_incoming(), which the auto-reply path
-    shares: that one drops everything but TEXT_MESSAGE_APP, and letting
-    telemetry through there would have the bot match rules against it.
-    """
-    decoded = packet.get("decoded") or {}
-    portnum = decoded.get("portnum") or ""
-    from_id = packet_node_id(packet, "fromId", "from") or "?"
-    # No decoded payload means the radio could not decrypt it - a channel this
-    # node holds no key for. The mesh carries these constantly and they are
-    # meaningful as themselves, so they are named rather than left blank, which
-    # would be indistinguishable from a rendering fault.
-    kind = PORTNUM_LABELS.get(portnum, portnum) if decoded else "encrypted"
-    return {
-        "when": packet_when(packet),
-        "node": node_label(nodes, from_id),
-        "channel": packet.get("channel", 0),
-        "snr": packet.get("rxSnr"),
-        "rssi": packet.get("rxRssi"),
-        "type": kind,
-        "hops": _packet_hops(packet),
-        "detail": _packet_detail(portnum, decoded),
-    }
-
-
-def _packet_hops(packet: dict) -> str:
-    """Hops travelled out of the sender's starting limit, as "2/3".
-
-    hopStart is what the sender set; hopLimit is what is left by the time it
-    reached us, so the difference is how far it actually travelled. The library
-    omits both on some paths, and a computed "0/0" would read as a fact rather
-    than an absence - hence "--", the same marker the node list and status pane
-    use for a figure that could not be determined.
-    """
-    start, limit = packet.get("hopStart"), packet.get("hopLimit")
-    if start is None or limit is None:
-        return "--"
-    return f"{start - limit}/{start}"
-
-
-def packet_when(packet: dict) -> str:
-    """A packet's arrival time, from the node's clock or failing that ours.
-
-    rxTime is the *node's* clock, and a node that has never had a GPS fix or a
-    phone connected reports 0 - the normal state for a bench node, which would
-    otherwise render as "??:??:??" on every single packet. Falling back to our
-    own clock is honest: the packet is handled as it arrives, so the two are
-    within a second of each other. Marked with "~" to say it was derived here
-    rather than reported.
-    """
-    rx_time = packet.get("rxTime")
-    if rx_time:
-        return datetime.datetime.fromtimestamp(rx_time).strftime("%H:%M:%S")
-    return "~" + datetime.datetime.now().strftime("%H:%M:%S")
-
-
-def _packet_detail(portnum: str, decoded: dict) -> str:
-    """The packet table's rightmost column: a one-line summary per type.
-
-    A summary rather than a dump, because this column is shared with message
-    text and is the first thing squeezed when the pane narrows. Telemetry
-    reports what an operator actually scans for - voltage and battery - and a
-    type with nothing worth summarising leaves it empty instead of filler.
-    """
-    if portnum == "TEXT_MESSAGE_APP":
-        return decoded.get("text", "")
-    if portnum == "TELEMETRY_APP":
-        metrics = (decoded.get("telemetry") or {}).get("deviceMetrics") or {}
-        parts = []
-        if metrics.get("voltage") is not None:
-            parts.append(f"{metrics['voltage']:.2f}V")
-        if metrics.get("batteryLevel") is not None:
-            parts.append(f"{metrics['batteryLevel']}%")
-        return " ".join(parts)
-    if portnum == "NODEINFO_APP":
-        # The long name, because the short one is already the node column.
-        user = decoded.get("user") or {}
-        return user.get("longName") or user.get("shortName") or ""
-    return ""
 
 
 def format_incoming_line(info: dict, sender: str | None = None, markup: bool = True) -> str:
@@ -1530,13 +1420,7 @@ class MeshtasticTUI(ReplyEngine, App):
     #main-row { height: 1fr; }
     #devices-pane, #targets-pane { width: 28; border: solid $accent; }
     #messages-pane { border: solid $accent; }
-    /* Taller than the 8 lines this held when it was only the event log: the
-       packet table now shares it, and the events are what get pushed out if
-       the split leaves either side too short. 5 lines of events is enough to
-       keep a connect/disconnect pair visible while the table scrolls. */
-    #status-pane { height: 16; border: solid $warning; }
-    #status-pane #status-log { height: 5; }
-    #status-pane #packet-table { height: 1fr; }
+    #status-pane { height: 8; border: solid $warning; }
     ListView { height: 1fr; }
     RichLog { height: 1fr; }
     #devices-pane #device-list { height: 1fr; }
@@ -1682,21 +1566,11 @@ class MeshtasticTUI(ReplyEngine, App):
                 yield RichLog(
                     id="status-log", wrap=True, highlight=True, markup=True, min_width=1
                 )
-                yield Label("封包", classes="pane-title")
-                # Every packet the radio hands over, of every port number -
-                # including the ones parse_incoming drops. Kept out of the
-                # message pane on purpose: telemetry arrives constantly on a
-                # busy mesh and would bury the conversation there. This pane
-                # spans the full width, so the columns fit without cutting any.
-                yield DataTable(id="packet-table", cursor_type="row", zebra_stripes=True)
             # One fixed line at the very bottom. A Label rather than another
             # RichLog: this is replaced wholesale every second, not appended to.
             yield Label(id="status-bar")
 
     def on_mount(self) -> None:
-        table = self.query_one("#packet-table", DataTable)
-        for label, width in PACKET_TABLE_COLUMNS:
-            table.add_column(label, width=width)
         pub.subscribe(self.on_receive, "meshtastic.receive")
         pub.subscribe(self.on_config_synced, "meshtastic.connection.established")
         pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
@@ -2265,35 +2139,6 @@ class MeshtasticTUI(ReplyEngine, App):
         now = datetime.datetime.now().strftime("%H:%M:%S")
         self.query_one("#status-log", RichLog).write(f"[dim]{now}[/dim] {line}")
 
-    def _add_packet_row(self, packet: dict) -> None:
-        """Put one raw packet into the packet table, oldest row out at the cap.
-
-        Numbers are formatted here rather than in packet_table_row(), which
-        keeps them as numbers so a caller can compare or sort them; only this
-        pane has to turn them into text. A figure the packet did not carry
-        reads "--", the same marker the node list and status pane use.
-        """
-        nodes = (self.interface.nodes or {}) if self.interface else {}
-        row = packet_table_row(packet, nodes, self.my_id)
-        if row is None:
-            return
-        table = self.query_one("#packet-table", DataTable)
-        table.add_row(
-            row["when"],
-            row["node"],
-            str(row["channel"]),
-            "--" if row["snr"] is None else f"{row['snr']:g}",
-            "--" if row["rssi"] is None else str(row["rssi"]),
-            row["type"],
-            row["hops"],
-            row["detail"],
-        )
-        while table.row_count > PACKET_TABLE_LIMIT:
-            table.remove_row(next(iter(table.rows)))
-        # Follow the tail, the way a log pane does. Without this the newest
-        # packet lands off-screen the moment the table is taller than the pane.
-        table.scroll_end(animate=False)
-
     # ---- the fixed bottom bar ----------------------------------------------
 
     def _status_bar_text(self) -> str:
@@ -2341,10 +2186,6 @@ class MeshtasticTUI(ReplyEngine, App):
         self.packet_count += 1
         self._note_packet()
         self._track_signal(packet)
-        # Ahead of the text-message filter below, and for the same reason the
-        # count is: the packet pane exists to show the traffic parse_incoming
-        # discards. On the app thread, since this runs on the library's.
-        self.call_from_thread(self._add_packet_row, packet)
 
         info = parse_incoming(packet, self.my_id)
         if info is None:
