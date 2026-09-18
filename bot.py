@@ -815,6 +815,10 @@ def local_status_rows(bot) -> list[tuple[str, str, str]]:
     gps_mode = config_pb2.Config.PositionConfig.GpsMode.Name(position_cfg.gps_mode)
 
     rows = [
+        # First, because it is what identifies the node these other figures
+        # describe. In the "!hex" form the target list already uses for every
+        # other node, so the two read the same way.
+        ("節點", "ID", bot.my_id),
         ("節點", "Region", region),
         ("節點", "韌體", bot.firmware_version or "查詢中..."),
         ("節點", "Role", role),

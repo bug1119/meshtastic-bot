@@ -3447,6 +3447,10 @@ def test_local_status_rows():
     rows = bot.local_status_rows(server)
     values = {label: value for _group, label, value in rows}
 
+    # The node's own id, in the "!hex" form the target list already uses for
+    # everyone else - without it the pane never says which node this is, and
+    # the server's startup log did not either.
+    check("the node's own id", values["ID"], "!me")
     check("region as its name, not its number", values["Region"], "TW")
     check("role", values["Role"], "CLIENT")
     check("preset", values["Preset"], "MEDIUM_FAST")
@@ -3501,7 +3505,7 @@ def test_local_status_lines_fold_by_group():
     server, _ = _fake_server("[*]\nping=pong\n", io.StringIO())
     lines = bot.local_status_lines(server)
     check("one line per group", len(lines), 6)
-    check("the node line", lines[0], "節點: Region=TW 韌體=查詢中... Role=CLIENT")
+    check("the node line", lines[0], "節點: ID=!me Region=TW 韌體=查詢中... Role=CLIENT")
     check("every line names its group", all(":" in line for line in lines), True)
     # A group holding a single field named after itself would otherwise read
     # "連線: 連線=BLE Bug2_1ca6".
@@ -3515,7 +3519,7 @@ def test_local_status_is_logged_at_startup():
     server.on_config_synced(server.interface)
     log = out.getvalue()
     for expected in (
-        "節點: Region=TW",
+        "節點: ID=!me Region=TW",
         "無線電: Preset=MEDIUM_FAST",
         "裝置: Uptime=02:42",
         "定位: GPS=無 GPS 模組",
