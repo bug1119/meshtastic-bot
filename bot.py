@@ -2191,9 +2191,21 @@ class MeshtasticTUI(ReplyEngine, App):
 
     # ---- pane 3: messages ---------------------------------------------------
 
-    def _log_system(self, line: str) -> None:
+    def _log_system(self, line: str, to_file: bool = True) -> None:
+        """One line in the status pane, and the same line in --log.
+
+        Marked "system:" in the file, beside the "channel:" and "node:" of the
+        message lines, so either kind can be grepped out of the other. The
+        pane's own HH:MM:SS is left out there; every file line already starts
+        with a full date.
+
+        `to_file` is for the rare line that only duplicates one the file
+        already has.
+        """
         now = datetime.datetime.now().strftime("%H:%M:%S")
         self.query_one("#status-log", RichLog).write(f"[dim]{now}[/dim] {line}")
+        if to_file:
+            self._log_message(f"system: {line}", markup=True)
 
     def _log_message(self, text: str, markup: bool = False) -> None:
         """Append one line to the --log file, if there is one.
@@ -2215,9 +2227,15 @@ class MeshtasticTUI(ReplyEngine, App):
         if self._message_log is None:
             return
         if markup:
+            from rich.errors import MarkupError
             from rich.text import Text
 
-            text = Text.from_markup(text).plain
+            try:
+                text = Text.from_markup(text).plain
+            except MarkupError:
+                # Written as it came rather than dropped: an odd line in the
+                # file beats a missing one, and raising is not an option here.
+                pass
         plain = text
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._message_log_lock:
@@ -2312,7 +2330,9 @@ class MeshtasticTUI(ReplyEngine, App):
             # The status pane keeps the raw id alongside the name: it is the
             # diagnostic view, and names are neither unique nor always present.
             who = sender if sender == info["from_id"] else f"{sender} ({info['from_id']})"
-            self._log_system(f"收到訊息 {kind}:{key} from={who}")
+            # Pane only: on_receive has already written the whole message to
+            # --log, and this notice there would put every message in twice.
+            self._log_system(f"收到訊息 {kind}:{key} from={who}", to_file=False)
 
         self.call_from_thread(update_ui)
 

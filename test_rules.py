@@ -1608,6 +1608,39 @@ def test_tui_log_failure_does_not_stop_replies():
     check("the failure was kept to be reported", "No space left" in (error or ""), True)
 
 
+async def _tui_system_log(path):
+    server, _ = _fake_server("[EDGE_ATS]\nping=pong\n", io.StringIO())
+    app = bot.MeshtasticTUI(log_path=str(path))
+    async with app.run_test() as pilot:
+        app.interface = server.interface
+        app.my_id = "!me"
+        app.target = ("channel", 3)
+        app._log_system("[green]設定同步完成[/green] (my id: !me)")
+        app._log_system("只給狀態窗看的一行", to_file=False)
+        # Markup that does not parse must still reach the file, as written,
+        # rather than raise out of whatever was logging it.
+        app._log_message("[/oops] 壞掉的標籤", markup=True)
+        worker = _tui_on_receive(app, _text_packet("ping", bot.BROADCAST_ADDR, 603))
+        while worker.is_alive():
+            await pilot.pause()
+        await pilot.pause()
+
+
+def test_tui_logs_status_events():
+    print("status pane events go to --log too, marked system:")
+    path = pathlib.Path(tempfile.mkdtemp()) / "mesh.log"
+    asyncio.run(_tui_system_log(path))
+    text = path.read_text(encoding="utf-8")
+    check("an event is there, flattened", "system: 設定同步完成 (my id: !me)" in text, True)
+    check("its markup did not come along", "[green]" in text, False)
+    check("to_file=False stays in the pane", "只給狀態窗看的一行" in text, False)
+    check("unparseable markup is written as-is", "[/oops] 壞掉的標籤" in text, True)
+    # Each message already has its own full line; the pane's one-line notice
+    # of it would put every message in the file twice.
+    check("the message is logged", ": ping" in text, True)
+    check("but its pane notice is not", "收到訊息" in text, False)
+
+
 def test_tui_without_log_writes_nothing():
     print("no --log, no file")
     check("no log file is opened", bot.MeshtasticTUI()._message_log, None)
@@ -4176,6 +4209,7 @@ if __name__ == "__main__":
         test_server_logs_overheard_without_answering()
         test_tui_writes_every_text_message()
         test_tui_log_failure_does_not_stop_replies()
+        test_tui_logs_status_events()
         test_tui_without_log_writes_nothing()
         test_daemon_log_default_is_unchanged()
         test_packet_node_id()
