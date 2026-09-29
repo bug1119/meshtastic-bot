@@ -1030,6 +1030,8 @@ def test_dm_replies():
         # Tallied for the status bar every time a reply goes out.
         sent_auto_count=0,
         interface=types.SimpleNamespace(nodes={}, sendText=lambda t, **k: sent.append((t, k))),
+        # Two replies back to back below; unspaced so both land at once.
+        text_sender=bot.TextSender(interval=0),
     )
     channels = {3: "EDGE_ATS"}
     app._channel_name = lambda i: channels.get(i) or None
@@ -1469,6 +1471,151 @@ def _text_packet(text, to_id, pkt_id, from_num=0xF2DCBABE, from_id="!them", chan
     }
 
 
+class _TimedRadio:
+    """A stand-in interface that records each sendText with when it happened."""
+
+    def __init__(self):
+        self.sent = []
+
+    def sendText(self, text, **kw):
+        self.sent.append((time.monotonic(), text, kw))
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_text_sender_sends_the_first_at_once():
+    print("nothing waiting means the text goes straight to the radio")
+    radio = _TimedRadio()
+    sender = bot.TextSender(interval=0.3)
+    done = []
+    sent_now = sender.send(radio, ("channel", 3), "Hi", on_sent=lambda: done.append(1))
+    check("sent inline", sent_now, True)
+    check("already on the radio", [t for _, t, _ in radio.sent], ["Hi"])
+    check("to the channel", radio.sent[0][2], {"channelIndex": 3})
+    check("on_sent ran", done, [1])
+    sender.stop()
+
+
+def test_text_sender_spaces_the_ones_after():
+    print("a text inside the interval waits its turn instead of being sent")
+    # The firmware drops a text a client hands it within two seconds of the
+    # last (PhoneAPI.cpp, TWO_SECONDS_MS). Sent anyway, it is acknowledged over
+    # BLE and then silently never transmitted - which is how a typed "Hi" went
+    # out and its auto-reply did not.
+    radio = _TimedRadio()
+    sender = bot.TextSender(interval=0.3)
+    sender.send(radio, ("channel", 3), "Hi")
+    queued = sender.send(radio, ("channel", 3), "BOT: Hello")
+    sender.send(radio, ("node", "!them"), "third")
+    check("the second is queued, not sent", queued, False)
+    check("and the call did not wait for it", len(radio.sent), 1)
+    _wait_for(lambda: len(radio.sent) == 3)
+    check("all three went out, in order", [t for _, t, _ in radio.sent], ["Hi", "BOT: Hello", "third"])
+    gaps = [b[0] - a[0] for a, b in zip(radio.sent, radio.sent[1:])]
+    check("each at least the interval apart", all(g >= 0.29 for g in gaps), True)
+    check("a DM still goes as a DM", radio.sent[2][2], {"destinationId": "!them"})
+    sender.stop()
+
+
+def test_text_sender_reports_failures():
+    print("a send that fails is reported, and never counted as sent")
+    sender = bot.TextSender(interval=0.3)
+
+    class Refuses:
+        def sendText(self, text, **kw):
+            raise OSError("Encryption is insufficient.")
+
+    # Inline: raised to the caller, which already turns it into a log line.
+    raised = False
+    try:
+        sender.send(Refuses(), ("channel", 3), "Hi", on_sent=lambda: None)
+    except OSError:
+        raised = True
+    check("an inline failure is raised", raised, True)
+
+    # Queued: nobody is waiting to catch it, so the callback carries it.
+    counted, failures = [], []
+    sender.send(
+        Refuses(), ("channel", 3), "again",
+        on_sent=lambda: counted.append(1), on_failed=failures.append,
+    )
+    _wait_for(lambda: failures)
+    check("a queued failure reaches on_failed", [str(e) for e in failures], ["Encryption is insufficient."])
+    check("and was not counted", counted, [])
+    sender.stop()
+
+
+def test_typed_message_and_its_reply_both_go_out():
+    print("typing a keyword in the TUI sends it and its reply, spaced apart")
+    original = bot.TEXT_SEND_SPACING
+    bot.TEXT_SEND_SPACING = 0.3
+    try:
+        sent = asyncio.run(_tui_typed_keyword())
+    finally:
+        bot.TEXT_SEND_SPACING = original
+    check("both reached the radio", [t.splitlines()[0] for _, t, _ in sent], ["Hi", "BOT: Hello"])
+    check("spaced by the interval", sent[1][0] - sent[0][0] >= 0.29, True)
+
+
+async def _tui_typed_keyword():
+    from textual.widgets import Input
+
+    server, _ = _fake_server("[*]\nHi=Hello\n", io.StringIO())
+    radio = _TimedRadio()
+    server.interface.sendText = radio.sendText
+    app = bot.MeshtasticTUI()
+    async with app.run_test() as pilot:
+        app.interface = server.interface
+        app.my_id = "!me"
+        app.target = ("channel", 3)
+        box = app.query_one("#send-box", Input)
+        box.disabled = False
+        box.value = "Hi"
+        box.focus()
+        await pilot.press("enter")
+        deadline = time.monotonic() + 5
+        while len(radio.sent) < 2 and time.monotonic() < deadline:
+            await pilot.pause(0.05)
+    return radio.sent
+
+
+def test_rate_limit_notice():
+    print("the firmware's rate-limit refusal is recognised")
+    def routing(reason, from_id="!me"):
+        return {
+            "decoded": {"portnum": "ROUTING_APP", "requestId": 4242,
+                        "routing": {"errorReason": reason}},
+            "fromId": from_id,
+        }
+
+    call = bot.rate_limit_notice
+    check("our own refusal is reported", call(routing("RATE_LIMIT_EXCEEDED"), "!me") is not None, True)
+    check("and names the request", "4242" in call(routing("RATE_LIMIT_EXCEEDED"), "!me"), True)
+    check("other routing errors are not", call(routing("NO_RESPONSE"), "!me"), None)
+    check("a text is not", call(_text_packet("hi", bot.BROADCAST_ADDR, 1), "!me"), None)
+    # Another node's routing error is its business, not a message we lost.
+    check("another node's is not", call(routing("RATE_LIMIT_EXCEEDED", "!them"), "!me"), None)
+
+
+def test_server_logs_a_rate_limit_refusal():
+    print("the server says when the firmware dropped one of its texts")
+    out = io.StringIO()
+    server, sent = _fake_server("[*]\nping=pong\n", out)
+    server.on_receive(
+        {"decoded": {"portnum": "ROUTING_APP", "requestId": 99,
+                     "routing": {"errorReason": "RATE_LIMIT_EXCEEDED"}},
+         "fromId": "!me", "from": 1},
+        server.interface,
+    )
+    check("it is in the log", "限流" in out.getvalue(), True)
+    check("nothing was sent in answer", sent, [])
+
+
 def test_parse_incoming_overheard():
     print("a DM between two other nodes is returned only when asked for")
     third_party = _text_packet("private", "!someone-else", 2, from_id="!them")
@@ -1778,6 +1925,10 @@ def _fake_server(rules, out):
         sendText=lambda text, **kw: sent.append((text, kw)),
         getMyUser=lambda: {"id": "!me", "longName": "BUG1119", "shortName": "BUG1"},
     )
+    # No spacing, so every send happens inline and the tests built on this can
+    # check `sent` straight after on_receive. The spacing itself is tested
+    # separately, with a real interval - see test_text_sender_*.
+    server.text_sender = bot.TextSender(interval=0)
     return server, sent
 
 
@@ -4203,6 +4354,12 @@ if __name__ == "__main__":
         test_distance()
         test_distance_to()
         test_reply_text()
+        test_text_sender_sends_the_first_at_once()
+        test_text_sender_spaces_the_ones_after()
+        test_text_sender_reports_failures()
+        test_typed_message_and_its_reply_both_go_out()
+        test_rate_limit_notice()
+        test_server_logs_a_rate_limit_refusal()
         test_parse_incoming_overheard()
         test_overheard_is_never_answered()
         test_target_log_label()

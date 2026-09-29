@@ -922,6 +922,144 @@ def build_reply_text(reply: str, info: dict) -> str:
     return f"{BOT_REPLY_PREFIX}{reply}\n[{' '.join(bits)}]"
 
 
+# The shortest gap between two texts handed to the radio. The firmware refuses a
+# TEXT_MESSAGE_APP from a client within two seconds of the previous one
+# (PhoneAPI::handleToRadioPacket, TWO_SECONDS_MS): the BLE write is still
+# acknowledged, so sendText returns as if it worked, and the only trace is a
+# RATE_LIMIT_EXCEEDED routing error sent back. A typed keyword and its reply,
+# sent milliseconds apart, lost the reply every time. The extra 0.2s covers the
+# two clocks not agreeing on exactly when "two seconds" began.
+TEXT_SEND_SPACING = 2.2
+
+
+class TextSender:
+    """Hands texts to the radio no closer together than the firmware accepts.
+
+    A text is sent inline when nothing is waiting and the interval has passed -
+    which is the common case, and exactly what happened before this existed -
+    and queued for a worker thread otherwise. Queued rather than slept on,
+    because the callers cannot afford to wait: on_receive runs inside the
+    library's receive loop, where blocking stalls every packet behind it, and
+    the TUI's send box runs on the app thread, where it would freeze the UI.
+
+    One sender per front end, shared by typed messages and auto-replies, so the
+    spacing holds between the two - which is the case that was losing replies.
+    """
+
+    def __init__(self, interval: float | None = None, clock=time.monotonic) -> None:
+        self.interval = TEXT_SEND_SPACING if interval is None else interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._queue: collections.deque = collections.deque()
+        self._wake = threading.Condition(self._lock)
+        self._last_sent: float | None = None
+        self._worker: threading.Thread | None = None
+        self._stopped = False
+
+    def send(self, interface, target: tuple, text: str, on_sent=None, on_failed=None) -> bool:
+        """Send `text` to `target` now if allowed, else queue it. True if sent now.
+
+        An inline failure is raised, as sendText's own would be, so the caller's
+        existing error handling still applies. A queued one has no caller left
+        to raise to, so it goes to `on_failed`. `on_sent` runs only once the
+        radio has actually taken the text, inline or later, so a counter fed by
+        it never claims a send that failed.
+        """
+        with self._lock:
+            ready = not self._queue and (
+                self._last_sent is None or self._clock() - self._last_sent >= self.interval
+            )
+            if ready:
+                # Held across the send, so a queued text cannot slip in between
+                # the check and the write and land inside the interval.
+                try:
+                    self._transmit(interface, target, text)
+                finally:
+                    # Even on failure, for the reason given in _drain.
+                    self._last_sent = self._clock()
+            else:
+                self._queue.append((interface, target, text, on_sent, on_failed))
+                self._start_worker()
+                self._wake.notify()
+        if ready and on_sent is not None:
+            on_sent()
+        return ready
+
+    def stop(self) -> None:
+        """Let the worker exit. Anything still queued is dropped - the link is
+        going away, and a text sent after the operator quit is worse than none."""
+        with self._lock:
+            self._stopped = True
+            self._queue.clear()
+            self._wake.notify()
+
+    @staticmethod
+    def _transmit(interface, target: tuple, text: str) -> None:
+        kind, key = target
+        if kind == "channel":
+            interface.sendText(text, channelIndex=key)
+        else:
+            interface.sendText(text, destinationId=key)
+
+    def _start_worker(self) -> None:
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = threading.Thread(target=self._drain, daemon=True)
+            self._worker.start()
+
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                while not self._queue and not self._stopped:
+                    self._wake.wait()
+                if self._stopped:
+                    return
+                if self._last_sent is not None:
+                    remaining = self._last_sent + self.interval - self._clock()
+                    if remaining > 0:
+                        # Waiting on the condition, not sleeping, so stop()
+                        # can end the wait instead of outliving it.
+                        self._wake.wait(remaining)
+                        continue
+                interface, target, text, on_sent, on_failed = self._queue.popleft()
+                try:
+                    self._transmit(interface, target, text)
+                except Exception as exc:  # noqa: BLE001
+                    failed = exc
+                else:
+                    failed = None
+                # Counted even when it failed: the firmware's two seconds run
+                # from what it was handed, and a failed write may have been.
+                self._last_sent = self._clock()
+            # Callbacks outside the lock, since they log and may take their time.
+            if failed is None:
+                if on_sent is not None:
+                    on_sent()
+            elif on_failed is not None:
+                on_failed(failed)
+
+
+def rate_limit_notice(packet: dict, my_id: str | None) -> str | None:
+    """A line to log if this packet is the firmware refusing one of our texts.
+
+    What the firmware sends back when it rate-limits a client's text is a
+    ROUTING_APP packet from the local node carrying RATE_LIMIT_EXCEEDED - and
+    nothing else, since the notification it once showed is commented out. With
+    TextSender spacing sends this should never appear; if it does, it is the
+    only evidence that a text the bot believes it sent never left the radio.
+    """
+    decoded = packet.get("decoded") or {}
+    if decoded.get("portnum") != "ROUTING_APP":
+        return None
+    if (decoded.get("routing") or {}).get("errorReason") != "RATE_LIMIT_EXCEEDED":
+        return None
+    if my_id and packet_node_id(packet, "fromId", "from") != my_id:
+        return None
+    return (
+        f"固件限流:2 秒內送出第二則文字,被丟棄沒有發出 "
+        f"(request id={decoded.get('requestId')})"
+    )
+
+
 class ReplyEngine:
     """The rules engine, shared by the TUI and the headless server.
 
@@ -1184,6 +1322,23 @@ class ReplyEngine:
             return False
         return True
 
+    def _text_sender(self) -> TextSender:
+        """The one TextSender every text from this front end goes through.
+
+        Made on first use rather than in __init__ because ReplyEngine has no
+        __init__ of its own - the TUI and the server each build their state -
+        and a test's stand-in can hand one in by setting `text_sender`.
+        """
+        sender = getattr(self, "text_sender", None)
+        if sender is None:
+            sender = self.text_sender = TextSender()
+        return sender
+
+    def _send_failed(self, note: str) -> None:
+        """Report a queued send that failed. Front ends override this; a queued
+        failure happens on the sender's thread, after the caller has returned,
+        so it cannot come back as a return value the way an inline one does."""
+
     def _remember_reply(
         self,
         from_id: str,
@@ -1250,19 +1405,28 @@ class ReplyEngine:
         # can fail on its own (a link whose notifications never subscribed, a
         # node that went away mid-exchange) and that has to look like a
         # failure, not like silence.
-        try:
-            if kind == "channel":
-                interface.sendText(full_reply, channelIndex=key)
-            else:
-                interface.sendText(full_reply, destinationId=key)
-        except Exception as exc:  # noqa: BLE001
-            where = f"channel:{key}" if kind == "channel" else f"node:{key}"
+        where = f"channel:{key}" if kind == "channel" else f"node:{key}"
+
+        def failure_note(exc) -> str:
             note = f"  -> 回覆送出失敗 ({where}): {type(exc).__name__}: {exc}"
+            return f"[red]{note}[/red]" if self.MARKUP else note
+
+        def counted() -> None:
+            self.sent_auto_count += 1
+
+        try:
+            # Through the shared sender, so a reply cannot follow another text
+            # inside the firmware's two-second window and be silently dropped.
+            ReplyEngine._text_sender(self).send(
+                interface, target, full_reply,
+                on_sent=counted,
+                on_failed=lambda exc: self._send_failed(failure_note(exc)),
+            )
+        except Exception as exc:  # noqa: BLE001
             # Returned rather than logged here, matching how the success line
             # travels: the caller owns the log, and the TUI needs markup where
             # the server must not have it.
-            return f"[red]{note}[/red]" if self.MARKUP else note
-        self.sent_auto_count += 1
+            return failure_note(exc)
         ReplyEngine._remember_reply(self, from_id, packet_id, rx_time, text)
 
         # The sent text carries literal brackets and a newline. For the TUI the
@@ -1951,6 +2115,10 @@ class ServerBot(ReplyEngine):
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"{stamp} {text}", file=self._out or sys.stdout, flush=True)
 
+    def _send_failed(self, note: str) -> None:
+        # A plain stream, safe from any thread; no marshalling needed.
+        self.log(note)
+
     # ---- link -------------------------------------------------------------
 
     def _adopt(self, interface, transport: str) -> None:
@@ -2133,6 +2301,10 @@ class ServerBot(ReplyEngine):
         # Before the text filter, for the reason the TUI does the same.
         self.packet_count += 1
         self._note_packet()
+        notice = rate_limit_notice(packet, self.my_id)
+        if notice:
+            self.log(notice)
+            return
         info = parse_incoming(packet, self.my_id, include_overheard=True)
         if info is None:
             return
@@ -2235,6 +2407,8 @@ class ServerBot(ReplyEngine):
         # can hang exactly like a BLE one.
         if self.mqtt is not None:
             self.mqtt.stop()
+        if getattr(self, "text_sender", None) is not None:
+            self.text_sender.stop()
         if pending is not None and pending is not interface:
             self._release_link(pending)
         closer = threading.Thread(
