@@ -394,6 +394,8 @@ def test_packet_count():
         # on_receive hands its UI work off; running it is not what is under test.
         app.call_from_thread = lambda fn, *a: None
         app._should_auto_reply = lambda info: False
+        # --log is off here; test_tui_writes_every_text_message covers it.
+        app._log_message = lambda text, markup=False: None
         return app
 
     # A position packet carries no text, so parse_incoming returns None and
@@ -1465,6 +1467,155 @@ def _text_packet(text, to_id, pkt_id, from_num=0xF2DCBABE, from_id="!them", chan
         "rxSnr": 6.5,
         "rxRssi": -92,
     }
+
+
+def test_parse_incoming_overheard():
+    print("a DM between two other nodes is returned only when asked for")
+    third_party = _text_packet("private", "!someone-else", 2, from_id="!them")
+    # The default is what the reply path relies on, so it must not move.
+    check("still ignored by default", bot.parse_incoming(third_party, "!me"), None)
+    info = bot.parse_incoming(third_party, "!me", include_overheard=True)
+    check("returned when asked for", info is not None, True)
+    check("and marked as overheard", info["overheard"], True)
+    check("both ends are kept", (info["from_id"], info["to_id"]), ("!them", "!someone-else"))
+    normal = bot.parse_incoming(_text_packet("ping", bot.BROADCAST_ADDR, 3), "!me")
+    check("an ordinary message is not overheard", normal["overheard"], False)
+
+
+def test_overheard_is_never_answered():
+    print("overhearing someone else's DM never earns a reply")
+    # A second gate behind on_receive's early return: answering would intrude
+    # on an exchange between two other people, and it must stay impossible
+    # even if a caller forgets to check the flag first.
+    engine = types.SimpleNamespace(my_id="!me", _replied_ids={})
+    info = bot.parse_incoming(
+        _text_packet("ping", "!someone-else", 4, from_id="!them"), "!me", include_overheard=True
+    )
+    check("refused", bot.ReplyEngine._should_auto_reply(engine, info), False)
+
+
+def test_target_log_label():
+    print("log lines name a channel by index and name, a node by id")
+    server, _ = _fake_server("[*]\nping=pong\n", io.StringIO())
+    call = bot.target_log_label
+    check("a named channel", call(server.interface, ("channel", 3)), "channel:3(EDGE_ATS)")
+    check("an unnamed channel", call(server.interface, ("channel", 0)), "channel:0")
+    check("a node", call(server.interface, ("node", "!them")), "node:!them")
+
+
+def test_server_logs_overheard_without_answering():
+    print("the server logs an overheard DM and does not answer it")
+    out = io.StringIO()
+    server, sent = _fake_server("[*]\nprivate=gotcha\n", out)
+    server.on_receive(_text_packet("private", "!someone-else", 5, from_id="!them"), server.interface)
+    log = out.getvalue()
+    check("it is logged", "overheard:!them->!someone-else" in log, True)
+    check("with its text", "private" in log, True)
+    check("nothing was sent", sent, [])
+    # Not addressed to us, so it is not something we received.
+    check("not counted as received", server.received_count, 0)
+
+
+def _tui_on_receive(app, packet):
+    """Run on_receive from a real thread, the way the library calls it.
+
+    call_from_thread refuses to run on the app's own thread, so calling
+    on_receive directly from a test would exercise a path production never
+    takes.
+    """
+    worker = threading.Thread(target=app.on_receive, args=(packet, app.interface))
+    worker.start()
+    return worker
+
+
+async def _tui_message_log(path):
+    from textual.widgets import Input
+
+    server, sent = _fake_server("[EDGE_ATS]\nping=pong\n", io.StringIO())
+    app = bot.MeshtasticTUI(log_path=str(path))
+    async with app.run_test() as pilot:
+        app.interface = server.interface
+        app.my_id = "!me"
+        # Looking at a different channel on purpose: the message pane filters
+        # on the current target, and the file must not.
+        app.target = ("channel", 0)
+        worker = _tui_on_receive(app, _text_packet("ping", bot.BROADCAST_ADDR, 601))
+        while worker.is_alive():
+            await pilot.pause()
+
+        app.target = ("channel", 3)
+        box = app.query_one("#send-box", Input)
+        box.disabled = False
+        box.value = "hello"
+        box.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+    return sent
+
+
+def test_tui_writes_every_text_message():
+    print("the TUI appends received, replied and typed messages to --log")
+    path = pathlib.Path(tempfile.mkdtemp()) / "mesh.log"
+    sent = asyncio.run(_tui_message_log(path))
+    text = path.read_text(encoding="utf-8")
+    check("the reply still went out", len(sent) >= 1, True)
+    check("the received message is there", "channel:3(EDGE_ATS)" in text and ": ping" in text, True)
+    check("so is the auto-reply", "-> auto-reply: BOT: pong" in text, True)
+    # Plain text, the same as the server's log, not the RichLog's markup.
+    check("no markup reached the file", "[yellow]" in text or "\\[" in text, False)
+    # And the reverse: plain lines are not parsed as markup, or the sender's
+    # "[!id]" would vanish as if it were a style tag.
+    check("the sender id bracket survives", "Bug2[!them]" in text, True)
+    check("and so is what was typed", "channel:3(EDGE_ATS)" in text and "me: hello" in text, True)
+    # Full dates, like the server: a file is read days later.
+    first = text.splitlines()[0]
+    check("lines carry a full date", len(first) > 19 and first[4] == "-" and first[10] == " ", True)
+
+
+class _BrokenLog:
+    def write(self, _text):
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+async def _tui_log_failure(path):
+    server, sent = _fake_server("[EDGE_ATS]\nping=pong\n", io.StringIO())
+    app = bot.MeshtasticTUI(log_path=str(path))
+    async with app.run_test() as pilot:
+        app.interface = server.interface
+        app.my_id = "!me"
+        app.target = ("channel", 3)
+        app._message_log.close()
+        app._message_log = _BrokenLog()
+        worker = _tui_on_receive(app, _text_packet("ping", bot.BROADCAST_ADDR, 602))
+        while worker.is_alive():
+            await pilot.pause()
+        worker.join()
+        error = app._message_log_error
+    return sent, error
+
+
+def test_tui_log_failure_does_not_stop_replies():
+    print("a log file that cannot be written must not stop the bot answering")
+    path = pathlib.Path(tempfile.mkdtemp()) / "mesh.log"
+    sent, error = asyncio.run(_tui_log_failure(path))
+    check("the reply still went out", len(sent), 1)
+    check("the failure was kept to be reported", "No space left" in (error or ""), True)
+
+
+def test_tui_without_log_writes_nothing():
+    print("no --log, no file")
+    check("no log file is opened", bot.MeshtasticTUI()._message_log, None)
+
+
+def test_daemon_log_default_is_unchanged():
+    print("--daemon still writes to meshtastic-bot.log when --log is not given")
+    check("the fallback", bot.DEFAULT_DAEMON_LOG, "meshtastic-bot.log")
 
 
 def test_packet_node_id():
@@ -4019,6 +4170,14 @@ if __name__ == "__main__":
         test_distance()
         test_distance_to()
         test_reply_text()
+        test_parse_incoming_overheard()
+        test_overheard_is_never_answered()
+        test_target_log_label()
+        test_server_logs_overheard_without_answering()
+        test_tui_writes_every_text_message()
+        test_tui_log_failure_does_not_stop_replies()
+        test_tui_without_log_writes_nothing()
+        test_daemon_log_default_is_unchanged()
         test_packet_node_id()
         test_format_plain()
         test_server_bot_replies()

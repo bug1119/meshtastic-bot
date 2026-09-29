@@ -241,6 +241,15 @@ sub(
 ''',
     "",
 )
+# The server has no UI to log messages from; --log is only where --daemon writes.
+sub(
+    '''        help="in the UI, record every text message here: received, replied, "
+        "typed, and DMs overheard between other nodes. With --daemon, where "
+        f"the server writes (default: {DEFAULT_DAEMON_LOG}). Appended to, "
+        "never truncated.",''',
+    '''        help="where --daemon writes "
+        f"(default: {DEFAULT_DAEMON_LOG}). Appended to, never truncated.",''',
+)
 sub(
     '''    if args.server:
         target = resolve_server_target(args.host, args.port, args.ble)
@@ -251,7 +260,7 @@ sub(
             sys.exit(
                 spawn_detached(
                     detached_argv(target, args.here, args.heartbeat, args.mqtt),
-                    Path(args.log),
+                    Path(args.log or DEFAULT_DAEMON_LOG),
                 )
             )
         sys.exit(
@@ -266,6 +275,7 @@ sub(
         here=args.here,
         ble_address=args.ble,
         mqtt=args.mqtt,
+        log_path=args.log,
     ).run()''',
     '''    target = resolve_server_target(args.host, args.port, args.ble)
     if target is None:
@@ -275,7 +285,7 @@ sub(
         sys.exit(
             spawn_detached(
                 detached_argv(target, args.here, args.heartbeat, args.mqtt),
-                Path(args.log),
+                Path(args.log or DEFAULT_DAEMON_LOG),
             )
         )
     sys.exit(

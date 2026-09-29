@@ -676,13 +676,20 @@ def packet_node_id(packet: dict, id_key: str, num_key: str) -> str | None:
     return None
 
 
-def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
+def parse_incoming(
+    packet: dict, my_id: str | None, include_overheard: bool = False
+) -> dict | None:
     """Return a dict of the fields we care about for a text-message packet, or None.
 
     target is a (kind, key) tuple: ("channel", index) for a broadcast, or
     ("node", other_party_id) for a direct message - key is always the *other*
     side of the conversation, whether this packet was incoming or our own
     outgoing echo.
+
+    A DM between two other nodes is None unless `include_overheard` asks for
+    it, and then comes back with "overheard" set and ("node", to_id) as its
+    target. Opt-in because the reply path shares this function and must never
+    see one; only the message log asks.
     """
     decoded = packet.get("decoded")
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
@@ -703,13 +710,17 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
 
     to_id = packet_node_id(packet, "toId", "to") or BROADCAST_ADDR
     from_id = packet_node_id(packet, "fromId", "from") or "?"
+    overheard = False
     if to_id == BROADCAST_ADDR:
         target = ("channel", packet.get("channel", 0))
-    else:
+    elif my_id and from_id != my_id and to_id != my_id:
         # A routed packet between two other nodes is not our DM. Radios may
         # overhear and decode it, but answering would intrude on their exchange.
-        if my_id and from_id != my_id and to_id != my_id:
+        if not include_overheard:
             return None
+        overheard = True
+        target = ("node", to_id)
+    else:
         other = to_id if from_id == my_id else from_id
         target = ("node", other)
 
@@ -727,7 +738,18 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
         "snr": packet.get("rxSnr"),
         "rssi": packet.get("rxRssi"),
         "id": packet.get("id"),
+        "overheard": overheard,
     }
+
+
+def target_log_label(interface, target: tuple) -> str:
+    """How a log line names where a message was: "channel:3(EDGE_ATS)", "node:!x".
+
+    Shared so the server's log and the TUI's --log file name things the same
+    way, and one can be grepped with what worked on the other.
+    """
+    kind, key = target
+    return f"{kind}:{channel_label(interface, key) if kind == 'channel' else key}"
 
 
 def node_label(nodes: dict, node_id: str) -> str:
@@ -1259,7 +1281,15 @@ class ReplyEngine:
 
         And only once per packet, since the mesh redelivers the same message via
         rebroadcast or the MQTT bridge.
+
+        Ahead of all three, never answer a DM overheard between two other
+        nodes. on_receive returns before getting here for one, so this is the
+        second gate rather than the only one - answering would intrude on
+        someone else's exchange, which is worth refusing twice.
         """
+        if info.get("overheard"):
+            return False
+
         if info["text"].lstrip().startswith(BOT_REPLY_PREFIX):
             return False
 
@@ -1456,8 +1486,27 @@ class MeshtasticTUI(ReplyEngine, App):
         here: tuple[float, float] | None = None,
         ble_address: str | None = None,
         mqtt: bool = False,
+        log_path: str | None = None,
     ) -> None:
         super().__init__()
+        # --log: every text message, appended in the server's own line format,
+        # so the two logs grep alike. Only when asked for - starting the UI
+        # should not leave a file behind in whatever directory it ran from.
+        #
+        # Opened once, line-buffered, rather than per message: this is written
+        # from inside the library's receive loop, which is the one place where
+        # doing more work per packet has already cost a working bot once.
+        self._message_log = (
+            open(os.path.expanduser(log_path), "a", encoding="utf-8", buffering=1)
+            if log_path
+            else None
+        )
+        # Written from the library's thread and the app's, so one lock.
+        self._message_log_lock = threading.Lock()
+        # A write that fails is kept here and reported once from the app
+        # thread; see _log_message for why it is not reported where it happens.
+        self._message_log_error: str | None = None
+        self._message_log_error_shown = False
         # Off unless asked for, the same as the server: starting it would put a
         # mesh the operator may think of as private onto whatever broker the
         # device happens to name, and an unchanged device names the public one.
@@ -1598,6 +1647,9 @@ class MeshtasticTUI(ReplyEngine, App):
         # can hang exactly as a BLE close can.
         if self.mqtt is not None:
             self.mqtt.stop()
+        if self._message_log is not None:
+            with self._message_log_lock:
+                self._message_log.close()
         if self.interface:
             # BLEInterface registers its own atexit hook (self._exit_handler)
             # that also calls the same no-timeout disconnect - if the
@@ -2143,6 +2195,45 @@ class MeshtasticTUI(ReplyEngine, App):
         now = datetime.datetime.now().strftime("%H:%M:%S")
         self.query_one("#status-log", RichLog).write(f"[dim]{now}[/dim] {line}")
 
+    def _log_message(self, text: str, markup: bool = False) -> None:
+        """Append one line to the --log file, if there is one.
+
+        `markup` says `text` is Rich markup - an auto-reply line arrives built
+        for the message pane - and it is then flattened to what the pane shows,
+        so the file matches the server's plain log. Everything else is passed
+        in plain and must stay untouched: a sender reads "Bug2[!f2dcbabe]",
+        and parsed as markup that bracket would vanish as a style tag.
+
+        Safe from any thread, and never raises. It is called from inside the
+        library's receive loop, where an exception escapes into a thread that
+        swallows it and takes the rest of on_receive - the reply included -
+        with it. A failed write is therefore only recorded, and reported from
+        the app thread by _report_message_log_error; reporting it from here
+        would mean call_from_thread, which is exactly the kind of extra work in
+        that loop this is written to avoid.
+        """
+        if self._message_log is None:
+            return
+        if markup:
+            from rich.text import Text
+
+            text = Text.from_markup(text).plain
+        plain = text
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._message_log_lock:
+            try:
+                self._message_log.write(f"{stamp} {plain}\n")
+            except (OSError, ValueError) as exc:
+                # ValueError is a write to a file already closed at shutdown.
+                if self._message_log_error is None:
+                    self._message_log_error = f"{type(exc).__name__}: {exc}"
+
+    def _report_message_log_error(self) -> None:
+        """Say once, on the app thread, that --log stopped being written."""
+        if self._message_log_error and not self._message_log_error_shown:
+            self._message_log_error_shown = True
+            self._log_system(f"[red]--log 寫入失敗,之後的訊息不會記錄: {self._message_log_error}[/red]")
+
     # ---- the fixed bottom bar ----------------------------------------------
 
     def _status_bar_text(self) -> str:
@@ -2179,6 +2270,8 @@ class MeshtasticTUI(ReplyEngine, App):
 
     def _render_status_bar(self) -> None:
         self.query_one("#status-bar", Label).update(self._status_bar_text())
+        # Piggybacks on the one-second tick, which is already on the app thread.
+        self._report_message_log_error()
 
     def on_receive(self, packet, interface) -> None:
         if getattr(self, "interface", None) is None:
@@ -2191,10 +2284,19 @@ class MeshtasticTUI(ReplyEngine, App):
         self._note_packet()
         self._track_signal(packet)
 
-        info = parse_incoming(packet, self.my_id)
+        info = parse_incoming(packet, self.my_id, include_overheard=True)
         if info is None:
             return
         sender = node_label(interface.nodes or {}, info["from_id"])
+        plain = format_incoming_line(info, sender, markup=False)
+        if info["overheard"]:
+            # For the file only: not our conversation, so it has no pane to
+            # land in, and it is never counted or answered.
+            self._log_message(f"overheard:{info['from_id']}->{info['to_id']} {plain}")
+            return
+        # Here on the library's thread, not through call_from_thread: the file
+        # records every message whatever the pane happens to be showing.
+        self._log_message(f"{target_log_label(interface, info['target'])} {plain}")
         line = format_incoming_line(info, sender)
         self.history.setdefault(info["target"], []).append(line)
         # Counted here, on the library's thread: the status bar only ever reads
@@ -2230,6 +2332,9 @@ class MeshtasticTUI(ReplyEngine, App):
                 rx_time=info.get("rx_time"),
             )
         if reply_line:
+            # Built for the pane, so markup - which is why it says so.
+            self._log_message(reply_line, markup=True)
+
             def update_ui2():
                 if info["target"] == self.target:
                     self.query_one("#log", RichLog).write(reply_line)
@@ -2259,6 +2364,9 @@ class MeshtasticTUI(ReplyEngine, App):
         line = f"[dim]{now}[/dim] [bold cyan]me[/bold cyan]: {text}"
         self.history.setdefault(self.target, []).append(line)
         self.query_one("#log", RichLog).write(line)
+        # Built plain rather than flattened from `line`: what was typed is the
+        # operator's text, and a "[" in it is a bracket, not a style tag.
+        self._log_message(f"{target_log_label(self.interface, self.target)} {now} me: {text}")
         self.sent_typed_count += 1
         self._render_status_bar()
 
@@ -2276,6 +2384,7 @@ class MeshtasticTUI(ReplyEngine, App):
             )
             if reply_line:
                 self.query_one("#log", RichLog).write(reply_line)
+                self._log_message(reply_line, markup=True)
 
     # ---- pane navigation (arrow keys) ------------------------------------
 
@@ -3181,13 +3290,23 @@ class ServerBot(ReplyEngine):
         # Before the text filter, for the reason the TUI does the same.
         self.packet_count += 1
         self._note_packet()
-        info = parse_incoming(packet, self.my_id)
+        info = parse_incoming(packet, self.my_id, include_overheard=True)
         if info is None:
             return
         sender = node_label(interface.nodes or {}, info["from_id"])
-        kind, key = info["target"]
-        label = channel_label(interface, key) if kind == "channel" else key
-        self.log(f"{kind}:{label} {format_incoming_line(info, sender, markup=False)}")
+        if info["overheard"]:
+            # Logged, so the record is of every text message the radio heard,
+            # and nothing else: not addressed to us, so not counted as
+            # received and never answered.
+            self.log(
+                f"overheard:{info['from_id']}->{info['to_id']} "
+                f"{format_incoming_line(info, sender, markup=False)}"
+            )
+            return
+        self.log(
+            f"{target_log_label(interface, info['target'])} "
+            f"{format_incoming_line(info, sender, markup=False)}"
+        )
         if info["from_id"] != self.my_id:
             self.received_count += 1
         if not self._should_auto_reply(info):
@@ -3473,6 +3592,12 @@ def detached_argv(
     return argv
 
 
+# Where --daemon writes when --log is not given. A constant rather than the
+# argparse default because that default has to be None: the UI logs only when
+# asked, and could not otherwise tell "asked for this file" from "said nothing".
+DEFAULT_DAEMON_LOG = "meshtastic-bot.log"
+
+
 def spawn_detached(argv: list[str], log_path: Path) -> int:
     """Start `argv` in its own session, output appended to `log_path`.
 
@@ -3555,9 +3680,13 @@ def main() -> None:
     parser.add_argument(
         "--log",
         metavar="PATH",
-        default="meshtastic-bot.log",
-        help="where --daemon writes. Appended to, never truncated. "
-        "(default: %(default)s)",
+        # None rather than the daemon's file, so the UI can tell whether it was
+        # asked to log at all - see DEFAULT_DAEMON_LOG.
+        default=None,
+        help="in the UI, record every text message here: received, replied, "
+        "typed, and DMs overheard between other nodes. With --daemon, where "
+        f"the server writes (default: {DEFAULT_DAEMON_LOG}). Appended to, "
+        "never truncated.",
     )
     parser.add_argument(
         "--heartbeat",
@@ -3624,7 +3753,7 @@ def main() -> None:
             sys.exit(
                 spawn_detached(
                     detached_argv(target, args.here, args.heartbeat, args.mqtt),
-                    Path(args.log),
+                    Path(args.log or DEFAULT_DAEMON_LOG),
                 )
             )
         sys.exit(
@@ -3639,6 +3768,7 @@ def main() -> None:
         here=args.here,
         ble_address=args.ble,
         mqtt=args.mqtt,
+        log_path=args.log,
     ).run()
 
 

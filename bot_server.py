@@ -554,13 +554,20 @@ def packet_node_id(packet: dict, id_key: str, num_key: str) -> str | None:
     return None
 
 
-def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
+def parse_incoming(
+    packet: dict, my_id: str | None, include_overheard: bool = False
+) -> dict | None:
     """Return a dict of the fields we care about for a text-message packet, or None.
 
     target is a (kind, key) tuple: ("channel", index) for a broadcast, or
     ("node", other_party_id) for a direct message - key is always the *other*
     side of the conversation, whether this packet was incoming or our own
     outgoing echo.
+
+    A DM between two other nodes is None unless `include_overheard` asks for
+    it, and then comes back with "overheard" set and ("node", to_id) as its
+    target. Opt-in because the reply path shares this function and must never
+    see one; only the message log asks.
     """
     decoded = packet.get("decoded")
     if not decoded or decoded.get("portnum") != "TEXT_MESSAGE_APP":
@@ -581,13 +588,17 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
 
     to_id = packet_node_id(packet, "toId", "to") or BROADCAST_ADDR
     from_id = packet_node_id(packet, "fromId", "from") or "?"
+    overheard = False
     if to_id == BROADCAST_ADDR:
         target = ("channel", packet.get("channel", 0))
-    else:
+    elif my_id and from_id != my_id and to_id != my_id:
         # A routed packet between two other nodes is not our DM. Radios may
         # overhear and decode it, but answering would intrude on their exchange.
-        if my_id and from_id != my_id and to_id != my_id:
+        if not include_overheard:
             return None
+        overheard = True
+        target = ("node", to_id)
+    else:
         other = to_id if from_id == my_id else from_id
         target = ("node", other)
 
@@ -605,7 +616,18 @@ def parse_incoming(packet: dict, my_id: str | None) -> dict | None:
         "snr": packet.get("rxSnr"),
         "rssi": packet.get("rxRssi"),
         "id": packet.get("id"),
+        "overheard": overheard,
     }
+
+
+def target_log_label(interface, target: tuple) -> str:
+    """How a log line names where a message was: "channel:3(EDGE_ATS)", "node:!x".
+
+    Shared so the server's log and the TUI's --log file name things the same
+    way, and one can be grepped with what worked on the other.
+    """
+    kind, key = target
+    return f"{kind}:{channel_label(interface, key) if kind == 'channel' else key}"
 
 
 def node_label(nodes: dict, node_id: str) -> str:
@@ -1137,7 +1159,15 @@ class ReplyEngine:
 
         And only once per packet, since the mesh redelivers the same message via
         rebroadcast or the MQTT bridge.
+
+        Ahead of all three, never answer a DM overheard between two other
+        nodes. on_receive returns before getting here for one, so this is the
+        second gate rather than the only one - answering would intrude on
+        someone else's exchange, which is worth refusing twice.
         """
+        if info.get("overheard"):
+            return False
+
         if info["text"].lstrip().startswith(BOT_REPLY_PREFIX):
             return False
 
@@ -2103,13 +2133,23 @@ class ServerBot(ReplyEngine):
         # Before the text filter, for the reason the TUI does the same.
         self.packet_count += 1
         self._note_packet()
-        info = parse_incoming(packet, self.my_id)
+        info = parse_incoming(packet, self.my_id, include_overheard=True)
         if info is None:
             return
         sender = node_label(interface.nodes or {}, info["from_id"])
-        kind, key = info["target"]
-        label = channel_label(interface, key) if kind == "channel" else key
-        self.log(f"{kind}:{label} {format_incoming_line(info, sender, markup=False)}")
+        if info["overheard"]:
+            # Logged, so the record is of every text message the radio heard,
+            # and nothing else: not addressed to us, so not counted as
+            # received and never answered.
+            self.log(
+                f"overheard:{info['from_id']}->{info['to_id']} "
+                f"{format_incoming_line(info, sender, markup=False)}"
+            )
+            return
+        self.log(
+            f"{target_log_label(interface, info['target'])} "
+            f"{format_incoming_line(info, sender, markup=False)}"
+        )
         if info["from_id"] != self.my_id:
             self.received_count += 1
         if not self._should_auto_reply(info):
@@ -2395,6 +2435,12 @@ def detached_argv(
     return argv
 
 
+# Where --daemon writes when --log is not given. A constant rather than the
+# argparse default because that default has to be None: the UI logs only when
+# asked, and could not otherwise tell "asked for this file" from "said nothing".
+DEFAULT_DAEMON_LOG = "meshtastic-bot.log"
+
+
 def spawn_detached(argv: list[str], log_path: Path) -> int:
     """Start `argv` in its own session, output appended to `log_path`.
 
@@ -2469,9 +2515,11 @@ def main() -> None:
     parser.add_argument(
         "--log",
         metavar="PATH",
-        default="meshtastic-bot.log",
-        help="where --daemon writes. Appended to, never truncated. "
-        "(default: %(default)s)",
+        # None rather than the daemon's file, so the UI can tell whether it was
+        # asked to log at all - see DEFAULT_DAEMON_LOG.
+        default=None,
+        help="where --daemon writes "
+        f"(default: {DEFAULT_DAEMON_LOG}). Appended to, never truncated.",
     )
     parser.add_argument(
         "--heartbeat",
@@ -2516,7 +2564,7 @@ def main() -> None:
         sys.exit(
             spawn_detached(
                 detached_argv(target, args.here, args.heartbeat, args.mqtt),
-                Path(args.log),
+                Path(args.log or DEFAULT_DAEMON_LOG),
             )
         )
     sys.exit(
