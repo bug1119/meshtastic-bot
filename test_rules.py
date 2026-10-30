@@ -1550,6 +1550,188 @@ def test_text_sender_reports_failures():
     sender.stop()
 
 
+class _StuckRadio:
+    """A stand-in interface whose sendText does not return until released -
+    what a BLE write that CoreBluetooth never completes looks like from above."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.sent = []
+        self.threads = []
+
+    def sendText(self, text, **kw):
+        self.threads.append(threading.current_thread())
+        self.entered.set()
+        self.release.wait(10)
+        self.sent.append((time.monotonic(), text, kw))
+
+
+def _timed(fn):
+    start = time.monotonic()
+    result = fn()
+    return result, time.monotonic() - start
+
+
+def test_text_sender_does_not_hold_its_lock_across_a_write():
+    print("queueing a text never waits behind another text's radio write")
+    # The TUI froze because the sender held its lock for the whole write: a
+    # write that never came back meant every later send() - the app thread's
+    # included - blocked on the lock forever.
+    radio = _StuckRadio()
+    sender = bot.TextSender(interval=0.1)
+    writer = threading.Thread(target=sender.send, args=(radio, ("channel", 3), "first"), daemon=True)
+    writer.start()
+    check("the first write is under way", radio.entered.wait(2), True)
+    sent_now, took = _timed(lambda: sender.send(radio, ("channel", 3), "second"))
+    check("the second is queued rather than sent", sent_now, False)
+    check("and queueing it did not wait for the stuck write", took < 0.5, True)
+    radio.release.set()
+    _wait_for(lambda: len(radio.sent) == 2)
+    check("both went out, in order", [t for _, t, _ in radio.sent], ["first", "second"])
+    check("still spaced by the interval", radio.sent[1][0] - radio.sent[0][0] >= 0.09, True)
+    writer.join(2)
+    sender.stop()
+
+
+def test_text_sender_without_inline_never_writes_on_the_callers_thread():
+    print("inline=False hands every text to the worker, even the first")
+    radio = _TimedRadio()
+    seen = []
+    radio_send = radio.sendText
+
+    def recording(text, **kw):
+        seen.append(threading.current_thread())
+        radio_send(text, **kw)
+
+    radio.sendText = recording
+    sender = bot.TextSender(interval=0.1, inline=False)
+    done = []
+    sent_now = sender.send(radio, ("channel", 3), "Hi", on_sent=lambda: done.append(1))
+    check("reported as queued", sent_now, False)
+    _wait_for(lambda: done)
+    check("it still went out", [t for _, t, _ in radio.sent], ["Hi"])
+    check("on a thread other than the caller's", seen[0] is not threading.current_thread(), True)
+    check("on_sent ran once it had", done, [1])
+
+    class Refuses:
+        def sendText(self, text, **kw):
+            raise OSError("BLE write did not complete within 10s")
+
+    failures = []
+    sender.send(Refuses(), ("channel", 3), "again", on_failed=failures.append)
+    _wait_for(lambda: failures)
+    check("a failure is reported, not raised", [str(e) for e in failures],
+          ["BLE write did not complete within 10s"])
+    sender.stop()
+
+
+def test_reply_engines_choose_their_send_mode():
+    print("the TUI never writes inline; the server still does")
+    check("TUI", bot.MeshtasticTUI.TEXT_SEND_INLINE, False)
+    check("server", bot.ServerBot.TEXT_SEND_INLINE, True)
+
+    class Engine(bot.ReplyEngine):
+        TEXT_SEND_INLINE = False
+
+    sender = bot.ReplyEngine._text_sender(Engine())
+    check("the shared sender follows the front end", sender.inline, False)
+    sender.stop()
+
+
+def test_ble_writes_have_a_deadline():
+    print("a BLE write that never completes is given up on, not waited on forever")
+    import concurrent.futures
+
+    class FakeBleak:
+        def write_gatt_char(self, *args, **kwargs):
+            return ("write", args)
+
+    class FakeClient:
+        def __init__(self, future):
+            self.bleak_client = FakeBleak()
+            self.future = future
+            self.ran = []
+
+        def async_run(self, coro):
+            self.ran.append(coro)
+            return self.future
+
+        def write_gatt_char(self, *args, **kwargs):  # the library's: no timeout
+            return self.future.result()
+
+    original = bot.BLE_WRITE_TIMEOUT_SECS
+    bot.BLE_WRITE_TIMEOUT_SECS = 0.2
+    try:
+        bot.bound_ble_writes(FakeClient)
+        bot.bound_ble_writes(FakeClient)  # a second link must not wrap it twice
+        check("installed once", FakeClient._write_deadline_installed, True)
+
+        stuck = concurrent.futures.Future()
+        client = FakeClient(stuck)
+        raised = None
+        start = time.monotonic()
+        try:
+            client.write_gatt_char("uuid", b"payload", response=True)
+        except TimeoutError as exc:
+            raised = exc
+        took = time.monotonic() - start
+        check("a stuck write raises TimeoutError", type(raised).__name__, "TimeoutError")
+        check("after the deadline, not forever", 0.15 <= took < 2, True)
+        check("the pending write is cancelled", stuck.cancelled(), True)
+        check("the write was handed to bleak as asked", client.ran, [("write", ("uuid", b"payload"))])
+
+        done = concurrent.futures.Future()
+        done.set_result("ok")
+        check("a write that completes returns normally", FakeClient(done).write_gatt_char("uuid", b"x"), "ok")
+    finally:
+        bot.BLE_WRITE_TIMEOUT_SECS = original
+
+
+def test_tui_stays_responsive_while_a_write_is_stuck():
+    print("a typed message whose radio write hangs does not freeze the TUI")
+    radio, results = asyncio.run(_tui_typed_into_a_stuck_radio())
+    check("enter returned at once", results["enter_took"] < 1.0, True)
+    check("the send box was cleared", results["box_after"], "")
+    check("the app kept handling input", results["typed_after"], "next")
+    check("the write was never on the app thread", results["on_app_thread"], False)
+    check("and it did go out once released", [t for _, t, _ in radio.sent], ["Hi"])
+
+
+async def _tui_typed_into_a_stuck_radio():
+    from textual.widgets import Input
+
+    server, _ = _fake_server("[*]\n", io.StringIO())
+    radio = _StuckRadio()
+    server.interface.sendText = radio.sendText
+    app = bot.MeshtasticTUI()
+    results = {}
+    async with app.run_test() as pilot:
+        app_thread = threading.current_thread()
+        app.interface = server.interface
+        app.my_id = "!me"
+        app.target = ("channel", 3)
+        box = app.query_one("#send-box", Input)
+        box.disabled = False
+        box.value = "Hi"
+        box.focus()
+        start = time.monotonic()
+        await pilot.press("enter")
+        results["enter_took"] = time.monotonic() - start
+        results["box_after"] = box.value
+        # The write is now stuck. The app must still take keystrokes.
+        await pilot.press("n", "e", "x", "t")
+        results["typed_after"] = box.value
+        await asyncio.to_thread(radio.entered.wait, 2)
+        results["on_app_thread"] = any(t is app_thread for t in radio.threads)
+        radio.release.set()
+        deadline = time.monotonic() + 5
+        while not radio.sent and time.monotonic() < deadline:
+            await pilot.pause(0.05)
+        app.text_sender.stop()
+    return radio, results
+
+
 def test_typed_message_and_its_reply_both_go_out():
     print("typing a keyword in the TUI sends it and its reply, spaced apart")
     original = bot.TEXT_SEND_SPACING
@@ -4357,6 +4539,11 @@ if __name__ == "__main__":
         test_text_sender_sends_the_first_at_once()
         test_text_sender_spaces_the_ones_after()
         test_text_sender_reports_failures()
+        test_text_sender_does_not_hold_its_lock_across_a_write()
+        test_text_sender_without_inline_never_writes_on_the_callers_thread()
+        test_reply_engines_choose_their_send_mode()
+        test_ble_writes_have_a_deadline()
+        test_tui_stays_responsive_while_a_write_is_stuck()
         test_typed_message_and_its_reply_both_go_out()
         test_rate_limit_notice()
         test_server_logs_a_rate_limit_refusal()
