@@ -81,6 +81,7 @@ import argparse
 import atexit
 import datetime
 import collections
+import concurrent.futures
 import functools
 import math
 import os
@@ -333,6 +334,57 @@ def node_position(node: dict) -> tuple[float, float] | None:
 # from the reconnect loop.
 CONNECT_TIMEOUT_SECS = 90
 
+# How long one BLE write may take before it is given up on. The library waits
+# on every write with no timeout at all (BLEClient.async_await defaults to
+# None), and on macOS a CoreBluetooth completion that never arrives - which the
+# library's own comment there admits can happen - then parks the caller for
+# good. Observed as a TUI that froze minutes into a --ble --mqtt session: the
+# link and the broker were both still up, the main thread sat on a write that
+# was never going to return. A healthy write takes milliseconds; ten seconds is
+# far past any slow one and still short enough to read as a failure.
+BLE_WRITE_TIMEOUT_SECS = 10
+
+
+def bound_ble_writes(client_class=None) -> None:
+    """Give every BLE write the library makes a deadline.
+
+    Replaces BLEClient.write_gatt_char rather than wrapping a call site,
+    because the writes come from everywhere: the config download, sendText,
+    heartbeats, and every MQTT downlink the bridge hands back to the node. All
+    of them go through this one method.
+
+    On timeout the pending write is cancelled - so bleak does not go on holding
+    it - and TimeoutError raised. BLEInterface._sendToRadioImpl turns that into
+    the BLEError it raises for any failed write, so callers see an ordinary
+    send failure: TextSender reports it, the MQTT bridge counts it.
+
+    Idempotent, and done when a BLE link is opened rather than at import, so
+    nothing changes for a session that never touches BLE.
+    """
+    if client_class is None:
+        client_class = meshtastic.ble_interface.BLEClient
+    if getattr(client_class, "_write_deadline_installed", False):
+        return
+
+    def write_gatt_char(self, *args, **kwargs):
+        future = self.async_run(self.bleak_client.write_gatt_char(*args, **kwargs))
+        # Kept from the method this replaces: on macOS a little I/O helps
+        # CoreBluetooth deliver its callbacks (see BLEClient.async_await).
+        try:
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return future.result(BLE_WRITE_TIMEOUT_SECS)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"BLE write did not complete within {BLE_WRITE_TIMEOUT_SECS}s"
+            ) from None
+
+    client_class.write_gatt_char = write_gatt_char
+    client_class._write_deadline_installed = True
+
 
 def open_interface(transport: str, address: str):
     """Build and connect the meshtastic interface for one transport.
@@ -349,6 +401,7 @@ def open_interface(transport: str, address: str):
         return meshtastic.serial_interface.SerialInterface(
             devPath=address, timeout=CONNECT_TIMEOUT_SECS
         )
+    bound_ble_writes()
     return meshtastic.ble_interface.BLEInterface(
         address=address, timeout=CONNECT_TIMEOUT_SECS
     )
@@ -942,17 +995,38 @@ class TextSender:
     library's receive loop, where blocking stalls every packet behind it, and
     the TUI's send box runs on the app thread, where it would freeze the UI.
 
+    With inline=False nothing is ever sent on the caller's thread: every text
+    goes through the worker. That is what the TUI uses. An inline send is a
+    radio write on whatever thread asked for it, and on the app thread a write
+    that does not come back is a frozen screen - which is exactly how a BLE
+    link on macOS presented: the pane stopped redrawing, keys did nothing, and
+    the process sat at 0% CPU with its main thread parked on this sender.
+
+    The lock guards the queue and the timestamps only. It is never held across
+    a radio write, because a write can take as long as the transport lets it
+    (up to BLE_WRITE_TIMEOUT_SECS over BLE), and anyone who only wanted to
+    queue a text would otherwise wait out that whole write behind it. `_busy`
+    is what keeps two writes from overlapping instead.
+
     One sender per front end, shared by typed messages and auto-replies, so the
     spacing holds between the two - which is the case that was losing replies.
     """
 
-    def __init__(self, interval: float | None = None, clock=time.monotonic) -> None:
+    def __init__(
+        self, interval: float | None = None, clock=time.monotonic, inline: bool = True
+    ) -> None:
         self.interval = TEXT_SEND_SPACING if interval is None else interval
+        self.inline = inline
         self._clock = clock
         self._lock = threading.Lock()
         self._queue: collections.deque = collections.deque()
         self._wake = threading.Condition(self._lock)
         self._last_sent: float | None = None
+        # True while a text is on its way to the radio, on whichever thread.
+        # Set under the lock before the write and cleared under it after, so
+        # an inline send and the worker can never be writing at the same time
+        # and the interval is always measured from a finished write.
+        self._busy = False
         self._worker: threading.Thread | None = None
         self._stopped = False
 
@@ -964,30 +1038,42 @@ class TextSender:
         to raise to, so it goes to `on_failed`. `on_sent` runs only once the
         radio has actually taken the text, inline or later, so a counter fed by
         it never claims a send that failed.
+
+        Never waits on another text's write: if one is in flight this one is
+        queued, and with inline=False it always is.
         """
         with self._lock:
-            ready = not self._queue and (
-                self._last_sent is None or self._clock() - self._last_sent >= self.interval
+            ready = (
+                self.inline
+                and not self._busy
+                and not self._queue
+                and (self._last_sent is None or self._clock() - self._last_sent >= self.interval)
             )
             if ready:
-                # Held across the send, so a queued text cannot slip in between
-                # the check and the write and land inside the interval.
-                try:
-                    self._transmit(interface, target, text)
-                finally:
-                    # Even on failure, for the reason given in _drain.
-                    self._last_sent = self._clock()
+                # Claimed before the lock is let go, so a text queued while this
+                # one is being written waits for it instead of overtaking it.
+                self._busy = True
             else:
                 self._queue.append((interface, target, text, on_sent, on_failed))
                 self._start_worker()
                 self._wake.notify()
-        if ready and on_sent is not None:
+        if not ready:
+            return False
+        try:
+            self._transmit(interface, target, text)
+        finally:
+            # Even on failure, for the reason given in _drain.
+            self._finish_write()
+        if on_sent is not None:
             on_sent()
-        return ready
+        return True
 
     def stop(self) -> None:
         """Let the worker exit. Anything still queued is dropped - the link is
-        going away, and a text sent after the operator quit is worse than none."""
+        going away, and a text sent after the operator quit is worse than none.
+
+        Does not wait for a write already in flight; that one ends on its own,
+        at the latest when the transport gives up on it."""
         with self._lock:
             self._stopped = True
             self._queue.clear()
@@ -1001,6 +1087,13 @@ class TextSender:
         else:
             interface.sendText(text, destinationId=key)
 
+    def _finish_write(self) -> None:
+        with self._lock:
+            self._last_sent = self._clock()
+            self._busy = False
+            # The worker may be waiting for this write to end.
+            self._wake.notify()
+
     def _start_worker(self) -> None:
         if self._worker is None or not self._worker.is_alive():
             self._worker = threading.Thread(target=self._drain, daemon=True)
@@ -1009,7 +1102,7 @@ class TextSender:
     def _drain(self) -> None:
         while True:
             with self._lock:
-                while not self._queue and not self._stopped:
+                while (not self._queue or self._busy) and not self._stopped:
                     self._wake.wait()
                 if self._stopped:
                     return
@@ -1021,15 +1114,18 @@ class TextSender:
                         self._wake.wait(remaining)
                         continue
                 interface, target, text, on_sent, on_failed = self._queue.popleft()
-                try:
-                    self._transmit(interface, target, text)
-                except Exception as exc:  # noqa: BLE001
-                    failed = exc
-                else:
-                    failed = None
-                # Counted even when it failed: the firmware's two seconds run
-                # from what it was handed, and a failed write may have been.
-                self._last_sent = self._clock()
+                self._busy = True
+            # The write itself happens with the lock released - see the class
+            # docstring for why holding it here froze the TUI.
+            try:
+                self._transmit(interface, target, text)
+            except Exception as exc:  # noqa: BLE001
+                failed = exc
+            else:
+                failed = None
+            # Counted even when it failed: the firmware's two seconds run
+            # from what it was handed, and a failed write may have been.
+            self._finish_write()
             # Callbacks outside the lock, since they log and may take their time.
             if failed is None:
                 if on_sent is not None:
@@ -1075,6 +1171,13 @@ class ReplyEngine:
     # which renders them in a RichLog; False for the server, whose output is a
     # plain stream where the tags would be printed literally.
     MARKUP = True
+
+    # Whether a text may be written to the radio on the thread that asked for
+    # it. The server keeps that: its callers are background threads, and a
+    # failure raised straight back to them is the simplest report there is.
+    # The TUI turns it off - see TextSender for what an inline write on the
+    # app thread did.
+    TEXT_SEND_INLINE = True
 
     # Seconds between reconnect attempts. Quick at first so a momentary WiFi
     # blip recovers almost immediately, then settling into a steady poll rather
@@ -1331,7 +1434,7 @@ class ReplyEngine:
         """
         sender = getattr(self, "text_sender", None)
         if sender is None:
-            sender = self.text_sender = TextSender()
+            sender = self.text_sender = TextSender(inline=self.TEXT_SEND_INLINE)
         return sender
 
     def _send_failed(self, note: str) -> None:
